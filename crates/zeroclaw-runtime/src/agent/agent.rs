@@ -3234,11 +3234,20 @@ impl Agent {
         binding: CapabilityBinding,
     ) -> Result<Self> {
         let (capabilities, principal, supplied) = match binding {
-            CapabilityBinding::ConfigBacked => (
-                crate::composition::RuntimeCapabilities::config_backed(config),
-                None,
-                false,
-            ),
+            CapabilityBinding::ConfigBacked => {
+                let mut capabilities =
+                    crate::composition::RuntimeCapabilities::config_backed(config);
+                // An entry point that owns extra tools (the gateway's connected
+                // device nodes) supplies them here; the config-backed registry
+                // and every policy gate still apply.
+                if let Some(source) = execution_capability
+                    .as_ref()
+                    .and_then(|capability| capability.tool_source())
+                {
+                    capabilities.tools = source;
+                }
+                (capabilities, None, false)
+            }
             CapabilityBinding::Supplied {
                 capabilities,
                 principal,

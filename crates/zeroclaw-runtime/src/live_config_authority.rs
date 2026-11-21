@@ -227,6 +227,7 @@ impl LiveConfigAuthority {
         AgentExecutionCapability {
             config: self.live_handle(),
             agent_lifecycle: self.agent_lifecycle(),
+            tool_source: None,
         }
     }
 
@@ -335,6 +336,9 @@ pub enum AgentExecutionError {
 pub struct AgentExecutionCapability {
     config: LiveConfigHandle,
     agent_lifecycle: AgentLifecycleCoordinator,
+    /// Extra tool source the entry point owns, such as the gateway's connected
+    /// device nodes. `None` keeps the config-backed tool registry unchanged.
+    tool_source: Option<Arc<dyn crate::composition::ToolSource>>,
 }
 
 /// An admitted target snapshot and its owned lifecycle lease. Clones share
@@ -437,7 +441,21 @@ impl AgentExecutionCapability {
         Self {
             config,
             agent_lifecycle,
+            tool_source: None,
         }
+    }
+
+    /// Attach an entry-point-owned tool source to every agent this capability
+    /// admits. The source is composed into the agent's registry alongside the
+    /// config-backed tools, so the agent's policy and the caller's allowlist
+    /// still filter what it supplies.
+    pub fn with_tool_source(mut self, source: Arc<dyn crate::composition::ToolSource>) -> Self {
+        self.tool_source = Some(source);
+        self
+    }
+
+    pub fn tool_source(&self) -> Option<Arc<dyn crate::composition::ToolSource>> {
+        self.tool_source.clone()
     }
 
     pub fn config_handle(&self) -> LiveConfigHandle {
