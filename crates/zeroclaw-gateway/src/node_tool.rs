@@ -1,6 +1,6 @@
 //! Wraps a node capability as a zeroclaw [`Tool`] so it can be dispatched
 //! through the existing tool registry and agent loop.
-//! Tool names are prefixed with the node ID: `node:<node_id>:<capability_name>`.
+//! Tool names are prefixed with the node ID: `node_<node_id>__<capability>`.
 
 use std::sync::Arc;
 
@@ -11,6 +11,7 @@ use crate::nodes::{NodeInvocation, NodeRegistry};
 use zeroclaw_api::attribution::{ToolKind, ToolProvenance};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_api::tool_attribution;
+use zeroclaw_runtime::composition::{ToolRequest, ToolSource};
 use zeroclaw_tools::node_capabilities::requires_approval;
 
 tool_attribution!(NodeTool, ToolKind::Plugin, ToolProvenance::Extension);
@@ -19,10 +20,10 @@ tool_attribution!(NodeTool, ToolKind::Plugin, ToolProvenance::Extension);
 const NODE_INVOKE_TIMEOUT_SECS: u64 = 30;
 
 /// A zeroclaw [`Tool`] backed by a node capability.
-/// The `prefixed_name` (e.g. `node:phone-1:camera.snap`) is what the agent
+/// The `prefixed_name` (e.g. `node_phone-1__camera_snap`) is what the agent
 /// loop sees. Invocations are routed to the connected node via WebSocket.
 pub struct NodeTool {
-    /// Prefixed name: `node:<node_id>:<capability_name>`.
+    /// Prefixed, provider-safe name: `node_<node_id>__<capability>`.
     prefixed_name: String,
     /// The node ID this tool belongs to.
     node_id: String,
@@ -45,7 +46,7 @@ impl NodeTool {
         parameters: serde_json::Value,
         registry: Arc<NodeRegistry>,
     ) -> Self {
-        let prefixed_name = format!("node:{node_id}:{capability_name}");
+        let prefixed_name = Self::tool_name(&node_id, &capability_name);
         Self {
             prefixed_name,
             node_id,
@@ -57,8 +58,75 @@ impl NodeTool {
     }
 
     /// Build the prefixed tool name for a node capability.
+    ///
+    /// Provider tool names are restricted to `[a-zA-Z0-9_-]{1,64}`
+    /// (OpenAI-compatible APIs reject colons and dots, and OpenRouter filters
+    /// such tools out entirely). The `node_<id>__<capability>` shape keeps the
+    /// origin visible while staying in that alphabet; dots in capability names
+    /// become `_`.
     pub fn tool_name(node_id: &str, capability_name: &str) -> String {
-        format!("node:{node_id}:{capability_name}")
+        let mut name = format!(
+            "node_{}__{}",
+            sanitize_component(node_id),
+            sanitize_component(capability_name)
+        );
+        name.truncate(64);
+        name
+    }
+}
+
+/// Replace characters providers reject with `_` so a tool name survives the
+/// strict `[a-zA-Z0-9_-]` rule. `:` and `.` are the common offenders.
+fn sanitize_component(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Exposes every capability of every connected node as an agent tool.
+///
+/// The gateway attaches this source to the live execution capability it hands
+/// the WebSocket-chat agent, so `alarm.set` on a paired phone becomes
+/// `node_android_1a2b3c4d__alarm_set` in the model's tool list. Node tools are
+/// rebuilt against the live registry for each agent construction: a
+/// disconnected phone simply contributes no tools.
+pub struct NodeToolSource {
+    registry: Arc<NodeRegistry>,
+}
+
+impl NodeToolSource {
+    pub fn new(registry: Arc<NodeRegistry>) -> Self {
+        Self { registry }
+    }
+
+    /// Build one tool per connected capability. Split from [`ToolSource::tools`]
+    /// so tests can exercise it without constructing a full [`ToolRequest`].
+    fn collect(&self) -> Vec<Box<dyn Tool>> {
+        self.registry
+            .all_capabilities()
+            .into_iter()
+            .map(|(node_id, capability_name, capability)| {
+                Box::new(NodeTool::new(
+                    node_id,
+                    capability_name,
+                    capability.description,
+                    capability.parameters,
+                    Arc::clone(&self.registry),
+                )) as Box<dyn Tool>
+            })
+            .collect()
+    }
+}
+
+impl ToolSource for NodeToolSource {
+    fn tools(&self, _request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>> {
+        Ok(self.collect())
     }
 }
 
@@ -172,11 +240,49 @@ mod tests {
     use zeroclaw_api::attribution::Attributable;
 
     #[test]
-    fn node_tool_name_format() {
-        assert_eq!(
-            NodeTool::tool_name("phone-1", "camera.snap"),
-            "node:phone-1:camera.snap"
+    fn node_tool_name_is_provider_safe() {
+        let name = NodeTool::tool_name("phone-1", "camera.snap");
+        assert_eq!(name, "node_phone-1__camera_snap");
+        assert!(name.len() <= 64);
+        assert!(
+            name.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+            "provider tool names allow only [a-zA-Z0-9_-]: {name}"
         );
+    }
+
+    #[test]
+    fn node_tool_name_sanitizes_unknown_characters_and_truncates() {
+        let name = NodeTool::tool_name("android:1a2b 3c4d", "alarm.set");
+        assert_eq!(name, "node_android_1a2b_3c4d__alarm_set");
+        assert!(NodeTool::tool_name(&"x".repeat(200), "cap").len() <= 64);
+    }
+
+    #[test]
+    fn node_tool_source_exposes_connected_capabilities() {
+        let registry = Arc::new(NodeRegistry::new(10));
+        let (invoke_tx, _invoke_rx) = tokio::sync::mpsc::channel(32);
+        registry.register(NodeInfo {
+            node_id: "android-1a2b3c4d".to_string(),
+            capabilities: vec![NodeCapability {
+                name: "alarm.set".to_string(),
+                description: "Set an alarm on the phone".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "hour": { "type": "integer" } }
+                }),
+            }],
+            invoke_tx,
+        });
+
+        let source = NodeToolSource::new(Arc::clone(&registry));
+        let tools = source.collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "node_android-1a2b3c4d__alarm_set");
+        assert_eq!(tools[0].description(), "Set an alarm on the phone");
+
+        let empty = NodeToolSource::new(Arc::new(NodeRegistry::new(10)));
+        assert!(empty.collect().is_empty());
     }
 
     #[test]
@@ -190,7 +296,7 @@ mod tests {
             registry,
         );
 
-        assert_eq!(tool.name(), "node:phone-1:camera.snap");
+        assert_eq!(tool.name(), "node_phone-1__camera_snap");
         assert_eq!(tool.description(), "Take a photo");
         assert_eq!(tool.parameters_schema()["type"], "object");
         assert_eq!(tool.tool_provenance(), ToolProvenance::Extension);
@@ -269,7 +375,7 @@ mod tests {
         );
 
         let spec = tool.spec();
-        assert_eq!(spec.name, "node:sensor-1:temp.read");
+        assert_eq!(spec.name, "node_sensor-1__temp_read");
         assert_eq!(spec.description, "Read temperature");
         assert!(spec.parameters["properties"]["unit"]["type"] == "string");
     }
