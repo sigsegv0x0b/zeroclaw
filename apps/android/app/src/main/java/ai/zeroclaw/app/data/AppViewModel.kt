@@ -1,6 +1,9 @@
 package ai.zeroclaw.app.data
 
 import android.app.Application
+import android.content.Intent
+import android.net.Uri
+import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import ai.zeroclaw.app.service.NodeService
@@ -17,6 +20,7 @@ data class UiState(
     val deviceName: String = "Android",
     val deviceId: String = "",
     val nodeEnabled: Boolean = true,
+    val nodeFolderName: String = "",
     val nodeStatus: NodeStatus = NodeStatus.Stopped,
     val agents: List<AgentEntry> = emptyList(),
     val agent: String = "",
@@ -94,6 +98,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     deviceName = saved.deviceName,
                     deviceId = runCatching { store.ensureDeviceId() }.getOrDefault(""),
                     nodeEnabled = saved.nodeEnabled,
+                    nodeFolderName = saved.nodeFolderName,
                     booting = false,
                 )
             }
@@ -245,6 +250,31 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             NodeService.start(getApplication())
         } else {
             NodeService.stop(getApplication())
+        }
+    }
+
+    /**
+     * Persist the SAF tree the operator picked in Settings. The URI grant must
+     * be taken while the activity result is still valid, and the display name
+     * is captured here so the tool output can name the folder without a query.
+     */
+    fun saveNodeFolder(uri: Uri?) {
+        if (uri == null) return
+        viewModelScope.launch {
+            val app = getApplication<Application>()
+            runCatching {
+                app.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                )
+            }
+            val name = runCatching { DocumentFile.fromTreeUri(app, uri)?.name }
+                .getOrNull()
+                .orEmpty()
+                .ifBlank { "Selected folder" }
+            runCatching { store.saveNodeFolder(uri.toString(), name) }
+            _ui.update { it.copy(nodeFolderName = name) }
         }
     }
 

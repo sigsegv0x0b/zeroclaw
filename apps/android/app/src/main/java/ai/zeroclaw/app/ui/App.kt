@@ -46,6 +46,7 @@ fun ZeroClawRoot(viewModel: AppViewModel = viewModel()) {
                 onReconnect = viewModel::reconnect,
                 onForget = viewModel::forgetGateway,
                 onNodeEnabled = viewModel::setNodeEnabled,
+                onFolderPicked = viewModel::saveNodeFolder,
             )
             !state.paired -> OnboardingScreen(
                 booting = state.booting,

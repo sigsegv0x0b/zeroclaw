@@ -59,12 +59,46 @@ pub struct NodeInvocation {
     pub response_tx: oneshot::Sender<NodeInvocationResult>,
 }
 
+/// One media attachment a node declared for an invocation result.
+///
+/// Bytes travel inline rather than by reference: a phone-local `content://`
+/// or file URI is not resolvable from the gateway host, so the only transport
+/// both sides share is the WebSocket itself. `data_b64` is capped by
+/// [`MAX_NODE_ATTACHMENT_BYTES`] on the way in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeAttachment {
+    /// Attachment disposition (`image` is the only kind the gateway surfaces today).
+    pub kind: String,
+    /// MIME type of the encoded bytes (e.g. `image/jpeg`).
+    pub mime: String,
+    /// Standard base64 of the attachment bytes.
+    #[serde(rename = "data_b64")]
+    pub data_b64: String,
+}
+
+impl NodeAttachment {
+    /// Decoded size of the base64 payload, without allocating the bytes.
+    #[must_use]
+    pub fn decoded_len(&self) -> usize {
+        self.data_b64.trim_end_matches('=').len() * 3 / 4
+    }
+}
+
+/// Largest attachment the gateway accepts from a node, per attachment.
+///
+/// The phone downscales gallery images before sending; this bound stops a
+/// compromised or buggy node from pushing an arbitrarily large frame into the
+/// agent's context.
+pub const MAX_NODE_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+
 /// The result of a node invocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInvocationResult {
     pub success: bool,
     pub output: String,
     pub error: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<NodeAttachment>,
 }
 
 /// Registry of all connected nodes and their capabilities.
@@ -150,6 +184,8 @@ enum NodeMessage {
         output: String,
         #[serde(default)]
         error: Option<String>,
+        #[serde(default)]
+        attachments: Vec<NodeAttachment>,
     },
 }
 
@@ -393,12 +429,14 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
                 success,
                 output,
                 error,
+                attachments,
             } => {
                 if let Some(tx) = pending.write().remove(&call_id) {
                     let _ = tx.send(NodeInvocationResult {
                         success,
                         output,
                         error,
+                        attachments,
                     });
                 }
             }
@@ -726,11 +764,30 @@ mod tests {
                 success,
                 output,
                 error,
+                attachments,
             } => {
                 assert_eq!(call_id, "abc-123");
                 assert!(success);
                 assert_eq!(output, "photo taken");
                 assert!(error.is_none());
+                assert!(attachments.is_empty());
+            }
+            NodeMessage::Register { .. } => panic!("Expected Result message"),
+        }
+    }
+
+    #[test]
+    fn node_message_result_deserializes_attachments() {
+        let json = r#"{"type":"result","call_id":"a","success":true,"output":"image",
+            "attachments":[{"kind":"image","mime":"image/jpeg","data_b64":"aGVsbG8="}]}"#;
+        let msg: NodeMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            NodeMessage::Result { attachments, .. } => {
+                assert_eq!(attachments.len(), 1);
+                assert_eq!(attachments[0].kind, "image");
+                assert_eq!(attachments[0].mime, "image/jpeg");
+                assert_eq!(attachments[0].data_b64, "aGVsbG8=");
+                assert_eq!(attachments[0].decoded_len(), 5);
             }
             NodeMessage::Register { .. } => panic!("Expected Result message"),
         }

@@ -911,6 +911,10 @@ async fn handle_socket(
         pending_approvals.clone(),
         Duration::from_secs(WS_APPROVAL_TIMEOUT_SECS),
     ));
+    // The approval bridge fans out through the `ask_user` map. A channel-less
+    // config starts without one, so create it here or the WS approval channel
+    // below has nowhere to live and the gate auto-denies every prompt.
+    agent.ensure_ask_user_handle();
     agent
         .channel_handles()
         .register_channel(WS_CHANNEL_KEY, approval_channel.clone());

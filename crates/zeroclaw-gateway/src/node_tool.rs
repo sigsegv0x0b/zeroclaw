@@ -7,17 +7,22 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::time::Duration;
 
-use crate::nodes::{NodeInvocation, NodeRegistry};
+use crate::nodes::{MAX_NODE_ATTACHMENT_BYTES, NodeAttachment, NodeInvocation, NodeRegistry};
 use zeroclaw_api::attribution::{ToolKind, ToolProvenance};
+use zeroclaw_api::media::{MarkerKind, RenderedMarker};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_api::tool_attribution;
 use zeroclaw_runtime::composition::{ToolRequest, ToolSource};
-use zeroclaw_tools::node_capabilities::requires_approval;
 
 tool_attribution!(NodeTool, ToolKind::Plugin, ToolProvenance::Extension);
 
 /// Default timeout for node invocations (30 seconds).
 const NODE_INVOKE_TIMEOUT_SECS: u64 = 30;
+
+/// Image MIME types a node may attach. Anything else is a document the model
+/// cannot inspect through the vision path, so it is dropped rather than
+/// silently mislabelled.
+const ALLOWED_IMAGE_MIMES: &[&str] = &["image/jpeg", "image/png", "image/webp", "image/gif"];
 
 /// A zeroclaw [`Tool`] backed by a node capability.
 /// The `prefixed_name` (e.g. `node_phone-1__camera_snap`) is what the agent
@@ -145,33 +150,11 @@ impl Tool for NodeTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        // Check if this capability requires approval
-        if requires_approval(&self.capability_name) {
-            let approved = args
-                .get("approved")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if !approved {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
-                        "Capability '{}' requires approval. Set approved=true to proceed.",
-                        self.capability_name
-                    )),
-                });
-            }
-        }
-
-        // Strip the `approved` field (same as MCP tools)
-        let args = match args {
-            serde_json::Value::Object(mut map) => {
-                map.remove("approved");
-                serde_json::Value::Object(map)
-            }
-            other => other,
-        };
-
+        // Risk is enforced by the agent's approval policy, which sees this
+        // tool's name and the operator's `auto_approve` / `always_ask` sets.
+        // An in-tool `approved` flag would be model-controlled, so it could
+        // not be a trust boundary; it used to exist here and is deliberately
+        // gone.
         let invoke_tx: tokio::sync::mpsc::Sender<NodeInvocation> =
             match self.registry.invoke_tx(&self.node_id) {
                 Some(tx) => tx,
@@ -210,7 +193,13 @@ impl Tool for NodeTool {
         {
             Ok(Ok(result)) => Ok(ToolResult {
                 success: result.success,
-                output: result.output.into(),
+                output: {
+                    let mut output = ToolOutput::text(result.output);
+                    for marker in attachment_markers(&result.attachments) {
+                        output = output.with_attachment(marker);
+                    }
+                    output
+                },
                 error: result.error,
             }),
             Ok(Err(_)) => Ok(ToolResult {
@@ -233,11 +222,99 @@ impl Tool for NodeTool {
     }
 }
 
+/// Convert a node's declared attachments into tool-output markers.
+///
+/// Only images the vision path can load are surfaced: the bytes become a
+/// `data:` URI (the one target both hosts can resolve — the phone's own URI is
+/// meaningless on the gateway), and anything oversized or mislabelled is
+/// dropped rather than turned into a broken attachment.
+fn attachment_markers(attachments: &[NodeAttachment]) -> Vec<RenderedMarker> {
+    attachments
+        .iter()
+        .filter_map(|attachment| {
+            let mime = attachment.mime.trim().to_ascii_lowercase();
+            if attachment.kind != "image" {
+                return None;
+            }
+            if !ALLOWED_IMAGE_MIMES.contains(&mime.as_str()) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"mime": mime})),
+                    "node attachment dropped: unsupported image mime"
+                );
+                return None;
+            }
+            let payload = attachment.data_b64.trim();
+            if payload.is_empty()
+                || !payload
+                    .bytes()
+                    .all(|b| b.is_ascii() && !b.is_ascii_whitespace())
+            {
+                return None;
+            }
+            if attachment.decoded_len() > MAX_NODE_ATTACHMENT_BYTES {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "decoded_bytes": attachment.decoded_len(),
+                            "limit": MAX_NODE_ATTACHMENT_BYTES,
+                        })),
+                    "node attachment dropped: over size limit"
+                );
+                return None;
+            }
+            Some(RenderedMarker {
+                target: format!("data:{mime};base64,{payload}"),
+                kind: MarkerKind::Image,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::nodes::{NodeCapability, NodeInfo, NodeRegistry};
     use zeroclaw_api::attribution::Attributable;
+
+    #[test]
+    fn image_attachments_become_data_uri_markers() {
+        let markers = attachment_markers(&[
+            NodeAttachment {
+                kind: "image".to_string(),
+                mime: "image/jpeg".to_string(),
+                data_b64: "aGVsbG8=".to_string(),
+            },
+            NodeAttachment {
+                kind: "image".to_string(),
+                mime: "text/plain".to_string(),
+                data_b64: "aGVsbG8=".to_string(),
+            },
+            NodeAttachment {
+                kind: "document".to_string(),
+                mime: "image/png".to_string(),
+                data_b64: "aGVsbG8=".to_string(),
+            },
+        ]);
+
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].kind, MarkerKind::Image);
+        assert_eq!(markers[0].target, "data:image/jpeg;base64,aGVsbG8=");
+    }
+
+    #[test]
+    fn attachment_decoded_len_matches_base64_padding() {
+        let attachment = NodeAttachment {
+            kind: "image".to_string(),
+            mime: "image/png".to_string(),
+            data_b64: "aGVsbG8=".to_string(),
+        };
+        assert_eq!(attachment.decoded_len(), 5);
+    }
 
     #[test]
     fn node_tool_name_is_provider_safe() {
@@ -350,6 +427,7 @@ mod tests {
                         success: true,
                         output: "echoed".to_string(),
                         error: None,
+                        attachments: Vec::new(),
                     });
             }
         });
@@ -380,34 +458,24 @@ mod tests {
         assert!(spec.parameters["properties"]["unit"]["type"] == "string");
     }
 
+    /// Sensitive capabilities are gated by the agent's approval policy, not
+    /// by a model-supplied flag. The tool must dispatch the call (here: fail
+    /// because no node is connected), never refuse for lack of `approved`.
     #[tokio::test]
-    async fn node_tool_rejects_unapproved_sensitive_operation() {
+    async fn sensitive_capability_is_dispatched_not_gated_in_tool() {
         let registry = Arc::new(NodeRegistry::new(10));
         let tool = NodeTool::new(
             "phone-1".to_string(),
             "camera.snap".to_string(),
             "Take a photo".to_string(),
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "approved": { "type": "boolean" }
-                },
-                "required": ["approved"]
-            }),
+            serde_json::json!({"type": "object", "properties": {}}),
             registry,
         );
 
-        // Without approved field
         let result = tool.execute(serde_json::json!({})).await.unwrap();
+        let error = result.error.unwrap_or_default();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("requires approval"));
-
-        // With approved=false
-        let result = tool
-            .execute(serde_json::json!({"approved": false}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("requires approval"));
+        assert!(error.contains("not connected"), "{error}");
+        assert!(!error.contains("requires approval"), "{error}");
     }
 }

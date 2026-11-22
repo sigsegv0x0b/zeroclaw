@@ -5,8 +5,9 @@ gateway keeps the agents, models, tools and history; the phone is a chat surface
 with streaming replies, tool cards, and remote approval of tool calls.
 
 Status: **0.1 alpha**. Chat, sessions, agents and approvals work against the
-gateway's public WebSocket/REST surface. Device-side node capabilities (camera,
-location, notifications) are not implemented yet.
+gateway's public WebSocket/REST surface. Device-side node capabilities cover
+the clock, location, a user-granted folder, and the photo library; camera,
+notifications and contacts are not implemented yet.
 
 ## What it does
 
@@ -20,10 +21,10 @@ location, notifications) are not implemented yet.
 | Agent switcher from `/api/agents/available` | Done |
 | Stop an in-flight turn (`/abort`) | Done |
 | Reconnect with backoff, connection status | Done |
-| Device link: alarms and timers set on the phone | Done |
+| Device link: clock, location, folder, photo library | Done |
 | QR pairing, push notifications, offline outbox | Not yet |
-| Attachments, voice, model picker | Not yet |
-| Camera, location, SMS, notification forwarding | Not yet |
+| Attachments (inbound), voice, model picker | Not yet |
+| Camera, SMS, notification forwarding, contacts | Not yet |
 | OIDC / mTLS login | Not yet |
 
 ## Build
@@ -86,7 +87,7 @@ The app allows cleartext `ws://` so first-run LAN pairing works. That is the
 same trade-off the dashboard makes on `localhost`; do not rely on it over the
 public internet.
 
-## Device link: alarms and timers
+## Device link: phone capabilities
 
 The chat socket makes the phone a *client*. Alarms and timers need the phone to
 be a **node**: a second WebSocket where the device advertises capabilities, and
@@ -106,9 +107,12 @@ the gateway turns each one into an agent tool. Both halves must be on:
    (default). It starts a `connectedDevice` foreground service, so the link
    stays up when the app is backgrounded.
 
-3. The agent now sees tools named `node_<node_id>__alarm_set` and
-   `node_<node_id>__timer_set`. Ask for a timer or alarm and it invokes the
-   phone.
+3. The agent now sees one tool per capability, named
+   `node_<node_id>__<capability>` (dots become `_`). Ask for a timer or alarm,
+   the time, the phone's location, a file in the granted folder, or a gallery
+   image, and the gateway invokes the phone. The node tools sit beside the
+   gateway's own native tools, so the agent can choose the phone or the host;
+   the tool descriptions tell it to ask when the user has not said which.
 
 Advertised capabilities:
 
@@ -116,14 +120,45 @@ Advertised capabilities:
 |---|---|---|
 | `alarm.set` | `hour` 0–23, `minute` 0–59, `label?`, `skip_ui?`, `vibrate?` | `AlarmClock.ACTION_SET_ALARM` |
 | `timer.set` | `seconds` 1–86400, `label?`, `skip_ui?` | `AlarmClock.ACTION_SET_TIMER` |
+| `alarm.list` / `timer.list` | — | ZeroClaw-tracked entries (see below) |
+| `alarm.delete` / `timer.delete` | `id` or `label?` | Drop the record; send the dismiss intent |
+| `time.get` / `date.get` | — | Local time/date, zone, epoch |
+| `location.get` | `timeout_secs?`, `max_age_secs?` | One location fix (LocationManager) |
+| `file.list` | `path?` | List the operator-granted SAF tree |
+| `file.read` | `path` | Read text (binary: base64, size-capped) |
+| `file.create` | `path`, `content`, `overwrite?` | Create/overwrite a text file |
+| `gallery.list` | `limit?` | Newest MediaStore images |
+| `gallery.read` | `id` | Downscaled JPEG attached to the tool result |
 
 Notes:
 
+- **Listing and deleting clock entries is best-effort by design.** Android gives
+  third-party apps no API to enumerate or cancel the clock app's alarms and
+  timers; only the set/dismiss intents exist. So `alarm.list` / `timer.list`
+  return only entries ZeroClaw created (persisted in the app), and
+  `alarm.delete` / `timer.delete` remove that record. `alarm.delete` also sends
+  the clock app's dismiss intent: AOSP DeskClock drops a pending alarm, some
+  OEMs only dismiss one that is firing, and a timer cannot be cancelled by
+  intent at all. The tool text says this; the agent is told not to claim a
+  pending alarm or timer was cancelled unless the tool output says so.
 - The phone's clock app performs the action; the app only sends the intent.
   Most clock apps honour `skip_ui=true`, but an OEM clock may still show a
   confirmation screen — that is the device owner's gate, not the agent's.
-- `SET_ALARM` is declared in the manifest. No runtime permission prompt is
-  needed for alarms or timers.
+- `SET_ALARM` is declared in the manifest. No runtime permission is needed for
+  alarms or timers. Location (`ACCESS_FINE_LOCATION` / `ACCESS_COARSE_LOCATION`)
+  and the photo library (`READ_MEDIA_IMAGES`, or `READ_EXTERNAL_STORAGE` on
+  API 26–32) are runtime permissions granted from **Settings → Device
+  capabilities**; the capability returns a pointer to that screen until they
+  are granted.
+- **Files are confined to a folder the operator picks** with the system folder
+  picker (SAF `OpenDocumentTree`). The persistable tree grant is stored with the
+  pairing; `..` and absolute paths are rejected, so the agent cannot walk out of
+  the tree. There is no blanket storage permission.
+- `gallery.read` downscales to a 1280 px max edge JPEG and sends it as a
+  base64 attachment over `/ws/nodes`. The gateway validates the MIME type and
+  size cap, then attaches the bytes as a `data:` URI so the vision model can
+  inspect the image. This is the only attachment kind the gateway surfaces
+  today.
 - The node id is a stable `android-xxxxxxxx` value stored with the pairing. It
   appears in tool names, which is why the gateway sanitizes them to
   `[a-zA-Z0-9_-]` (OpenAI-compatible providers reject `:` and `.`).
@@ -136,9 +171,12 @@ serving the old list.
 
 Gateway plumbing: `/ws/nodes` registers the device, and the gateway attaches a
 `NodeToolSource` to the live agent capability for each WebSocket chat agent.
-Each connected capability becomes a `NodeTool`; a disconnected phone simply
-contributes no tools. Node tools still pass through the agent's tool policy and
-the caller's allowlist.
+It is layered over the config-backed tool source, so a connected phone adds
+tools instead of replacing the host's own. Each connected capability becomes a
+`NodeTool`; a disconnected phone simply contributes no tools. Node tools still
+pass through the agent's tool policy and the caller's allowlist, and tool
+approvals reach the paired client over the chat socket's `approval_request`
+frame.
 
 ## Wire contract used
 
@@ -151,7 +189,7 @@ the caller's allowlist.
 | Transcript | `GET /api/sessions/{id}/messages` |
 | Stop a turn | `POST /api/sessions/{id}/abort` |
 | Chat stream | `WS /ws/chat?session_id=…&agent=…` |
-| Device node | `WS /ws/nodes` (register + invoke/result) |
+| Device node | `WS /ws/nodes` (register + invoke/result, optional `attachments`) |
 
 Chat sockets authenticate with `Sec-WebSocket-Protocol: zeroclaw.v1,
 bearer.<token>`, which the gateway accepts alongside the `Authorization` header
@@ -178,9 +216,14 @@ app/src/main/java/ai/zeroclaw/app/
 │   ├── SettingsStore.kt     DataStore-backed gateway URL/token/agent/device id
 │   ├── GatewayClient.kt     REST: pair, agents, sessions, history, abort
 │   ├── ChatSocket.kt        `/ws/chat` transport with backoff
-│   ├── NodeClient.kt        `/ws/nodes` device link: register + invoke
+│   ├── NodeClient.kt        `/ws/nodes` device link: register + invoke + attachments
 │   ├── NodeRuntime.kt       device-link status shared with the UI
-│   ├── DeviceCapabilities.kt  alarm/timer capability definitions + intents
+│   ├── DeviceCapabilities.kt  capability registry, clock + time/date
+│   ├── ClockStore.kt        ZeroClaw-tracked alarms/timers
+│   ├── LocationCapability.kt  one-shot LocationManager read
+│   ├── FileCapabilities.kt  SAF folder list/read/create
+│   ├── GalleryCapabilities.kt  MediaStore list + downscaled read
+│   ├── DevicePermissions.kt runtime permission groups
 │   └── AppViewModel.kt      state machine for pairing → chat → approvals
 ├── service/NodeService.kt   foreground service that owns the device link
 └── ui/
@@ -203,9 +246,13 @@ OpenClaw source is vendored; the tokens were re-expressed here.
 
 ## Known gaps
 
-- Device capabilities are limited to `alarm.set` and `timer.set`. Camera,
-  location, notifications and contacts need their own capability entries and
-  runtime permissions.
+- Clock list/delete only sees ZeroClaw-created entries (Android platform limit,
+  described above).
+- Camera, screen capture, notifications and contacts need their own capability
+  entries and runtime permissions.
+- Location reads need the app in the foreground (or an OEM that relaxes
+  background location for a `connectedDevice` foreground service); the tool
+  fails with a clear message rather than a stale fix.
 - Node tools are attached to the WebSocket-chat agent. Turns driven by a
   Telegram/Discord/other channel do not see them yet.
 - A phone whose clock app ignores `EXTRA_SKIP_UI` will show its own
