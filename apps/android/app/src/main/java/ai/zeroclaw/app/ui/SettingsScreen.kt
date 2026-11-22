@@ -40,7 +40,12 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.ui.platform.LocalContext
+import ai.zeroclaw.app.data.DevicePermissions
 import ai.zeroclaw.app.data.NodeStatus
 import ai.zeroclaw.app.data.UiState
 import ai.zeroclaw.app.ui.theme.Zc
@@ -52,8 +57,22 @@ fun SettingsScreen(
     onReconnect: (url: String, token: String) -> Unit,
     onForget: () -> Unit,
     onNodeEnabled: (Boolean) -> Unit,
+    onFolderPicked: (android.net.Uri?) -> Unit,
 ) {
     var url by remember(state.gatewayUrl) { mutableStateOf(state.gatewayUrl) }
+    val context = LocalContext.current
+    var permissionTick by remember { mutableIntStateOf(0) }
+    val locationGranted = remember(permissionTick) { DevicePermissions.hasLocation(context) }
+    val mediaGranted = remember(permissionTick) { DevicePermissions.hasMedia(context) }
+    val locationLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { permissionTick++ }
+    val mediaLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { permissionTick++ }
+    val folderLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
+    ) { uri -> onFolderPicked(uri) }
     var token by remember(state.token) { mutableStateOf(state.token) }
     var reveal by remember { mutableStateOf(false) }
     var confirmForget by remember { mutableStateOf(false) }
@@ -151,8 +170,9 @@ fun SettingsScreen(
             Spacer(Modifier.height(26.dp))
             SectionLabel("Device capabilities")
             Text(
-                text = "Let the agent use this phone: alarms and timers are set on the device's clock app. " +
-                    "The link runs as a foreground service while it is enabled.",
+                text = "Let the agent use this phone: clock alarms and timers, location, files in " +
+                    "a folder you pick, and photos. The link runs as a foreground service while " +
+                    "it is enabled.",
                 style = MaterialTheme.typography.bodySmall,
                 color = Zc.TextMuted,
             )
@@ -194,6 +214,54 @@ fun SettingsScreen(
             }
             if (state.deviceId.isNotBlank()) {
                 InfoRow("Node id", state.deviceId)
+            }
+
+            Spacer(Modifier.height(6.dp))
+            PermissionRow(
+                title = "Location",
+                detail = if (locationGranted) {
+                    "Granted. The agent can read the current position."
+                } else {
+                    "Needed for location.get. Android asks while the app is open."
+                },
+                granted = locationGranted,
+                actionLabel = "Grant",
+                onAction = { locationLauncher.launch(DevicePermissions.location()) },
+            )
+            PermissionRow(
+                title = "Photos",
+                detail = if (mediaGranted) {
+                    "Granted. The agent can list the gallery and attach an image."
+                } else {
+                    "Needed for gallery.list / gallery.read."
+                },
+                granted = mediaGranted,
+                actionLabel = "Grant",
+                onAction = { mediaLauncher.launch(DevicePermissions.media()) },
+            )
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        text = "Folder",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Zc.Text,
+                    )
+                    Text(
+                        text = state.nodeFolderName.ifBlank {
+                            "No folder chosen. File tools stay unavailable until you pick one."
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (state.nodeFolderName.isBlank()) Zc.TextSubtle else Zc.Success,
+                    )
+                }
+                TextButton(onClick = { folderLauncher.launch(null) }) {
+                    Text("Choose", color = Zc.Accent)
+                }
             }
 
             Spacer(Modifier.height(26.dp))
@@ -251,6 +319,42 @@ private fun nodeStatusLabel(state: UiState): String = when (val status = state.n
     is NodeStatus.Connecting -> "Connecting…"
     is NodeStatus.Error -> "Link lost: ${status.message}"
     NodeStatus.Stopped -> if (state.nodeEnabled) "Starting…" else "Off"
+}
+
+@Composable
+private fun PermissionRow(
+    title: String,
+    detail: String,
+    granted: Boolean,
+    actionLabel: String,
+    onAction: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = Zc.Text,
+            )
+            Text(
+                text = detail,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (granted) Zc.Success else Zc.TextSubtle,
+            )
+        }
+        if (!granted) {
+            TextButton(onClick = onAction) {
+                Text(actionLabel, color = Zc.Accent)
+            }
+        } else {
+            Text("Granted", style = MaterialTheme.typography.labelSmall, color = Zc.Success)
+        }
+    }
 }
 
 @Composable

@@ -1774,6 +1774,21 @@ impl Agent {
         &self.channel_handles
     }
 
+    /// Make sure the `ask_user` channel map exists and return it.
+    ///
+    /// Tool approvals on a non-CLI entry point (the gateway WebSocket) reach
+    /// the operator through the approval bridge, which fans out to whatever is
+    /// registered in this map. An agent built from a config with no outbound
+    /// channels starts with no map, so `register_channel` had nowhere to put
+    /// the WebSocket approval channel and every prompt was auto-denied. Entry
+    /// points that own an approval back-channel call this first.
+    pub fn ensure_ask_user_handle(&mut self) -> crate::tools::PerToolChannelHandle {
+        self.channel_handles
+            .ask_user
+            .get_or_insert_with(crate::tools::PerToolChannelHandle::default)
+            .clone()
+    }
+
     pub fn populate_channels(
         &self,
         channel_map: &std::collections::HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>,
@@ -3238,13 +3253,18 @@ impl Agent {
                 let mut capabilities =
                     crate::composition::RuntimeCapabilities::config_backed(config);
                 // An entry point that owns extra tools (the gateway's connected
-                // device nodes) supplies them here; the config-backed registry
-                // and every policy gate still apply.
+                // device nodes) supplies them here. Layer them over the
+                // config-backed source rather than replacing it: the native
+                // registry, including every host tool, must stay available so
+                // the agent can choose between the phone and this host.
                 if let Some(source) = execution_capability
                     .as_ref()
                     .and_then(|capability| capability.tool_source())
                 {
-                    capabilities.tools = source;
+                    capabilities.tools = Arc::new(crate::composition::LayeredToolSource::new(
+                        capabilities.tools,
+                        source,
+                    ));
                 }
                 (capabilities, None, false)
             }

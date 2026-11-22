@@ -51,6 +51,40 @@ class NodeProtocolTest {
         assertEquals("call-1", json["call_id"]?.jsonPrimitive?.content)
         assertEquals("true", json["success"]?.jsonPrimitive?.content)
         assertEquals("Alarm set for 07:30 on this phone.", json["output"]?.jsonPrimitive?.content)
+        assertEquals(0, (json["attachments"] as JsonArray).size)
+    }
+
+    @Test
+    fun `image attachments use the gateway field names`() {
+        val frame = InvokeResultFrame(
+            callId = "call-2",
+            success = true,
+            output = "Attached image 7.",
+            attachments = listOf(
+                NodeAttachment(
+                    kind = "image",
+                    mime = "image/jpeg",
+                    dataB64 = "aGVsbG8=",
+                ),
+            ),
+        )
+        val json = zcJson.parseToJsonElement(
+            zcJson.encodeToString(InvokeResultFrame.serializer(), frame),
+        ) as JsonObject
+        val attachment = (json["attachments"] as JsonArray)[0] as JsonObject
+
+        assertEquals("image", attachment["kind"]?.jsonPrimitive?.content)
+        assertEquals("image/jpeg", attachment["mime"]?.jsonPrimitive?.content)
+        assertEquals("aGVsbG8=", attachment["data_b64"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `file paths cannot escape the granted folder`() {
+        assertEquals(listOf("notes", "a.txt"), FileCapabilities.normalize("notes/a.txt"))
+        assertEquals(listOf("notes", "a.txt"), FileCapabilities.normalize("/notes//a.txt/"))
+        assertEquals(null, FileCapabilities.normalize("../secret"))
+        assertEquals(null, FileCapabilities.normalize("notes/../../secret"))
+        assertEquals(null, FileCapabilities.normalize("./notes"))
     }
 
     @Test

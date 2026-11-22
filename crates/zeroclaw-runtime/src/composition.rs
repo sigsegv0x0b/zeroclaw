@@ -393,6 +393,44 @@ pub trait ToolSource: Send + Sync {
     fn tools(&self, request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>>;
 }
 
+/// A [`ToolSource`] that keeps a base source's registry and adds an extra
+/// source's tools on top of it.
+///
+/// A gateway entry point owns tools the config-backed source does not know
+/// about — connected device nodes today. Assigning them over the base source
+/// (`capabilities.tools = extra`) makes them *replace* the native registry,
+/// which is how a WS chat agent ends up with a phone's two capabilities and
+/// nothing else. This wrapper delegates [`ToolSource::native_recipe`] to the
+/// base so the native registry is still built, and concatenates
+/// [`ToolSource::tools`]; the runtime's duplicate-name rule then keeps the
+/// native tool and drops the shadowed extras.
+pub struct LayeredToolSource {
+    base: Arc<dyn ToolSource>,
+    extra: Arc<dyn ToolSource>,
+}
+
+impl LayeredToolSource {
+    #[must_use]
+    pub fn new(base: Arc<dyn ToolSource>, extra: Arc<dyn ToolSource>) -> Self {
+        Self { base, extra }
+    }
+}
+
+impl ToolSource for LayeredToolSource {
+    fn native_recipe<'s>(
+        &'s self,
+        request: &ToolRequest<'_>,
+    ) -> anyhow::Result<Option<&'s NativeRegistryRecipe>> {
+        self.base.native_recipe(request)
+    }
+
+    fn tools(&self, request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>> {
+        let mut tools = self.base.tools(request)?;
+        tools.extend(self.extra.tools(request)?);
+        Ok(tools)
+    }
+}
+
 /// Supplies outbound delivery channels.
 ///
 /// It covers replies routed by alias, scheduled delivery, approval prompts and
@@ -897,5 +935,105 @@ mod binding_ratchet_tests {
             offenders.is_empty(),
             "production loops drop the capability binding: {offenders:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod layered_source_tests {
+    use super::*;
+    use crate::tools::Tool;
+
+    struct StubTool(&'static str);
+
+    zeroclaw_api::tool_attribution!(
+        StubTool,
+        zeroclaw_api::attribution::ToolKind::Plugin,
+        zeroclaw_api::attribution::ToolProvenance::Extension
+    );
+
+    #[async_trait]
+    impl Tool for StubTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "stub"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<zeroclaw_api::tool::ToolResult> {
+            Ok(zeroclaw_api::tool::ToolResult::ok(
+                zeroclaw_api::tool::ToolOutput::text("ok"),
+            ))
+        }
+    }
+
+    fn stub_recipe(_inputs: NativeRecipeInputs<'_>) -> anyhow::Result<AllToolsResult> {
+        Ok(AllToolsResult::from_prebuilt_tools(Vec::new()))
+    }
+
+    struct Base;
+
+    impl ToolSource for Base {
+        fn native_recipe<'s>(
+            &'s self,
+            _request: &ToolRequest<'_>,
+        ) -> anyhow::Result<Option<&'s NativeRegistryRecipe>> {
+            Ok(Some(&stub_recipe))
+        }
+
+        fn tools(&self, _request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>> {
+            Ok(vec![Box::new(StubTool("base_tool"))])
+        }
+    }
+
+    struct Extra;
+
+    impl ToolSource for Extra {
+        fn tools(&self, _request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>> {
+            Ok(vec![Box::new(StubTool("extra_tool"))])
+        }
+    }
+
+    /// The regression: an entry-point source must add tools to the native
+    /// registry, not replace it. The native recipe must stay visible and both
+    /// sources' tools must survive the layering.
+    #[test]
+    fn layered_source_keeps_the_base_recipe_and_appends_extra_tools() {
+        let config = Arc::new(Config::default());
+        let security = Arc::new(SecurityPolicy::default());
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(crate::platform::NativeRuntime::new());
+        let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        let request = ToolRequest {
+            config: &config,
+            agent_alias: "assistant",
+            security: &security,
+            runtime: &runtime,
+            memory: &memory,
+        };
+
+        let layered = LayeredToolSource::new(Arc::new(Base), Arc::new(Extra));
+
+        assert!(
+            layered
+                .native_recipe(&request)
+                .expect("recipe lookup succeeds")
+                .is_some(),
+            "the base source's native recipe must survive layering"
+        );
+        let names: Vec<String> = layered
+            .tools(&request)
+            .expect("layered tools resolve")
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert_eq!(names, ["base_tool", "extra_tool"]);
     }
 }

@@ -21,6 +21,8 @@ data class StoredSettings(
     val lastSessionId: String = "",
     val deviceId: String = "",
     val nodeEnabled: Boolean = true,
+    val nodeFolderUri: String = "",
+    val nodeFolderName: String = "",
 )
 
 /**
@@ -38,6 +40,8 @@ class SettingsStore(private val context: Context) {
         val lastSession = stringPreferencesKey("last_session_id")
         val deviceId = stringPreferencesKey("device_id")
         val nodeEnabled = booleanPreferencesKey("node_enabled")
+        val nodeFolderUri = stringPreferencesKey("node_folder_uri")
+        val nodeFolderName = stringPreferencesKey("node_folder_name")
     }
 
     val settings: Flow<StoredSettings> = context.settingsDataStore.data.map { prefs ->
@@ -49,6 +53,8 @@ class SettingsStore(private val context: Context) {
             lastSessionId = prefs[Keys.lastSession].orEmpty(),
             deviceId = prefs[Keys.deviceId].orEmpty(),
             nodeEnabled = prefs[Keys.nodeEnabled] ?: true,
+            nodeFolderUri = prefs[Keys.nodeFolderUri].orEmpty(),
+            nodeFolderName = prefs[Keys.nodeFolderName].orEmpty(),
         )
     }
 
@@ -80,6 +86,13 @@ class SettingsStore(private val context: Context) {
         val generated = "android-" + java.util.UUID.randomUUID().toString().take(8)
         context.settingsDataStore.edit { prefs -> prefs[Keys.deviceId] = generated }
         return generated
+    }
+
+    suspend fun saveNodeFolder(uri: String, name: String) {
+        context.settingsDataStore.edit { prefs ->
+            prefs[Keys.nodeFolderUri] = uri
+            prefs[Keys.nodeFolderName] = name
+        }
     }
 
     suspend fun saveNodeEnabled(enabled: Boolean) {

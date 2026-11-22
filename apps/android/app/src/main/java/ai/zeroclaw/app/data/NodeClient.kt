@@ -128,6 +128,7 @@ class NodeClient(
                 success = outcome.success,
                 output = outcome.output,
                 error = outcome.error,
+                attachments = outcome.attachments,
             )
             webSocket.send(zcJson.encodeToString(InvokeResultFrame.serializer(), result))
         }
