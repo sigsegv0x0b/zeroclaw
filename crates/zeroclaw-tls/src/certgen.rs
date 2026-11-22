@@ -168,6 +168,128 @@ fn load_ca(
     load_ca_from_pem(&ca_cert_pem, &ca_key_pem)
 }
 
+/// On-disk paths to the gateway's identity-based mTLS materials.
+///
+/// The server leaf carries a stable URI SAN (`spiffe://zeroclaw/gateway/<id>`)
+/// and **no DNS or IP SANs**: the dialed address (public IP, DDNS name, LAN
+/// address) is transport, not identity. A client verifies the pinned CA and
+/// this URI, so moving either endpoint between networks does not invalidate
+/// the certificate.
+#[derive(Debug, Clone)]
+pub struct GatewayMaterials {
+    /// Stable, generated gateway identity (`gw_<16 hex>`), persisted on disk.
+    pub gateway_id: String,
+    pub ca_cert_path: PathBuf,
+    pub ca_key_path: PathBuf,
+    pub server_cert_path: PathBuf,
+    pub server_key_path: PathBuf,
+}
+
+/// Ensure the gateway mTLS CA and identity server certificate exist under `dir`.
+///
+/// The CA is never silently rotated; the server leaf is regenerated only when
+/// it is missing or when the persisted gateway id changed. That id is the
+/// certificate's identity and must survive address changes.
+pub fn ensure_gateway_materials(dir: &Path) -> Result<GatewayMaterials> {
+    static GEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _gen_guard = GEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    create_secure_dir(dir)?;
+    let materials = GatewayMaterials {
+        gateway_id: String::new(),
+        ca_cert_path: dir.join("ca.crt"),
+        ca_key_path: dir.join("ca.key"),
+        server_cert_path: dir.join("server.crt"),
+        server_key_path: dir.join("server.key"),
+    };
+    let id_path = dir.join("gateway_id");
+    let gateway_id = if id_path.exists() {
+        std::fs::read_to_string(&id_path)
+            .with_context(|| format!("reading {}", id_path.display()))?
+            .trim()
+            .to_string()
+    } else {
+        let id = format!("gw_{}", hex::encode(rand::random::<[u8; 8]>()));
+        std::fs::write(&id_path, format!("{id}\n"))
+            .with_context(|| format!("writing {}", id_path.display()))?;
+        id
+    };
+    if gateway_id.is_empty()
+        || !gateway_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        anyhow::bail!(
+            "gateway id in {} is invalid; delete it to generate a new identity",
+            id_path.display()
+        );
+    }
+
+    let id_marker = dir.join("server.gateway_id");
+    let id_changed = std::fs::read_to_string(&id_marker)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .as_deref()
+        != Some(gateway_id.as_str());
+    let all_present = materials.ca_cert_path.exists()
+        && materials.ca_key_path.exists()
+        && materials.server_cert_path.exists()
+        && materials.server_key_path.exists();
+    if all_present && !id_changed {
+        return Ok(GatewayMaterials {
+            gateway_id,
+            ..materials
+        });
+    }
+
+    let (ca_cert, ca_key) = if materials.ca_cert_path.exists() && materials.ca_key_path.exists() {
+        load_ca(
+            &materials.ca_cert_path,
+            &materials.ca_key_path,
+            &CaKeyProtection::None,
+        )?
+    } else {
+        let ca_key = rcgen::KeyPair::generate().context("generating gateway CA key")?;
+        let ca_cert = ca_params("ZeroClaw Gateway mTLS CA")?
+            .self_signed(&ca_key)
+            .context("self-signing gateway CA certificate")?;
+        write_public_pem(&materials.ca_cert_path, &ca_cert.pem())?;
+        let ca_key_pem = Zeroizing::new(ca_key.serialize_pem());
+        write_ca_key(
+            &materials.ca_key_path,
+            ca_key_pem.as_str(),
+            &CaKeyProtection::None,
+        )?;
+        (ca_cert, ca_key)
+    };
+
+    let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .context("generating gateway server key")?;
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
+        .context("building gateway server certificate params")?;
+    params.distinguished_name = distinguished_name("zeroclaw-gateway");
+    params.is_ca = rcgen::IsCa::NoCa;
+    params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    let uri = format!("spiffe://zeroclaw/gateway/{gateway_id}")
+        .try_into()
+        .context("gateway identity is not a valid URI SAN")?;
+    params.subject_alt_names = vec![rcgen::SanType::URI(uri)];
+    set_validity(&mut params, SERVER_VALIDITY_DAYS);
+    let cert = params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .context("signing gateway server certificate")?;
+    write_public_pem(&materials.server_cert_path, &cert.pem())?;
+    write_private_pem(&materials.server_key_path, &server_key.serialize_pem())?;
+    std::fs::write(&id_marker, format!("{gateway_id}\n"))
+        .with_context(|| format!("writing {}", id_marker.display()))?;
+
+    Ok(GatewayMaterials {
+        gateway_id,
+        ..materials
+    })
+}
+
 /// Ensure mTLS server materials exist under `dir`.
 ///
 /// The per-daemon CA is the root of trust and is **never silently rotated**: if
@@ -924,6 +1046,58 @@ mod tests {
         assert!(
             m2.server_cert_path.exists(),
             "server leaf was not regenerated"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gateway_material_tests {
+    use super::*;
+    use x509_parser::prelude::*;
+
+    fn san_entries(cert_pem: &str) -> Vec<String> {
+        let der = crate::load_certs_from_pem(cert_pem).unwrap();
+        let (_, cert) = X509Certificate::from_der(der[0].as_ref()).unwrap();
+        let mut out = Vec::new();
+        if let Ok(Some(ext)) = cert.subject_alternative_name() {
+            for name in ext.value.general_names.iter() {
+                match name {
+                    GeneralName::DNSName(d) => out.push(format!("dns:{d}")),
+                    GeneralName::IPAddress(_) => out.push("ip".to_string()),
+                    GeneralName::URI(u) => out.push(format!("uri:{u}")),
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn gateway_identity_is_a_stable_uri_not_an_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = ensure_gateway_materials(dir.path()).unwrap();
+        assert!(first.gateway_id.starts_with("gw_"), "{}", first.gateway_id);
+        let cert = std::fs::read_to_string(&first.server_cert_path).unwrap();
+        let sans = san_entries(&cert);
+        assert_eq!(
+            sans,
+            vec![format!(
+                "uri:spiffe://zeroclaw/gateway/{}",
+                first.gateway_id
+            )],
+            "gateway leaf must identify by URI only, no DNS/IP: {sans:?}"
+        );
+
+        let ca_one = std::fs::read_to_string(&first.ca_cert_path).unwrap();
+        let second = ensure_gateway_materials(dir.path()).unwrap();
+        assert_eq!(
+            first.gateway_id, second.gateway_id,
+            "identity must be stable"
+        );
+        assert_eq!(
+            ca_one,
+            std::fs::read_to_string(&second.ca_cert_path).unwrap(),
+            "CA must not rotate on restart"
         );
     }
 }

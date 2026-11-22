@@ -7521,6 +7521,12 @@ enum SecurityCommands {
         /// Overwrite an existing certificate/key for this name.
         #[arg(long)]
         force: bool,
+
+        /// CA directory. Defaults to `<data_dir>/tls`; pass the gateway mTLS
+        /// material directory (e.g. `<data_dir>/gateway-mtls`) to issue a
+        /// client certificate for the identity-based `[gateway.mtls]` listener.
+        #[arg(long)]
+        ca_dir: Option<PathBuf>,
     },
 
     /// Revoke an issued client certificate so the daemon refuses it at the next
@@ -8228,8 +8234,9 @@ fn issue_wss_client_cert(
     name: &str,
     out_dir: Option<PathBuf>,
     force: bool,
+    ca_dir: Option<PathBuf>,
 ) -> Result<()> {
-    let tls_dir = config.data_dir.join("tls");
+    let tls_dir = ca_dir.unwrap_or_else(|| config.data_dir.join("tls"));
     let ca_cert = tls_dir.join("ca.crt");
     let ca_key = tls_dir.join("ca.key");
     if !ca_cert.exists() || !ca_key.exists() {
@@ -12184,7 +12191,8 @@ Add pricing to the active provider profile or supply a catalog entry."
                 name,
                 out_dir,
                 force,
-            } => issue_wss_client_cert(&config, &name, out_dir, force),
+                ca_dir,
+            } => issue_wss_client_cert(&config, &name, out_dir, force, ca_dir),
             SecurityCommands::RevokeClientCert {
                 fingerprint,
                 device,

@@ -72,6 +72,7 @@
   - [Feature and support matrix](./reference/feature-matrix.md)
   - [API (rustdoc)](./api.md)
   - [Gateway HTTP API](./gateway/api.md)
+  - [Identity-based mTLS transport](./gateway/mtls-transport.md)
   - [A2A agent discovery](./gateway/a2a-discovery.md)
   - [Web dashboard (web_dist_dir)](./gateway/web-dashboard.md)
 - [Agents](./agents/overview.md)

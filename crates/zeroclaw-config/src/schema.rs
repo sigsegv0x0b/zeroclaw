@@ -8022,6 +8022,17 @@ pub struct GatewayConfig {
     #[nested]
     pub tls: Option<GatewayTlsConfig>,
 
+    /// Additional identity-based mTLS listener (`[gateway.mtls]`).
+    ///
+    /// Runs alongside the normal gateway transport, on its own port. The
+    /// server certificate carries a stable generated URI SAN
+    /// (`spiffe://zeroclaw/gateway/<id>`), never a DNS name or IP, so the
+    /// client may reach it through a public IP or DDNS name that changes.
+    /// Client certificates are required and must chain to the generated CA.
+    #[serde(default)]
+    #[nested]
+    pub mtls: Option<GatewayMtlsConfig>,
+
     /// HTTP request timeout (seconds) for gateway routes other than the
     /// long-running cron-trigger endpoint. Default: 30s.
     #[serde(default = "default_gateway_request_timeout_secs")]
@@ -8133,6 +8144,7 @@ impl Default for GatewayConfig {
             dashboard_sign_in: DashboardSignInConfig::default(),
             web_dist_dir: None,
             tls: None,
+            mtls: None,
             request_timeout_secs: default_gateway_request_timeout_secs(),
             long_running_request_timeout_secs: default_gateway_long_running_request_timeout_secs(),
             check_updates: true,
@@ -8271,6 +8283,45 @@ pub struct GatewayTlsConfig {
     #[serde(default)]
     #[nested]
     pub client_auth: Option<GatewayClientAuthConfig>,
+}
+
+/// Identity-based mTLS listener (`[gateway.mtls]`).
+///
+/// This is an additive transport: the existing gateway listener keeps its
+/// configured plain/TLS mode. When enabled, a second listener serves the same
+/// HTTP/WebSocket app with mandatory client-certificate authentication.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "gateway.mtls"]
+#[serde(default)]
+pub struct GatewayMtlsConfig {
+    /// Enable the additional mTLS listener (default: false).
+    pub enabled: bool,
+    /// Address the mTLS listener binds on (default: 127.0.0.1).
+    pub bind: String,
+    /// Port the mTLS listener binds on (default: 42618).
+    pub port: u16,
+    /// Material directory. Empty means `<data_dir>/gateway-mtls`.
+    pub dir: String,
+    /// Extra client-certificate SHA-256 pins (hex). The generated CA remains
+    /// the chain root; a non-empty list additionally restricts which leaves
+    /// are accepted.
+    pub pinned_client_certs: Vec<String>,
+    /// Optional CRL file (one revoked SHA-256 fingerprint per line).
+    pub crl_path: String,
+}
+
+impl Default for GatewayMtlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1".to_string(),
+            port: 42_618,
+            dir: String::new(),
+            pinned_client_certs: Vec::new(),
+            crl_path: String::new(),
+        }
+    }
 }
 
 /// Client certificate authentication (mTLS) configuration (`[gateway.tls.client_auth]`).
@@ -38269,6 +38320,7 @@ allowed_numbers = ["+1", "+2"]
             dashboard_sign_in: DashboardSignInConfig::default(),
             web_dist_dir: None,
             tls: None,
+            mtls: None,
             request_timeout_secs: 30,
             long_running_request_timeout_secs: 600,
             check_updates: true,
