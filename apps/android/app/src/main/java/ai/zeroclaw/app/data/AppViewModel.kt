@@ -27,6 +27,10 @@ data class UiState(
     val voiceBackend: String = "android",
     val voiceListening: Boolean = false,
     val voiceError: String? = null,
+    val mtlsEnabled: Boolean = false,
+    val mtlsGatewayId: String = "",
+    val mtlsLoaded: Boolean = false,
+    val mtlsStatus: String = "",
     val nodeStatus: NodeStatus = NodeStatus.Stopped,
     val agents: List<AgentEntry> = emptyList(),
     val agent: String = "",
@@ -110,9 +114,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     nodeEnabled = saved.nodeEnabled,
                     nodeFolderName = saved.nodeFolderName,
                     voiceBackend = saved.voiceBackend,
+                    mtlsEnabled = saved.mtlsEnabled,
+                    mtlsGatewayId = saved.mtlsGatewayId,
+                    mtlsLoaded = saved.mtlsCaPem.isNotBlank() &&
+                        saved.mtlsClientCertPem.isNotBlank() &&
+                        saved.mtlsClientKeyPem.isNotBlank(),
+                    mtlsStatus = MtlsTransport.describe(saved),
                     booting = false,
                 )
             }
+            applyMtlsTransport(saved, reconnect = false)
             if (saved.nodeEnabled) {
                 NodeService.start(getApplication())
             }
@@ -308,6 +319,78 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
         override fun onStopped() {
             _ui.update { it.copy(voiceListening = false) }
+        }
+    }
+
+    // ── Identity-based mTLS transport ──────────────────────────────────────
+
+    private fun applyMtlsTransport(settings: StoredSettings, reconnect: Boolean) {
+        val client = when (val result = MtlsTransport.build(settings)) {
+            is MtlsTransport.Result.Ready -> result.built.client
+            is MtlsTransport.Result.Unavailable -> MtlsTransport.plainClient()
+        }
+        gateway.updateHttpClient(client)
+        socket.updateHttpClient(client)
+        if (reconnect) {
+            val snapshot = _ui.value
+            if (snapshot.paired) reconnect(snapshot.gatewayUrl, snapshot.token)
+        }
+    }
+
+    fun setMtlsEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            store.saveMtlsEnabled(enabled)
+            val saved = store.current()
+            // Keep Settings open; the next "Save and reconnect" picks the transport up.
+            applyMtlsTransport(saved, reconnect = false)
+            _ui.update {
+                it.copy(
+                    mtlsEnabled = saved.mtlsEnabled,
+                    mtlsStatus = MtlsTransport.describe(saved),
+                )
+            }
+        }
+    }
+
+    fun setMtlsGatewayId(id: String) {
+        _ui.update { it.copy(mtlsGatewayId = id) }
+        viewModelScope.launch {
+            store.saveMtlsGatewayId(id)
+            val saved = store.current()
+            _ui.update { it.copy(mtlsStatus = MtlsTransport.describe(saved)) }
+        }
+    }
+
+    /** Import one PEM file (CA, client certificate or client key) via SAF. */
+    fun importMtlsMaterial(kind: String, uri: Uri?) {
+        if (uri == null) return
+        viewModelScope.launch {
+            val text = runCatching {
+                getApplication<Application>().contentResolver
+                    .openInputStream(uri)
+                    ?.bufferedReader()
+                    ?.use { it.readText() }
+            }.getOrNull()
+            if (text.isNullOrBlank() || !text.contains("-----BEGIN")) {
+                _ui.update { it.copy(error = "The selected file is not a PEM certificate or key.") }
+                return@launch
+            }
+            when (kind) {
+                "ca" -> store.saveMtlsMaterial(ca = text, cert = null, key = null)
+                "cert" -> store.saveMtlsMaterial(ca = null, cert = text, key = null)
+                "key" -> store.saveMtlsMaterial(ca = null, cert = null, key = text)
+                else -> return@launch
+            }
+            val saved = store.current()
+            applyMtlsTransport(saved, reconnect = false)
+            _ui.update {
+                it.copy(
+                    mtlsLoaded = saved.mtlsCaPem.isNotBlank() &&
+                        saved.mtlsClientCertPem.isNotBlank() &&
+                        saved.mtlsClientKeyPem.isNotBlank(),
+                    mtlsStatus = MtlsTransport.describe(saved),
+                )
+            }
         }
     }
 

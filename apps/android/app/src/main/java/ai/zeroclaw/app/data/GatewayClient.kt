@@ -26,9 +26,14 @@ class GatewayException(
  * [ChatSocket]; everything else here is request/response.
  */
 class GatewayClient(
-    private val http: OkHttpClient = defaultHttpClient(),
+    @Volatile private var http: OkHttpClient = defaultHttpClient(),
 ) {
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
+
+    /** Swap the transport (e.g. plain https -> identity-based mTLS). */
+    fun updateHttpClient(client: OkHttpClient) {
+        http = client
+    }
 
     suspend fun health(baseUrl: String): Boolean = withContext(Dispatchers.IO) {
         val request = Request.Builder().url("$baseUrl/health").get().build()

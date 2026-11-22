@@ -30,12 +30,17 @@ import java.util.concurrent.TimeUnit
  */
 class ChatSocket(
     private val scope: CoroutineScope,
-    private val http: OkHttpClient = OkHttpClient.Builder()
+    @Volatile private var http: OkHttpClient = OkHttpClient.Builder()
         .pingInterval(20, TimeUnit.SECONDS)
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS)
         .build(),
 ) {
+    /** Swap the transport (e.g. plain ws -> identity-based mTLS) on reconnect. */
+    fun updateHttpClient(client: OkHttpClient) {
+        http = client
+    }
+
     data class Config(
         val baseUrl: String,
         val token: String,
