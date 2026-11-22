@@ -18,9 +18,9 @@ use tokio_rustls::TlsAcceptor;
 
 pub mod certgen;
 pub use certgen::{
-    CaKeyProtection, IssuedLeaf, Pem, ServerMaterials, ensure_server_materials,
-    ensure_server_materials_protected, generate_client_csr, issue_client_cert, load_ca_key_pem,
-    server_leaf_sans, sign_csr,
+    CaKeyProtection, GatewayMaterials, IssuedLeaf, Pem, ServerMaterials, ensure_gateway_materials,
+    ensure_server_materials, ensure_server_materials_protected, generate_client_csr,
+    issue_client_cert, load_ca_key_pem, server_leaf_sans, sign_csr,
 };
 
 pub mod csr;
@@ -551,6 +551,12 @@ impl rustls::client::danger::ServerCertVerifier for RelayPinVerifier {
 }
 
 /// Load PEM-encoded certificates from a file.
+pub fn load_certs_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
+    rustls_pemfile::certs(&mut pem.as_bytes())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("parsing certificate PEM")
+}
+
 pub fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("cannot open certificate file: {path}"))?;

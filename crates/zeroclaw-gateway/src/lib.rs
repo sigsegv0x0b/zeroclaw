@@ -1323,6 +1323,119 @@ async fn gateway_stop_requested(stopping: &mut tokio::sync::watch::Receiver<bool
     }
 }
 
+/// Build the optional identity-based mTLS listener.
+///
+/// The server certificate carries a generated URI SAN
+/// (`spiffe://zeroclaw/gateway/<id>`), never a DNS name or IP. Client
+/// certificates must chain to the generated CA; the normal gateway listener is
+/// left untouched so existing transports keep working.
+async fn build_gateway_mtls_listener(
+    config: &Config,
+) -> anyhow::Result<Option<(tokio::net::TcpListener, tokio_rustls::TlsAcceptor, String)>> {
+    let Some(mtls) = config.gateway.mtls.as_ref().filter(|m| m.enabled) else {
+        return Ok(None);
+    };
+    let dir = if mtls.dir.trim().is_empty() {
+        config.data_dir.join("gateway-mtls")
+    } else {
+        std::path::PathBuf::from(mtls.dir.trim())
+    };
+    let materials = zeroclaw_tls::ensure_gateway_materials(&dir)?;
+    let acceptor = zeroclaw_tls::build_mtls_acceptor(
+        &materials.server_cert_path.to_string_lossy(),
+        &materials.server_key_path.to_string_lossy(),
+        &materials.ca_cert_path.to_string_lossy(),
+        &mtls.pinned_client_certs,
+        &mtls.crl_path,
+    )?;
+    let listener = tokio::net::TcpListener::bind((mtls.bind.as_str(), mtls.port)).await?;
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            serde_json::json!({
+                "bind": mtls.bind,
+                "port": mtls.port,
+                "gateway_id": materials.gateway_id,
+                "identity": format!("spiffe://zeroclaw/gateway/{}", materials.gateway_id),
+            })
+        ),
+        "Gateway mTLS listener up with identity-based certificates"
+    );
+    Ok(Some((listener, acceptor, materials.gateway_id)))
+}
+
+/// Serve the same gateway app on the additional mTLS listener.
+///
+/// Connections are tracked in the gateway's `ServeTasks` so the normal shutdown
+/// drain still applies; a stop request breaks the accept loop.
+fn spawn_gateway_mtls_listener(
+    router: axum::Router,
+    listener: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    gateway_id: String,
+    admission: Admission,
+    mut stopping: tokio::sync::watch::Receiver<bool>,
+    tasks: ServeTasks,
+) {
+    tokio::spawn(async move {
+        let mut service = router.into_make_service_with_connect_info::<SocketAddr>();
+        loop {
+            let accepted = tokio::select! {
+                () = gateway_stop_requested(&mut stopping) => break,
+                conn = listener.accept() => conn,
+            };
+            let (tcp_stream, remote_addr) = match accepted {
+                Ok(pair) => pair,
+                Err(_) => continue,
+            };
+            let acceptor = acceptor.clone();
+            let gateway_id = gateway_id.clone();
+            let admission = admission.clone();
+            let svc = match tower::MakeService::<
+                SocketAddr,
+                hyper::Request<hyper::body::Incoming>,
+            >::make_service(&mut service, remote_addr)
+            .await
+            {
+                Ok(svc) => svc,
+                Err(_) => continue,
+            };
+            let executor = tasks.clone();
+            tasks.spawn(async move {
+                let tls_stream = match acceptor.accept(tcp_stream).await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(serde_json::json!({
+                                "error": format!("{error}"),
+                                "remote_addr": remote_addr,
+                                "gateway_id": gateway_id,
+                            })),
+                            "gateway mTLS handshake failed"
+                        );
+                        return;
+                    }
+                };
+                let hyper_svc = hyper::service::service_fn(
+                    move |req: hyper::Request<hyper::body::Incoming>| {
+                        let svc = svc.clone();
+                        let admission = admission.clone();
+                        async move { serve_while_current(svc, &admission, req).await }
+                    },
+                );
+                let builder = hyper_util::server::conn::auto::Builder::new(executor);
+                let io = hyper_util::rt::TokioIo::new(tls_stream);
+                let _ = builder.serve_connection_with_upgrades(io, hyper_svc).await;
+            });
+        }
+    });
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 // One parameter per daemon-owned dependency; a bundling struct would only
@@ -3008,6 +3121,11 @@ pub async fn run_gateway_with_plugin_webhooks(
         readiness.report_ready(actual_addr);
     }
 
+    // An additive, identity-based mTLS listener. The normal listener below
+    // keeps whatever transport the operator configured.
+    let mtls_listener = build_gateway_mtls_listener(&config).await?;
+    let mtls_router = mtls_listener.as_ref().map(|_| app.clone());
+
     // One accept loop for plain and TLS connections. Every connection
     // watches this gateway's stop and serves through `admission`, so after
     // the stop no request reaches this gateway's router. Its tasks are in
@@ -3027,6 +3145,17 @@ pub async fn run_gateway_with_plugin_webhooks(
         stopping: shutdown_rx.clone(),
         tasks: tasks.clone(),
     };
+    if let (Some(router), Some((listener, acceptor, gateway_id))) = (mtls_router, mtls_listener) {
+        spawn_gateway_mtls_listener(
+            router,
+            listener,
+            acceptor,
+            gateway_id,
+            admission.clone(),
+            shutdown_rx.clone(),
+            tasks.clone(),
+        );
+    }
     loop {
         tokio::select! {
             conn = listener.accept() => {
