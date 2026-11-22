@@ -23,6 +23,7 @@ pub mod api_skills;
 pub mod api_sop;
 pub mod api_sop_author;
 mod api_sop_webhook;
+pub mod api_transcribe;
 pub mod api_upload;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
@@ -2884,7 +2885,25 @@ pub async fn run_gateway_with_plugin_webhooks(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
         ));
-    let inner = inner.merge(upload_router);
+    // Voice transcription uploads are far larger than the control-plane body
+    // cap, so this route gets its own body limit and a longer timeout than the
+    // 30s gateway default (a cloud STT call can take a while).
+    let transcribe_router: Router = Router::new()
+        .route(
+            "/api/transcribe",
+            post(api_transcribe::handle_transcribe).layer(axum::extract::DefaultBodyLimit::max(
+                api_transcribe::TRANSCRIBE_BODY_CEILING_BYTES,
+            )),
+        )
+        .with_state(state.clone())
+        .layer(RequestBodyLimitLayer::new(
+            api_transcribe::TRANSCRIBE_BODY_CEILING_BYTES,
+        ))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(180),
+        ));
+    let inner = inner.merge(upload_router).merge(transcribe_router);
 
     // Manual cron-trigger and A2A task routes live on their own sub-router so
     // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a

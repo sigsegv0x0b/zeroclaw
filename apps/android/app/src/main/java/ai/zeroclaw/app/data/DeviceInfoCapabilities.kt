@@ -125,7 +125,7 @@ object DeviceInfoCapabilities {
                 android.Manifest.permission.POST_NOTIFICATIONS,
             ),
             "notificationAccess" to DevicePermissions.hasNotificationAccess(context),
-            "accessibility" to isAccessibilityEnabled(context),
+            "accessibility" to DevicePermissions.hasAccessibility(context),
         )
         CapabilityOutcome(
             true,
@@ -265,13 +265,6 @@ object DeviceInfoCapabilities {
         val available = stat.availableBytes
         val total = stat.totalBytes
         return Storage(total = total, available = available)
-    }
-
-    private fun isAccessibilityEnabled(context: Context): Boolean {
-        val manager = context.getSystemService(android.view.accessibility.AccessibilityManager::class.java)
-        return manager?.getEnabledAccessibilityServiceList(
-            android.accessibilityservice.AccessibilityServiceInfo.FEEDBACK_ALL_MASK,
-        )?.any { it.resolveInfo.serviceInfo.packageName == context.packageName } == true
     }
 
     private fun humanBytes(bytes: Long): String = when {

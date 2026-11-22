@@ -96,6 +96,15 @@ object DeviceCapabilities {
     const val CALL_LOG_SEARCH = "callLog.search"
     const val NOTIFICATIONS_LIST = "notifications.list"
     const val NOTIFICATIONS_ACTIONS = "notifications.actions"
+    const val CAMERA_LIST = "camera.list"
+    const val CAMERA_SNAP = "camera.snap"
+    const val CAMERA_CLIP = "camera.clip"
+    const val MOBILE_UI_OBSERVE = "mobile.ui.observe"
+    const val MOBILE_UI_ACT = "mobile.ui.act"
+    const val TALK_PTT_START = "talk.ptt.start"
+    const val TALK_PTT_STOP = "talk.ptt.stop"
+    const val TALK_PTT_CANCEL = "talk.ptt.cancel"
+    const val TALK_PTT_ONCE = "talk.ptt.once"
 
     private const val PHONE_NOTE = " This runs on the phone, not on the ZeroClaw host."
     private const val ASK_TARGET_NOTE =
@@ -528,6 +537,122 @@ object DeviceCapabilities {
             }
             """.trimIndent(),
         ),
+
+
+        capability(
+            CAMERA_LIST,
+            "List this phone's cameras and their facing direction.",
+            """
+            { "type": "object", "properties": {} }
+            """.trimIndent(),
+        ),
+        capability(
+            CAMERA_SNAP,
+            "Take a photo with this phone's camera and attach it to the result. The app must " +
+                "be in the foreground.",
+            """
+            {
+              "type": "object",
+              "properties": {
+                "facing": { "type": "string", "enum": ["back", "front"], "default": "back" },
+                "maxWidth": { "type": "integer", "minimum": 320, "maximum": 4096, "default": 1280 }
+              }
+            }
+            """.trimIndent(),
+        ),
+        capability(
+            CAMERA_CLIP,
+            "Record a short video with this phone's camera. The file stays on the phone and is " +
+                "not attached to the tool result.",
+            """
+            {
+              "type": "object",
+              "properties": {
+                "facing": { "type": "string", "enum": ["back", "front"], "default": "back" },
+                "durationMs": { "type": "integer", "minimum": 500, "maximum": 15000, "default": 3000 }
+              }
+            }
+            """.trimIndent(),
+        ),
+        capability(
+            MOBILE_UI_OBSERVE,
+            "Snapshot this phone's active screen through the accessibility service. Returns a " +
+                "snapshot id and the visible nodes with refs, text, ids and bounds. Requires " +
+                "Accessibility to be enabled for ZeroClaw.",
+            """
+            { "type": "object", "properties": {} }
+            """.trimIndent(),
+        ),
+        capability(
+            MOBILE_UI_ACT,
+            "Act on the last accessibility snapshot: click a ref, set text, scroll, tap or " +
+                "swipe coordinates, or perform a global action (back, home, recents, " +
+                "notifications, quick_settings).",
+            """
+            {
+              "type": "object",
+              "properties": {
+                "snapshot_id": { "type": "string" },
+                "action": {
+                  "type": "object",
+                  "properties": {
+                    "type": { "type": "string",
+                              "enum": ["click", "set_text", "scroll", "tap", "swipe", "global"] },
+                    "ref": { "type": "string" },
+                    "text": { "type": "string" },
+                    "direction": { "type": "string", "enum": ["forward", "backward"] },
+                    "x": { "type": "integer" },
+                    "y": { "type": "integer" },
+                    "x1": { "type": "integer" },
+                    "y1": { "type": "integer" },
+                    "x2": { "type": "integer" },
+                    "y2": { "type": "integer" },
+                    "duration_ms": { "type": "integer" },
+                    "name": { "type": "string",
+                              "enum": ["back", "home", "recents", "notifications", "quick_settings"] }
+                  },
+                  "required": ["type"]
+                }
+              },
+              "required": ["snapshot_id", "action"]
+            }
+            """.trimIndent(),
+        ),
+        capability(
+            TALK_PTT_ONCE,
+            "Record one spoken utterance with this phone's microphone and return the transcript. " +
+                "Use this when the user wants to talk instead of typing.",
+            """
+            {
+              "type": "object",
+              "properties": {
+                "timeout_secs": { "type": "integer", "minimum": 3, "maximum": 30, "default": 15 }
+              }
+            }
+            """.trimIndent(),
+        ),
+        capability(
+            TALK_PTT_START,
+            "Start a push-to-talk capture session on this phone. Call talk.ptt.stop to get the " +
+                "transcript or talk.ptt.cancel to discard it.",
+            """
+            { "type": "object", "properties": {} }
+            """.trimIndent(),
+        ),
+        capability(
+            TALK_PTT_STOP,
+            "Stop the active push-to-talk session and return its transcript.",
+            """
+            { "type": "object", "properties": {} }
+            """.trimIndent(),
+        ),
+        capability(
+            TALK_PTT_CANCEL,
+            "Cancel the active push-to-talk session without returning a transcript.",
+            """
+            { "type": "object", "properties": {} }
+            """.trimIndent(),
+        ),
     )
 
     suspend fun execute(context: Context, capability: String, args: JsonObject): CapabilityOutcome =
@@ -564,6 +689,15 @@ object DeviceCapabilities {
             CALL_LOG_SEARCH -> CallLogCapabilities.search(context, args)
             NOTIFICATIONS_LIST -> NotificationCapabilities.list(context, args)
             NOTIFICATIONS_ACTIONS -> NotificationCapabilities.actions(context, args)
+            CAMERA_LIST -> CameraCapabilities.list(context)
+            CAMERA_SNAP -> CameraCapabilities.snap(context, args)
+            CAMERA_CLIP -> CameraCapabilities.clip(context, args)
+            MOBILE_UI_OBSERVE -> MobileUiCapabilities.observe(context)
+            MOBILE_UI_ACT -> MobileUiCapabilities.act(context, args)
+            TALK_PTT_ONCE -> VoiceCapabilities.once(context, args)
+            TALK_PTT_START -> VoiceCapabilities.start(context)
+            TALK_PTT_STOP -> VoiceCapabilities.stop()
+            TALK_PTT_CANCEL -> VoiceCapabilities.cancel()
             else -> CapabilityOutcome(false, "", "Unsupported capability: $capability")
         }
 

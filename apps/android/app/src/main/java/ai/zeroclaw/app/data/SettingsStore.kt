@@ -23,6 +23,8 @@ data class StoredSettings(
     val nodeEnabled: Boolean = true,
     val nodeFolderUri: String = "",
     val nodeFolderName: String = "",
+    /** `android` (on-phone recognizer) or `zeroclaw` (gateway transcription). */
+    val voiceBackend: String = "android",
 )
 
 /**
@@ -42,6 +44,7 @@ class SettingsStore(private val context: Context) {
         val nodeEnabled = booleanPreferencesKey("node_enabled")
         val nodeFolderUri = stringPreferencesKey("node_folder_uri")
         val nodeFolderName = stringPreferencesKey("node_folder_name")
+        val voiceBackend = stringPreferencesKey("voice_backend")
     }
 
     val settings: Flow<StoredSettings> = context.settingsDataStore.data.map { prefs ->
@@ -55,6 +58,7 @@ class SettingsStore(private val context: Context) {
             nodeEnabled = prefs[Keys.nodeEnabled] ?: true,
             nodeFolderUri = prefs[Keys.nodeFolderUri].orEmpty(),
             nodeFolderName = prefs[Keys.nodeFolderName].orEmpty(),
+            voiceBackend = prefs[Keys.voiceBackend] ?: "android",
         )
     }
 
@@ -92,6 +96,12 @@ class SettingsStore(private val context: Context) {
         context.settingsDataStore.edit { prefs ->
             prefs[Keys.nodeFolderUri] = uri
             prefs[Keys.nodeFolderName] = name
+        }
+    }
+
+    suspend fun saveVoiceBackend(backend: String) {
+        context.settingsDataStore.edit { prefs ->
+            prefs[Keys.voiceBackend] = backend
         }
     }
 

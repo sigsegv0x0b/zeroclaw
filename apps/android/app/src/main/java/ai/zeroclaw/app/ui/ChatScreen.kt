@@ -32,6 +32,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
@@ -78,8 +82,13 @@ fun ChatScreen(
         Composer(
             busy = state.busy,
             connected = state.connected,
+            voiceListening = state.voiceListening,
+            voiceError = state.voiceError,
             onSend = viewModel::send,
             onStop = viewModel::stop,
+            onVoiceStart = viewModel::startVoice,
+            onVoiceStop = viewModel::stopVoice,
+            onVoiceCancel = viewModel::cancelVoice,
             modifier = Modifier
                 .imePadding()
                 .navigationBarsPadding(),
@@ -231,11 +240,25 @@ private fun ApprovalDialog(
                     }
                 }
                 prompt.timeoutSecs?.let { seconds ->
+                    // Live countdown: the gateway's auto-deny window starts when
+                    // the request is sent, so tick once a second from the value
+                    // the frame carried rather than showing a frozen number.
+                    var remaining by remember(prompt.requestId) { mutableIntStateOf(seconds) }
+                    LaunchedEffect(prompt.requestId) {
+                        while (remaining > 0) {
+                            kotlinx.coroutines.delay(1_000)
+                            remaining -= 1
+                        }
+                    }
                     Spacer(Modifier.height(10.dp))
                     Text(
-                        text = "Auto-denies in ${seconds}s.",
+                        text = if (remaining > 0) {
+                            "Auto-denies in ${remaining}s."
+                        } else {
+                            "Auto-deny window elapsed — waiting for the gateway."
+                        },
                         style = MaterialTheme.typography.labelSmall,
-                        color = Zc.TextSubtle,
+                        color = if (remaining <= 10 && remaining > 0) Zc.Warning else Zc.TextSubtle,
                     )
                 }
             }
