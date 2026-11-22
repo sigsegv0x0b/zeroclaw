@@ -6,8 +6,9 @@ with streaming replies, tool cards, and remote approval of tool calls.
 
 Status: **0.1 alpha**. Chat, sessions, agents and approvals work against the
 gateway's public WebSocket/REST surface. Device-side node capabilities cover
-the clock, location, a user-granted folder, and the photo library; camera,
-notifications and contacts are not implemented yet.
+the clock, location, a user-granted folder, photos, contacts, calendar, motion,
+SMS/call log, notifications, camera capture, accessibility UI control and
+on-phone voice transcription.
 
 ## What it does
 
@@ -143,6 +144,35 @@ Advertised capabilities:
 | `callLog.search` | `query?`, `limit?` | Search the call log |
 | `notifications.list` | `limit?` | Posted notifications |
 | `notifications.actions` | `key`, `action` (`open`/`dismiss`/`reply`), `reply_text?` | Act on a notification |
+| `camera.list` | — | Cameras and facing |
+| `camera.snap` | `facing?`, `maxWidth?` | Headless JPEG, attached to the result |
+| `camera.clip` | `facing?`, `durationMs?` | MP4 saved on the phone (path only) |
+| `mobile.ui.observe` | — | Accessibility snapshot with node refs |
+| `mobile.ui.act` | `snapshot_id`, `action` | click/set_text/scroll/tap/swipe/global |
+| `talk.ptt.once` | `timeout_secs?` | Transcribe one utterance |
+| `talk.ptt.start` / `.stop` / `.cancel` | — | Session-based push-to-talk |
+
+## Voice input in the composer
+
+The chat composer has a mic button beside Send:
+
+- **Press and hold**, speak, release: the recording is finalized and sent.
+- **Tap and let go**: the recorder keeps listening until it detects silence,
+  then transcribes and sends automatically.
+
+Two backends are available under **Settings → Voice input**:
+
+| Backend | Where audio goes | Requirement |
+|---|---|---|
+| Android speech-to-text | Stays on the phone (SpeechRecognizer) | Microphone permission |
+| ZeroClaw gateway | POST to `/api/transcribe`; the gateway calls its STT provider | `[transcription] enabled = true` plus a provider on the gateway |
+
+The gateway endpoint reuses the existing transcription providers (Groq,
+OpenAI, Deepgram, Google, local Whisper, or
+`[providers.transcription.<type>.<alias>]`), so STT credentials stay on the
+gateway. A missing or disabled provider returns a clear error in the composer.
+The same `talk.ptt.*` node tools remain available to the agent; they use the
+on-phone recognizer.
 
 Notes:
 
@@ -169,6 +199,18 @@ Notes:
 - `notifications.list` / `.actions` need the **Notification access** special
   grant (Settings → Device capabilities → Notification access), not a runtime
   permission. The listener keeps posted notifications in memory only.
+- `mobile.ui.observe` / `.act` need the **Accessibility** special grant
+  (Settings → Device capabilities → Accessibility) and a service config that
+  can retrieve window content and perform gestures. Snapshots hold refs only;
+  an act re-resolves the node against the current window and refuses a stale
+  snapshot id.
+- `camera.snap`/`clip` need the Camera runtime permission and the app in the
+  foreground on Android versions that restrict background camera use.
+  `camera.clip` writes an MP4 into the app cache and returns its path: the node
+  protocol carries image attachments only, so video is not attached.
+- `talk.ptt.*` need the Microphone runtime permission. They transcribe on the
+  phone with Android's SpeechRecognizer; the composer's ZeroClaw backend is the
+  path that sends audio to the gateway (`/api/transcribe`).
 - **Files are confined to a folder the operator picks** with the system folder
   picker (SAF `OpenDocumentTree`). The persistable tree grant is stored with the
   pairing; `..` and absolute paths are rejected, so the agent cannot walk out of
@@ -209,6 +251,7 @@ frame.
 | Stop a turn | `POST /api/sessions/{id}/abort` |
 | Chat stream | `WS /ws/chat?session_id=…&agent=…` |
 | Device node | `WS /ws/nodes` (register + invoke/result, optional `attachments`) |
+| Voice transcription | `POST /api/transcribe` (audio/wav body) → `{text}` |
 
 Chat sockets authenticate with `Sec-WebSocket-Protocol: zeroclaw.v1,
 bearer.<token>`, which the gateway accepts alongside the `Authorization` header
@@ -249,10 +292,14 @@ app/src/main/java/ai/zeroclaw/app/
 │   ├── SmsCapabilities.kt  sms.send/search
 │   ├── CallLogCapabilities.kt  callLog.search
 │   ├── NotificationCapabilities.kt  notifications.list/actions
+│   ├── CameraCapabilities.kt  camera.list/snap/clip (Camera2)
+│   ├── MobileUiCapabilities.kt  accessibility observe/act
+│   ├── VoiceCapabilities.kt  talk.ptt.* via SpeechRecognizer
 │   ├── DevicePermissions.kt runtime permission groups
 │   └── AppViewModel.kt      state machine for pairing → chat → approvals
 ├── service/NodeService.kt   foreground service that owns the device link
-│   └── NotificationListener.kt  notification-access bridge
+│   ├── NotificationListener.kt  notification-access bridge
+│   └── AgentAccessibilityService.kt  accessibility tree + gesture executor
 └── ui/
     ├── theme/Theme.kt       design tokens and type scale
     ├── App.kt               root, drawer shell, splash
@@ -275,8 +322,12 @@ OpenClaw source is vendored; the tokens were re-expressed here.
 
 - Clock list/delete only sees ZeroClaw-created entries (Android platform limit,
   described above).
-- Camera capture, accessibility UI control, and voice push-to-talk are not
-  implemented yet (OpenClaw's `camera.*`, `mobile.ui.*`, `talk.ptt.*`).
+- `camera.clip` video files stay on the phone; only image attachments cross
+  the node protocol.
+- PTT transcription depends on the device's speech-recognition service (and on
+  a usable microphone); the emulator returns "no speech".
+- Accessibility actions are limited to the active window; there is no
+  multi-window or scoped-app targeting yet.
 - Location reads need the app in the foreground (or an OEM that relaxes
   background location for a `connectedDevice` foreground service); the tool
   fails with a clear message rather than a stale fix.

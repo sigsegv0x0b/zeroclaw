@@ -7,6 +7,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -43,7 +44,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
@@ -281,8 +286,13 @@ fun ToolCallRow(card: ToolCallCard) {
 fun Composer(
     busy: Boolean,
     connected: Boolean,
+    voiceListening: Boolean,
+    voiceError: String?,
     onSend: (String) -> Unit,
     onStop: () -> Unit,
+    onVoiceStart: () -> Unit,
+    onVoiceStop: (heldMs: Long) -> Unit,
+    onVoiceCancel: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var draft by remember { mutableStateOf("") }
@@ -294,8 +304,9 @@ fun Composer(
         onSend(text)
     }
 
+    Column(modifier = modifier.fillMaxWidth()) {
     Row(
-        modifier = modifier
+        modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalAlignment = Alignment.Bottom,
@@ -313,7 +324,11 @@ fun Composer(
                 Box(Modifier.weight(1f).padding(vertical = 10.dp)) {
                     if (draft.isEmpty()) {
                         Text(
-                            text = if (connected) "Message ZeroClaw" else "Reconnecting…",
+                            text = when {
+                                voiceListening -> "Listening…"
+                                connected -> "Message ZeroClaw"
+                                else -> "Reconnecting…"
+                            },
                             style = MaterialTheme.typography.bodyLarge,
                             color = Zc.TextSubtle,
                         )
@@ -338,6 +353,33 @@ fun Composer(
                         )
                     }
                 }
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (voiceListening) Zc.Danger.copy(alpha = 0.16f) else Color.Transparent,
+                        )
+                        .pointerInput(Unit) {
+                            detectTapGestures(
+                                onPress = {
+                                    onVoiceStart()
+                                    val started = System.currentTimeMillis()
+                                    val released = tryAwaitRelease()
+                                    val heldMs = System.currentTimeMillis() - started
+                                    if (released) onVoiceStop(heldMs) else onVoiceCancel()
+                                },
+                            )
+                        }
+                        .semantics { contentDescription = "Hold to talk" },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "🎤",
+                        fontSize = 20.sp,
+                        color = if (voiceListening) Zc.Danger else Zc.TextMuted,
+                    )
+                }
                 IconButton(
                     onClick = { send() },
                     enabled = draft.isNotBlank(),
@@ -349,6 +391,15 @@ fun Composer(
                     )
                 }
             }
+        }
+    }
+        if (voiceError != null) {
+            Text(
+                text = voiceError,
+                style = MaterialTheme.typography.labelSmall,
+                color = Zc.Danger,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp),
+            )
         }
     }
 }

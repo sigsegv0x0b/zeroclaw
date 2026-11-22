@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -23,6 +24,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -62,6 +64,7 @@ fun SettingsScreen(
     onForget: () -> Unit,
     onNodeEnabled: (Boolean) -> Unit,
     onFolderPicked: (android.net.Uri?) -> Unit,
+    onVoiceBackend: (String) -> Unit,
 ) {
     var url by remember(state.gatewayUrl) { mutableStateOf(state.gatewayUrl) }
     val context = LocalContext.current
@@ -85,6 +88,15 @@ fun SettingsScreen(
     }
     val notificationAccess = remember(permissionTick) {
         DevicePermissions.hasNotificationAccess(context)
+    }
+    val cameraGranted = remember(permissionTick) {
+        DevicePermissions.has(context, DevicePermissions.camera())
+    }
+    val microphoneGranted = remember(permissionTick) {
+        DevicePermissions.has(context, DevicePermissions.microphone())
+    }
+    val accessibilityGranted = remember(permissionTick) {
+        DevicePermissions.hasAccessibility(context)
     }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -113,6 +125,12 @@ fun SettingsScreen(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { permissionTick++ }
     val callLogLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { permissionTick++ }
+    val cameraLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { permissionTick++ }
+    val microphoneLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { permissionTick++ }
     val folderLauncher = rememberLauncherForActivityResult(
@@ -340,6 +358,39 @@ fun SettingsScreen(
                 onAction = { callLogLauncher.launch(DevicePermissions.callLog()) },
             )
             PermissionRow(
+                title = "Camera",
+                detail = if (cameraGranted) {
+                    "Granted. camera.list / camera.snap / camera.clip."
+                } else {
+                    "Needed for camera.list, camera.snap and camera.clip."
+                },
+                granted = cameraGranted,
+                actionLabel = "Grant",
+                onAction = { cameraLauncher.launch(DevicePermissions.camera()) },
+            )
+            PermissionRow(
+                title = "Microphone",
+                detail = if (microphoneGranted) {
+                    "Granted. talk.ptt.* and voice capture."
+                } else {
+                    "Needed for talk.ptt.once / start / stop."
+                },
+                granted = microphoneGranted,
+                actionLabel = "Grant",
+                onAction = { microphoneLauncher.launch(DevicePermissions.microphone()) },
+            )
+            PermissionRow(
+                title = "Accessibility",
+                detail = if (accessibilityGranted) {
+                    "Granted. mobile.ui.observe / mobile.ui.act."
+                } else {
+                    "Special access. Enable the ZeroClaw service in system accessibility settings."
+                },
+                granted = accessibilityGranted,
+                actionLabel = "Enable",
+                onAction = { context.startActivity(DevicePermissions.accessibilitySettingsIntent()) },
+            )
+            PermissionRow(
                 title = "Notification access",
                 detail = if (notificationAccess) {
                     "Granted. notifications.list / notifications.actions."
@@ -374,6 +425,29 @@ fun SettingsScreen(
                     Text("Choose", color = Zc.Accent)
                 }
             }
+
+            Spacer(Modifier.height(26.dp))
+            SectionLabel("Voice input")
+            Text(
+                text = "Where spoken messages are transcribed. The mic button in the chat " +
+                    "composer uses this choice.",
+                style = MaterialTheme.typography.bodySmall,
+                color = Zc.TextMuted,
+            )
+            VoiceOptionRow(
+                title = "Android speech-to-text",
+                detail = "Transcribe on this phone with Android's recognizer. Audio stays on " +
+                    "the device.",
+                selected = state.voiceBackend != "zeroclaw",
+                onSelect = { onVoiceBackend("android") },
+            )
+            VoiceOptionRow(
+                title = "ZeroClaw gateway",
+                detail = "Record on the phone and send the audio to the gateway. Requires " +
+                    "[transcription] enabled with a provider on the gateway.",
+                selected = state.voiceBackend == "zeroclaw",
+                onSelect = { onVoiceBackend("zeroclaw") },
+            )
 
             Spacer(Modifier.height(26.dp))
             SectionLabel("This device")
@@ -430,6 +504,36 @@ private fun nodeStatusLabel(state: UiState): String = when (val status = state.n
     is NodeStatus.Connecting -> "Connecting…"
     is NodeStatus.Error -> "Link lost: ${status.message}"
     NodeStatus.Stopped -> if (state.nodeEnabled) "Starting…" else "Off"
+}
+
+@Composable
+private fun VoiceOptionRow(
+    title: String,
+    detail: String,
+    selected: Boolean,
+    onSelect: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onSelect)
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = Zc.Text,
+            )
+            Text(
+                text = detail,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (selected) Zc.Success else Zc.TextSubtle,
+            )
+        }
+        RadioButton(selected = selected, onClick = onSelect)
+    }
 }
 
 @Composable

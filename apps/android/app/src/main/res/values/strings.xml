@@ -2,4 +2,5 @@
 <resources>
     <string name="app_name">ZeroClaw</string>
     <string name="channel_default">ZeroClaw</string>
+    <string name="accessibility_service_description">Lets the ZeroClaw agent read the current screen and perform taps, swipes, text entry and system navigation when you ask it to. Nothing is read unless a tool call is made.</string>
 </resources>

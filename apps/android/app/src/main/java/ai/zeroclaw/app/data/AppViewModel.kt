@@ -13,6 +13,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
+/** A press shorter than this is a tap: let silence detection finish the turn. */
+private const val VOICE_QUICK_TAP_MS = 400L
+
 data class UiState(
     val booting: Boolean = true,
     val gatewayUrl: String = "",
@@ -21,6 +24,9 @@ data class UiState(
     val deviceId: String = "",
     val nodeEnabled: Boolean = true,
     val nodeFolderName: String = "",
+    val voiceBackend: String = "android",
+    val voiceListening: Boolean = false,
+    val voiceError: String? = null,
     val nodeStatus: NodeStatus = NodeStatus.Stopped,
     val agents: List<AgentEntry> = emptyList(),
     val agent: String = "",
@@ -44,11 +50,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val store = SettingsStore(app)
     private val gateway = GatewayClient()
     private val socket = ChatSocket(viewModelScope)
+    private val androidVoice = AndroidVoiceInput(app)
+    private val gatewayVoice = GatewayVoiceInput(app)
 
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui.asStateFlow()
 
     init {
+        androidVoice.listener = voiceListener()
+        gatewayVoice.listener = voiceListener()
         viewModelScope.launch {
             socket.events.collect(::handleEvent)
         }
@@ -99,6 +109,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     deviceId = runCatching { store.ensureDeviceId() }.getOrDefault(""),
                     nodeEnabled = saved.nodeEnabled,
                     nodeFolderName = saved.nodeFolderName,
+                    voiceBackend = saved.voiceBackend,
                     booting = false,
                 )
             }
@@ -277,6 +288,75 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _ui.update { it.copy(nodeFolderName = name) }
         }
     }
+
+    // ── Voice input ────────────────────────────────────────────────────────
+
+    private fun voiceListener() = object : AndroidVoiceInput.Listener,
+        GatewayVoiceInput.Listener {
+        override fun onStarted() {
+            _ui.update { it.copy(voiceListening = true, voiceError = null) }
+        }
+
+        override fun onTranscript(text: String) {
+            _ui.update { it.copy(voiceListening = false) }
+            send(text)
+        }
+
+        override fun onFailed(message: String) {
+            _ui.update { it.copy(voiceListening = false, voiceError = message) }
+        }
+
+        override fun onStopped() {
+            _ui.update { it.copy(voiceListening = false) }
+        }
+    }
+
+    fun setVoiceBackend(backend: String) {
+        val normalized = if (backend == "zeroclaw") "zeroclaw" else "android"
+        if (_ui.value.voiceBackend == normalized) return
+        cancelVoice()
+        _ui.update { it.copy(voiceBackend = normalized, voiceError = null) }
+        viewModelScope.launch { store.saveVoiceBackend(normalized) }
+    }
+
+    fun startVoice() {
+        val snapshot = _ui.value
+        if (snapshot.voiceListening) return
+        val app = getApplication<Application>()
+        if (!DevicePermissions.has(app, DevicePermissions.microphone())) {
+            _ui.update {
+                it.copy(
+                    voiceError = "Microphone permission is not granted. Open Settings → " +
+                        "Device capabilities → Microphone and grant it.",
+                )
+            }
+            return
+        }
+        _ui.update { it.copy(voiceListening = true, voiceError = null) }
+        if (snapshot.voiceBackend == "zeroclaw") {
+            gatewayVoice.start(viewModelScope, snapshot.gatewayUrl, snapshot.token)
+        } else {
+            androidVoice.start()
+        }
+    }
+
+    /**
+     * Release handler: a long hold finalizes now, a quick tap lets the
+     * recognizer's end-of-speech (or the recorder's silence detector) finish
+     * and auto-send.
+     */
+    fun stopVoice(heldMs: Long) {
+        if (heldMs < VOICE_QUICK_TAP_MS) return
+        if (_ui.value.voiceBackend == "zeroclaw") gatewayVoice.stop() else androidVoice.stop()
+    }
+
+    fun cancelVoice() {
+        androidVoice.cancel()
+        gatewayVoice.cancel()
+        _ui.update { it.copy(voiceListening = false) }
+    }
+
+    fun dismissVoiceError() = _ui.update { it.copy(voiceError = null) }
 
     fun dismissError() = _ui.update { it.copy(error = null) }
 
@@ -550,6 +630,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun newId(): String = java.util.UUID.randomUUID().toString()
 
     override fun onCleared() {
+        androidVoice.destroy()
+        gatewayVoice.destroy()
         socket.close()
         super.onCleared()
     }

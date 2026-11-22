@@ -51,6 +51,10 @@ object DevicePermissions {
 
     fun callLog(): Array<String> = arrayOf(Manifest.permission.READ_CALL_LOG)
 
+    fun camera(): Array<String> = arrayOf(Manifest.permission.CAMERA)
+
+    fun microphone(): Array<String> = arrayOf(Manifest.permission.RECORD_AUDIO)
+
     fun has(context: Context, permissions: Array<String>): Boolean =
         permissions.all { granted(context, it) }
 
@@ -65,6 +69,19 @@ object DevicePermissions {
 
     fun notificationAccessSettingsIntent(): android.content.Intent =
         android.content.Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS")
+            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+
+    /** Accessibility is a special access grant; the service must be enabled by hand. */
+    fun hasAccessibility(context: Context): Boolean {
+        val manager = context.getSystemService(android.view.accessibility.AccessibilityManager::class.java)
+            ?: return false
+        return manager.getEnabledAccessibilityServiceList(
+            android.accessibilityservice.AccessibilityServiceInfo.FEEDBACK_ALL_MASK,
+        ).any { it.resolveInfo.serviceInfo.packageName == context.packageName }
+    }
+
+    fun accessibilitySettingsIntent(): android.content.Intent =
+        android.content.Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
             .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
 
     fun granted(context: Context, permission: String): Boolean =
