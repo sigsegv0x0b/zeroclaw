@@ -1364,7 +1364,7 @@ fn spawn_gateway_mtls_listener(
     mut stopping: tokio::sync::watch::Receiver<bool>,
     tasks: ServeTasks,
 ) {
-    tokio::spawn(async move {
+    zeroclaw_spawn::spawn!(async move {
         let mut service = router.into_make_service_with_connect_info::<SocketAddr>();
         loop {
             let accepted = tokio::select! {
