@@ -28,6 +28,7 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -45,6 +46,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import ai.zeroclaw.app.data.DevicePermissions
 import ai.zeroclaw.app.data.NodeStatus
 import ai.zeroclaw.app.data.UiState
@@ -64,10 +68,51 @@ fun SettingsScreen(
     var permissionTick by remember { mutableIntStateOf(0) }
     val locationGranted = remember(permissionTick) { DevicePermissions.hasLocation(context) }
     val mediaGranted = remember(permissionTick) { DevicePermissions.hasMedia(context) }
+    val contactsGranted = remember(permissionTick) {
+        DevicePermissions.has(context, DevicePermissions.contacts())
+    }
+    val calendarGranted = remember(permissionTick) {
+        DevicePermissions.has(context, DevicePermissions.calendar())
+    }
+    val activityGranted = remember(permissionTick) {
+        DevicePermissions.has(context, DevicePermissions.activity())
+    }
+    val smsGranted = remember(permissionTick) {
+        DevicePermissions.has(context, DevicePermissions.sms())
+    }
+    val callLogGranted = remember(permissionTick) {
+        DevicePermissions.has(context, DevicePermissions.callLog())
+    }
+    val notificationAccess = remember(permissionTick) {
+        DevicePermissions.hasNotificationAccess(context)
+    }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) permissionTick++
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     val locationLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { permissionTick++ }
     val mediaLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { permissionTick++ }
+    val contactsLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { permissionTick++ }
+    val calendarLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { permissionTick++ }
+    val activityLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { permissionTick++ }
+    val smsLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { permissionTick++ }
+    val callLogLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { permissionTick++ }
     val folderLauncher = rememberLauncherForActivityResult(
@@ -238,6 +283,72 @@ fun SettingsScreen(
                 granted = mediaGranted,
                 actionLabel = "Grant",
                 onAction = { mediaLauncher.launch(DevicePermissions.media()) },
+            )
+            PermissionRow(
+                title = "Contacts",
+                detail = if (contactsGranted) {
+                    "Granted. contacts.search / contacts.add."
+                } else {
+                    "Needed for contacts.search and contacts.add."
+                },
+                granted = contactsGranted,
+                actionLabel = "Grant",
+                onAction = { contactsLauncher.launch(DevicePermissions.contacts()) },
+            )
+            PermissionRow(
+                title = "Calendar",
+                detail = if (calendarGranted) {
+                    "Granted. calendar.events / calendar.add."
+                } else {
+                    "Needed for calendar.events and calendar.add."
+                },
+                granted = calendarGranted,
+                actionLabel = "Grant",
+                onAction = { calendarLauncher.launch(DevicePermissions.calendar()) },
+            )
+            PermissionRow(
+                title = "Activity",
+                detail = if (activityGranted) {
+                    "Granted. Step counter and motion classification."
+                } else {
+                    "Needed for motion.activity and motion.pedometer."
+                },
+                granted = activityGranted,
+                actionLabel = "Grant",
+                onAction = { activityLauncher.launch(DevicePermissions.activity()) },
+            )
+            PermissionRow(
+                title = "SMS",
+                detail = if (smsGranted) {
+                    "Granted. sms.send / sms.search."
+                } else {
+                    "Needed for sms.send and sms.search. Play-restricted; this build is sideloaded."
+                },
+                granted = smsGranted,
+                actionLabel = "Grant",
+                onAction = { smsLauncher.launch(DevicePermissions.sms()) },
+            )
+            PermissionRow(
+                title = "Call log",
+                detail = if (callLogGranted) {
+                    "Granted. callLog.search."
+                } else {
+                    "Needed for callLog.search. Play-restricted; this build is sideloaded."
+                },
+                granted = callLogGranted,
+                actionLabel = "Grant",
+                onAction = { callLogLauncher.launch(DevicePermissions.callLog()) },
+            )
+            PermissionRow(
+                title = "Notification access",
+                detail = if (notificationAccess) {
+                    "Granted. notifications.list / notifications.actions."
+                } else {
+                    "Special access. Enable ZeroClaw in the system notification-access list."
+                },
+                granted = notificationAccess,
+                actionLabel = "Enable",
+                onAction = { context.startActivity(DevicePermissions.notificationAccessSettingsIntent()) },
             )
             Row(
                 Modifier

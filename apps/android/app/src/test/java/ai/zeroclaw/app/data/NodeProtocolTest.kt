@@ -92,10 +92,13 @@ class NodeProtocolTest {
         val names = DeviceCapabilities.definitions.map { it.name }
         assertEquals(names.size, names.toSet().size)
         names.forEach { name ->
-            assertTrue("capability name '$name'", Regex("^[a-z]+\\.[a-z]+$").matches(name))
+            assertTrue("capability name '$name'", Regex("^[a-zA-Z]+(\\.[a-zA-Z]+)+$").matches(name))
         }
         assertTrue(names.contains(DeviceCapabilities.ALARM_SET))
         assertTrue(names.contains(DeviceCapabilities.TIMER_SET))
+        assertTrue(names.contains(DeviceCapabilities.DEVICE_INFO))
+        assertTrue(names.contains(DeviceCapabilities.NOTIFICATIONS_LIST))
+        assertTrue(names.contains(DeviceCapabilities.CALL_LOG_SEARCH))
     }
 
     @Test

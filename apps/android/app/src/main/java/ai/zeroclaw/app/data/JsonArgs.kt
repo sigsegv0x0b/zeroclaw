@@ -14,6 +14,11 @@ internal fun JsonObject.int(key: String): Int? {
     return value.content.toIntOrNull()
 }
 
+internal fun JsonObject.double(key: String): Double? {
+    val value = this[key] as? JsonPrimitive ?: return null
+    return value.content.toDoubleOrNull()
+}
+
 internal fun JsonObject.long(key: String): Long? {
     val value = this[key] as? JsonPrimitive ?: return null
     return value.content.toLongOrNull()

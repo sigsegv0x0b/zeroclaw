@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import androidx.core.app.NotificationManagerCompat
 
 /**
  * Runtime permissions the node capabilities need. The device link (a
@@ -30,6 +31,41 @@ object DevicePermissions {
             granted(context, Manifest.permission.ACCESS_COARSE_LOCATION)
 
     fun hasMedia(context: Context): Boolean = media().all { granted(context, it) }
+
+    fun contacts(): Array<String> = arrayOf(
+        Manifest.permission.READ_CONTACTS,
+        Manifest.permission.WRITE_CONTACTS,
+    )
+
+    fun calendar(): Array<String> = arrayOf(
+        Manifest.permission.READ_CALENDAR,
+        Manifest.permission.WRITE_CALENDAR,
+    )
+
+    fun activity(): Array<String> = arrayOf(Manifest.permission.ACTIVITY_RECOGNITION)
+
+    fun sms(): Array<String> = arrayOf(
+        Manifest.permission.SEND_SMS,
+        Manifest.permission.READ_SMS,
+    )
+
+    fun callLog(): Array<String> = arrayOf(Manifest.permission.READ_CALL_LOG)
+
+    fun has(context: Context, permissions: Array<String>): Boolean =
+        permissions.all { granted(context, it) }
+
+    /**
+     * Notification access is a special access grant, not a runtime permission:
+     * the listener service only receives notifications once the operator
+     * enables it in system settings.
+     */
+    fun hasNotificationAccess(context: Context): Boolean =
+        NotificationManagerCompat.getEnabledListenerPackages(context)
+            .contains(context.packageName)
+
+    fun notificationAccessSettingsIntent(): android.content.Intent =
+        android.content.Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS")
+            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
 
     fun granted(context: Context, permission: String): Boolean =
         context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
