@@ -110,6 +110,113 @@ object GalleryCapabilities {
             )
         }
 
+    /**
+     * `photos.latest`: return the newest images as attachments, mirroring
+     * OpenClaw's command of the same name.
+     */
+    suspend fun latest(context: Context, args: JsonObject): CapabilityOutcome =
+        withContext(Dispatchers.IO) {
+            if (!DevicePermissions.hasMedia(context)) return@withContext PERMISSION_DENIED
+            val limit = (args.int("limit") ?: 5).coerceIn(1, 20)
+            val maxWidth = (args.int("maxWidth") ?: args.int("max_width") ?: 1024)
+                .coerceIn(240, 4096)
+            val quality = ((args.double("quality") ?: 0.85).coerceIn(0.1, 1.0) * 100).toInt()
+            val resolver = context.contentResolver
+            val rows = runCatching {
+                resolver.query(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    PROJECTION,
+                    null,
+                    null,
+                    "${MediaStore.Images.Media.DATE_ADDED} DESC",
+                )?.use { cursor ->
+                    val idIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                    val nameIndex =
+                        cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+                    val widthIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
+                    val heightIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
+                    buildList {
+                        while (cursor.moveToNext() && size < limit) {
+                            add(
+                                Quad(
+                                    cursor.getLong(idIndex),
+                                    cursor.getString(nameIndex) ?: "image",
+                                    cursor.getInt(widthIndex),
+                                    cursor.getInt(heightIndex),
+                                ),
+                            )
+                        }
+                    }
+                }
+            }.getOrElse { error ->
+                return@withContext CapabilityOutcome(
+                    false,
+                    "",
+                    "Could not query the photo library: ${error.message}",
+                )
+            } ?: emptyList()
+
+            if (rows.isEmpty()) {
+                return@withContext CapabilityOutcome(
+                    true,
+                    "No images were found in the phone's photo library.",
+                )
+            }
+            val attachments = ArrayList<NodeAttachment>()
+            val lines = ArrayList<String>()
+            var totalBytes = 0
+            for (row in rows) {
+                val uri = ContentUris.withAppendedId(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    row.id,
+                )
+                val bitmap = runCatching { decodeScaled(context, uri, maxWidth) }.getOrNull()
+                    ?: continue
+                val oriented = runCatching { applyExifRotation(context, uri, bitmap) }
+                    .getOrDefault(bitmap)
+                val buffer = ByteArrayOutputStream()
+                val ok = runCatching {
+                    oriented.compress(Bitmap.CompressFormat.JPEG, quality, buffer)
+                }.getOrDefault(false)
+                if (oriented !== bitmap) {
+                    bitmap.recycleIfNotRecycled()
+                    oriented.recycleIfNotRecycled()
+                } else {
+                    bitmap.recycleIfNotRecycled()
+                }
+                if (!ok) continue
+                val bytes = buffer.toByteArray()
+                if (totalBytes + bytes.size > MAX_TOTAL_ATTACHMENT_BYTES) {
+                    lines += "- id=${row.id} skipped (attachment budget reached)"
+                    continue
+                }
+                totalBytes += bytes.size
+                attachments += NodeAttachment(
+                    kind = "image",
+                    mime = "image/jpeg",
+                    dataB64 = Base64.getEncoder().encodeToString(bytes),
+                )
+                lines += "- id=${row.id}  ${row.name}  ${row.width}x${row.height}  " +
+                    "sent as JPEG ${humanSize(bytes.size.toLong())}"
+            }
+            if (attachments.isEmpty()) {
+                return@withContext CapabilityOutcome(
+                    false,
+                    "",
+                    "None of the latest images could be decoded.",
+                )
+            }
+            CapabilityOutcome(
+                true,
+                "Attached the newest ${attachments.size} image(s):\n" + lines.joinToString("\n"),
+                attachments = attachments,
+            )
+        }
+
+    private data class Quad(val id: Long, val name: String, val width: Int, val height: Int)
+
+    private const val MAX_TOTAL_ATTACHMENT_BYTES = 6 * 1024 * 1024
+
     suspend fun read(context: Context, args: JsonObject): CapabilityOutcome =
         withContext(Dispatchers.IO) {
             if (!DevicePermissions.hasMedia(context)) return@withContext PERMISSION_DENIED
@@ -207,14 +314,14 @@ object GalleryCapabilities {
         }
     }
 
-    private fun decodeScaled(context: Context, uri: Uri): Bitmap? {
+    private fun decodeScaled(context: Context, uri: Uri, maxEdge: Int = MAX_EDGE_PX): Bitmap? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         context.contentResolver.openInputStream(uri)?.use {
             BitmapFactory.decodeStream(it, null, bounds)
         }
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
         var sample = 1
-        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > MAX_EDGE_PX * 2) {
+        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > maxEdge * 2) {
             sample *= 2
         }
         val options = BitmapFactory.Options().apply { inSampleSize = sample }

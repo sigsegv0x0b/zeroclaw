@@ -78,19 +78,38 @@ object DeviceCapabilities {
     const val FILE_CREATE = "file.create"
     const val GALLERY_LIST = "gallery.list"
     const val GALLERY_READ = "gallery.read"
+    const val DEVICE_INFO = "device.info"
+    const val DEVICE_STATUS = "device.status"
+    const val DEVICE_HEALTH = "device.health"
+    const val DEVICE_PERMISSIONS = "device.permissions"
+    const val DEVICE_APPS = "device.apps"
+    const val SYSTEM_NOTIFY = "system.notify"
+    const val PHOTOS_LATEST = "photos.latest"
+    const val CONTACTS_SEARCH = "contacts.search"
+    const val CONTACTS_ADD = "contacts.add"
+    const val CALENDAR_EVENTS = "calendar.events"
+    const val CALENDAR_ADD = "calendar.add"
+    const val MOTION_ACTIVITY = "motion.activity"
+    const val MOTION_PEDOMETER = "motion.pedometer"
+    const val SMS_SEND = "sms.send"
+    const val SMS_SEARCH = "sms.search"
+    const val CALL_LOG_SEARCH = "callLog.search"
+    const val NOTIFICATIONS_LIST = "notifications.list"
+    const val NOTIFICATIONS_ACTIONS = "notifications.actions"
 
-    private const val TARGET_NOTE =
-        " This runs on the phone, not on the ZeroClaw host. If the user has not said " +
-            "the phone, do not call it: ask whether they want this on their phone or on " +
-            "the ZeroClaw host first. The host has its own tools for the same job."
+    private const val PHONE_NOTE = " This runs on the phone, not on the ZeroClaw host."
+    private const val ASK_TARGET_NOTE =
+        " If the user has not said the phone, do not call it: ask whether they want this on " +
+            "their phone or on the ZeroClaw host first; the host has its own tools for the same job."
 
     private fun capability(
         name: String,
         description: String,
         parameters: String,
+        asksTarget: Boolean = false,
     ): NodeCapabilityDef = NodeCapabilityDef(
         name = name,
-        description = description + TARGET_NOTE,
+        description = description + PHONE_NOTE + if (asksTarget) ASK_TARGET_NOTE else "",
         parameters = zcJson.parseToJsonElement(parameters) as JsonObject,
     )
 
@@ -115,6 +134,7 @@ object DeviceCapabilities {
               "required": ["hour", "minute"]
             }
             """.trimIndent(),
+            asksTarget = true,
         ),
         capability(
             TIMER_SET,
@@ -134,6 +154,7 @@ object DeviceCapabilities {
               "required": ["seconds"]
             }
             """.trimIndent(),
+            asksTarget = true,
         ),
         capability(
             ALARM_LIST,
@@ -224,6 +245,7 @@ object DeviceCapabilities {
               }
             }
             """.trimIndent(),
+            asksTarget = true,
         ),
         capability(
             FILE_READ,
@@ -238,6 +260,7 @@ object DeviceCapabilities {
               "required": ["path"]
             }
             """.trimIndent(),
+            asksTarget = true,
         ),
         capability(
             FILE_CREATE,
@@ -255,6 +278,7 @@ object DeviceCapabilities {
               "required": ["path", "content"]
             }
             """.trimIndent(),
+            asksTarget = true,
         ),
         capability(
             GALLERY_LIST,
@@ -285,6 +309,225 @@ object DeviceCapabilities {
             }
             """.trimIndent(),
         ),
+
+        capability(
+            DEVICE_INFO,
+            "Read this phone's manufacturer, model, Android version, build id, locale and screen size.",
+            """
+            { "type": "object", "properties": {} }
+            """.trimIndent(),
+        ),
+        capability(
+            DEVICE_STATUS,
+            "Read this phone's battery, charging, network transport, screen/lock state, storage and uptime.",
+            """
+            { "type": "object", "properties": {} }
+            """.trimIndent(),
+        ),
+        capability(
+            DEVICE_HEALTH,
+            "Read this phone's memory, storage, battery health/temperature and thermal status.",
+            """
+            { "type": "object", "properties": {} }
+            """.trimIndent(),
+        ),
+        capability(
+            DEVICE_PERMISSIONS,
+            "List which ZeroClaw device permissions are granted on this phone, including the " +
+                "special notification-access and accessibility grants.",
+            """
+            { "type": "object", "properties": {} }
+            """.trimIndent(),
+        ),
+        capability(
+            DEVICE_APPS,
+            "List launchable apps installed on this phone.",
+            """
+            {
+              "type": "object",
+              "properties": {
+                "query": { "type": "string", "description": "Filter by app label or package substring" },
+                "include_system": { "type": "boolean", "default": false },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+              }
+            }
+            """.trimIndent(),
+        ),
+        capability(
+            SYSTEM_NOTIFY,
+            "Post a notification on this phone with a title and body.",
+            """
+            {
+              "type": "object",
+              "properties": {
+                "title": { "type": "string" },
+                "body": { "type": "string" },
+                "sound": { "type": "string", "description": "Optional sound hint (best effort)" },
+                "priority": { "type": "string", "enum": ["min", "low", "default", "high"] }
+              },
+              "required": ["title", "body"]
+            }
+            """.trimIndent(),
+        ),
+        capability(
+            PHOTOS_LATEST,
+            "Return the newest images from this phone's photo library as attachments you can see.",
+            """
+            {
+              "type": "object",
+              "properties": {
+                "limit": { "type": "integer", "minimum": 1, "maximum": 20, "default": 5 },
+                "maxWidth": { "type": "integer", "minimum": 240, "maximum": 4096, "default": 1024 },
+                "quality": { "type": "number", "minimum": 0.1, "maximum": 1.0, "default": 0.85 }
+              }
+            }
+            """.trimIndent(),
+        ),
+        capability(
+            CONTACTS_SEARCH,
+            "Search this phone's contacts by display name. Returns phone numbers and emails.",
+            """
+            {
+              "type": "object",
+              "properties": {
+                "query": { "type": "string", "description": "Name substring; empty lists recent contacts" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 }
+              }
+            }
+            """.trimIndent(),
+        ),
+        capability(
+            CONTACTS_ADD,
+            "Create a contact on this phone.",
+            """
+            {
+              "type": "object",
+              "properties": {
+                "given_name": { "type": "string" },
+                "family_name": { "type": "string" },
+                "display_name": { "type": "string" },
+                "phone_numbers": { "type": "array", "items": { "type": "string" } },
+                "emails": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+            """.trimIndent(),
+        ),
+        capability(
+            CALENDAR_EVENTS,
+            "List events from this phone's calendars in the next N days.",
+            """
+            {
+              "type": "object",
+              "properties": {
+                "range_days": { "type": "integer", "minimum": 1, "maximum": 30, "default": 7 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+              }
+            }
+            """.trimIndent(),
+        ),
+        capability(
+            CALENDAR_ADD,
+            "Create a calendar event on this phone. Times are ISO-8601 or epoch millis.",
+            """
+            {
+              "type": "object",
+              "properties": {
+                "title": { "type": "string" },
+                "begin": { "type": "string", "description": "ISO-8601 or epoch millis" },
+                "end": { "type": "string", "description": "ISO-8601 or epoch millis; defaults to begin + duration" },
+                "duration_minutes": { "type": "integer", "minimum": 1, "default": 60 },
+                "calendar_id": { "type": "integer" },
+                "calendar_title": { "type": "string" },
+                "description": { "type": "string" },
+                "location": { "type": "string" },
+                "all_day": { "type": "boolean", "default": false }
+              },
+              "required": ["title", "begin"]
+            }
+            """.trimIndent(),
+        ),
+        capability(
+            MOTION_ACTIVITY,
+            "Classify this phone's current motion (stationary, walking or running) from its accelerometer.",
+            """
+            { "type": "object", "properties": {} }
+            """.trimIndent(),
+        ),
+        capability(
+            MOTION_PEDOMETER,
+            "Read this phone's step counter (steps since boot).",
+            """
+            { "type": "object", "properties": {} }
+            """.trimIndent(),
+        ),
+        capability(
+            SMS_SEND,
+            "Send an SMS from this phone.",
+            """
+            {
+              "type": "object",
+              "properties": {
+                "to": { "type": "string", "description": "Recipient phone number" },
+                "body": { "type": "string" }
+              },
+              "required": ["to", "body"]
+            }
+            """.trimIndent(),
+        ),
+        capability(
+            SMS_SEARCH,
+            "Search this phone's SMS messages by address or body substring.",
+            """
+            {
+              "type": "object",
+              "properties": {
+                "query": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+              }
+            }
+            """.trimIndent(),
+        ),
+        capability(
+            CALL_LOG_SEARCH,
+            "Search this phone's call log by number or contact name.",
+            """
+            {
+              "type": "object",
+              "properties": {
+                "query": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20 }
+              }
+            }
+            """.trimIndent(),
+        ),
+        capability(
+            NOTIFICATIONS_LIST,
+            "List notifications currently posted on this phone. Requires the operator to enable " +
+                "Notification access for ZeroClaw.",
+            """
+            {
+              "type": "object",
+              "properties": {
+                "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20 }
+              }
+            }
+            """.trimIndent(),
+        ),
+        capability(
+            NOTIFICATIONS_ACTIONS,
+            "Open, dismiss or reply to a posted notification by its key (from notifications.list).",
+            """
+            {
+              "type": "object",
+              "properties": {
+                "key": { "type": "string" },
+                "action": { "type": "string", "enum": ["open", "dismiss", "reply"] },
+                "reply_text": { "type": "string", "description": "Required for action=reply" }
+              },
+              "required": ["key", "action"]
+            }
+            """.trimIndent(),
+        ),
     )
 
     suspend fun execute(context: Context, capability: String, args: JsonObject): CapabilityOutcome =
@@ -303,6 +546,24 @@ object DeviceCapabilities {
             FILE_CREATE -> FileCapabilities.create(context, args)
             GALLERY_LIST -> GalleryCapabilities.list(context, args)
             GALLERY_READ -> GalleryCapabilities.read(context, args)
+            PHOTOS_LATEST -> GalleryCapabilities.latest(context, args)
+            DEVICE_INFO -> DeviceInfoCapabilities.info(context)
+            DEVICE_STATUS -> DeviceInfoCapabilities.status(context)
+            DEVICE_HEALTH -> DeviceInfoCapabilities.health(context)
+            DEVICE_PERMISSIONS -> DeviceInfoCapabilities.permissions(context)
+            DEVICE_APPS -> DeviceInfoCapabilities.apps(context, args)
+            SYSTEM_NOTIFY -> DeviceInfoCapabilities.notify(context, args)
+            CONTACTS_SEARCH -> ContactsCapabilities.search(context, args)
+            CONTACTS_ADD -> ContactsCapabilities.add(context, args)
+            CALENDAR_EVENTS -> CalendarCapabilities.events(context, args)
+            CALENDAR_ADD -> CalendarCapabilities.add(context, args)
+            MOTION_ACTIVITY -> MotionCapabilities.activity(context, args)
+            MOTION_PEDOMETER -> MotionCapabilities.pedometer(context, args)
+            SMS_SEND -> SmsCapabilities.send(context, args)
+            SMS_SEARCH -> SmsCapabilities.search(context, args)
+            CALL_LOG_SEARCH -> CallLogCapabilities.search(context, args)
+            NOTIFICATIONS_LIST -> NotificationCapabilities.list(context, args)
+            NOTIFICATIONS_ACTIONS -> NotificationCapabilities.actions(context, args)
             else -> CapabilityOutcome(false, "", "Unsupported capability: $capability")
         }
 

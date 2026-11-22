@@ -129,6 +129,20 @@ Advertised capabilities:
 | `file.create` | `path`, `content`, `overwrite?` | Create/overwrite a text file |
 | `gallery.list` | `limit?` | Newest MediaStore images |
 | `gallery.read` | `id` | Downscaled JPEG attached to the tool result |
+| `photos.latest` | `limit?`, `maxWidth?`, `quality?` | Newest images, all attached |
+| `device.info` / `.status` / `.health` / `.permissions` / `.apps` | `query?`, `include_system?`, `limit?` (apps) | Device, battery, memory, permission and app inventory |
+| `system.notify` | `title`, `body`, `priority?` | Post a local notification |
+| `contacts.search` | `query?`, `limit?` | Name search with phones/emails |
+| `contacts.add` | names, `phone_numbers?`, `emails?` | Create a contact |
+| `calendar.events` | `range_days?`, `limit?` | Upcoming events |
+| `calendar.add` | `title`, `begin`, `end?`/`duration_minutes?`, `calendar_id?` | Create an event |
+| `motion.activity` | — | Stationary / walking / running |
+| `motion.pedometer` | — | Steps since boot |
+| `sms.send` | `to`, `body` | Send an SMS |
+| `sms.search` | `query?`, `limit?` | Search SMS |
+| `callLog.search` | `query?`, `limit?` | Search the call log |
+| `notifications.list` | `limit?` | Posted notifications |
+| `notifications.actions` | `key`, `action` (`open`/`dismiss`/`reply`), `reply_text?` | Act on a notification |
 
 Notes:
 
@@ -145,11 +159,16 @@ Notes:
   Most clock apps honour `skip_ui=true`, but an OEM clock may still show a
   confirmation screen — that is the device owner's gate, not the agent's.
 - `SET_ALARM` is declared in the manifest. No runtime permission is needed for
-  alarms or timers. Location (`ACCESS_FINE_LOCATION` / `ACCESS_COARSE_LOCATION`)
-  and the photo library (`READ_MEDIA_IMAGES`, or `READ_EXTERNAL_STORAGE` on
-  API 26–32) are runtime permissions granted from **Settings → Device
-  capabilities**; the capability returns a pointer to that screen until they
-  are granted.
+  alarms or timers. Location, photos, contacts, calendar, activity, SMS and
+  call log are runtime permissions granted from **Settings → Device
+  capabilities**; each capability returns a pointer to that screen until its
+  grant exists.
+- `contacts.*`, `sms.*` and `callLog.search` need Play-restricted permissions;
+  this build is sideloaded, so the grants are allowed. The emulator has no SIM
+  or call history, so those tools exercise their empty/error paths there.
+- `notifications.list` / `.actions` need the **Notification access** special
+  grant (Settings → Device capabilities → Notification access), not a runtime
+  permission. The listener keeps posted notifications in memory only.
 - **Files are confined to a folder the operator picks** with the system folder
   picker (SAF `OpenDocumentTree`). The persistable tree grant is stored with the
   pairing; `..` and absolute paths are rejected, so the agent cannot walk out of
@@ -222,10 +241,18 @@ app/src/main/java/ai/zeroclaw/app/
 │   ├── ClockStore.kt        ZeroClaw-tracked alarms/timers
 │   ├── LocationCapability.kt  one-shot LocationManager read
 │   ├── FileCapabilities.kt  SAF folder list/read/create
-│   ├── GalleryCapabilities.kt  MediaStore list + downscaled read
+│   ├── GalleryCapabilities.kt  MediaStore list/read + photos.latest
+│   ├── DeviceInfoCapabilities.kt  device.* + system.notify
+│   ├── ContactsCapabilities.kt  contacts.search/add
+│   ├── CalendarCapabilities.kt  calendar.events/add
+│   ├── MotionCapabilities.kt  motion.activity/pedometer
+│   ├── SmsCapabilities.kt  sms.send/search
+│   ├── CallLogCapabilities.kt  callLog.search
+│   ├── NotificationCapabilities.kt  notifications.list/actions
 │   ├── DevicePermissions.kt runtime permission groups
 │   └── AppViewModel.kt      state machine for pairing → chat → approvals
 ├── service/NodeService.kt   foreground service that owns the device link
+│   └── NotificationListener.kt  notification-access bridge
 └── ui/
     ├── theme/Theme.kt       design tokens and type scale
     ├── App.kt               root, drawer shell, splash
@@ -248,8 +275,8 @@ OpenClaw source is vendored; the tokens were re-expressed here.
 
 - Clock list/delete only sees ZeroClaw-created entries (Android platform limit,
   described above).
-- Camera, screen capture, notifications and contacts need their own capability
-  entries and runtime permissions.
+- Camera capture, accessibility UI control, and voice push-to-talk are not
+  implemented yet (OpenClaw's `camera.*`, `mobile.ui.*`, `talk.ptt.*`).
 - Location reads need the app in the foreground (or an OEM that relaxes
   background location for a `connectedDevice` foreground service); the tool
   fails with a clear message rather than a stale fix.
