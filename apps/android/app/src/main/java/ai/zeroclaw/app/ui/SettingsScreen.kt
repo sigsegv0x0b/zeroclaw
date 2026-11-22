@@ -1,6 +1,7 @@
 package ai.zeroclaw.app.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -65,8 +66,12 @@ fun SettingsScreen(
     onNodeEnabled: (Boolean) -> Unit,
     onFolderPicked: (android.net.Uri?) -> Unit,
     onVoiceBackend: (String) -> Unit,
+    onMtlsEnabled: (Boolean) -> Unit,
+    onMtlsGatewayId: (String) -> Unit,
+    onMtlsImport: (kind: String, uri: android.net.Uri?) -> Unit,
 ) {
     var url by remember(state.gatewayUrl) { mutableStateOf(state.gatewayUrl) }
+    var gwId by remember(state.mtlsGatewayId) { mutableStateOf(state.mtlsGatewayId) }
     val context = LocalContext.current
     var permissionTick by remember { mutableIntStateOf(0) }
     val locationGranted = remember(permissionTick) { DevicePermissions.hasLocation(context) }
@@ -136,6 +141,15 @@ fun SettingsScreen(
     val folderLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree(),
     ) { uri -> onFolderPicked(uri) }
+    val caLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> onMtlsImport("ca", uri) }
+    val certLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> onMtlsImport("cert", uri) }
+    val keyLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> onMtlsImport("key", uri) }
     var token by remember(state.token) { mutableStateOf(state.token) }
     var reveal by remember { mutableStateOf(false) }
     var confirmForget by remember { mutableStateOf(false) }
@@ -218,6 +232,79 @@ fun SettingsScreen(
             ) {
                 Text("Save and reconnect", style = MaterialTheme.typography.labelLarge)
             }
+
+            Spacer(Modifier.height(26.dp))
+            SectionLabel("Transport")
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        text = "Identity-based mTLS",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Zc.Text,
+                    )
+                    Text(
+                        text = "Use the additional gateway listener. Set the Gateway URL to " +
+                            "https://host:42618. Identity is a URI, so IP/DDNS changes are fine.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Zc.TextSubtle,
+                    )
+                }
+                Switch(
+                    checked = state.mtlsEnabled,
+                    onCheckedChange = onMtlsEnabled,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = Color(0xFF00242B),
+                        checkedTrackColor = Zc.Accent,
+                        uncheckedThumbColor = Zc.TextSubtle,
+                        uncheckedTrackColor = Zc.SurfaceRaised,
+                        uncheckedBorderColor = Zc.BorderStrong,
+                    ),
+                )
+            }
+            OutlinedTextField(
+                value = gwId,
+                onValueChange = {
+                    gwId = it
+                    onMtlsGatewayId(it)
+                },
+                label = { Text("Gateway ID") },
+                placeholder = { Text("gw_…") },
+                singleLine = true,
+                colors = colors,
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(
+                    onClick = { caLauncher.launch(arrayOf("*/*")) },
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.weight(1f),
+                ) { Text("Import CA", style = MaterialTheme.typography.labelSmall) }
+                OutlinedButton(
+                    onClick = { certLauncher.launch(arrayOf("*/*")) },
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.weight(1f),
+                ) { Text("Import cert", style = MaterialTheme.typography.labelSmall) }
+                OutlinedButton(
+                    onClick = { keyLauncher.launch(arrayOf("*/*")) },
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.weight(1f),
+                ) { Text("Import key", style = MaterialTheme.typography.labelSmall) }
+            }
+            Text(
+                text = state.mtlsStatus.ifBlank { "mTLS transport is disabled" },
+                style = MaterialTheme.typography.labelSmall,
+                color = if (state.mtlsStatus.startsWith("mTLS ready")) Zc.Success else Zc.TextSubtle,
+            )
 
             Spacer(Modifier.height(26.dp))
             SectionLabel("Status")

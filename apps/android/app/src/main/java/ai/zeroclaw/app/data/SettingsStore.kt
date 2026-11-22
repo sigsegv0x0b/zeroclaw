@@ -25,6 +25,11 @@ data class StoredSettings(
     val nodeFolderName: String = "",
     /** `android` (on-phone recognizer) or `zeroclaw` (gateway transcription). */
     val voiceBackend: String = "android",
+    val mtlsEnabled: Boolean = false,
+    val mtlsGatewayId: String = "",
+    val mtlsCaPem: String = "",
+    val mtlsClientCertPem: String = "",
+    val mtlsClientKeyPem: String = "",
 )
 
 /**
@@ -45,6 +50,11 @@ class SettingsStore(private val context: Context) {
         val nodeFolderUri = stringPreferencesKey("node_folder_uri")
         val nodeFolderName = stringPreferencesKey("node_folder_name")
         val voiceBackend = stringPreferencesKey("voice_backend")
+        val mtlsEnabled = booleanPreferencesKey("mtls_enabled")
+        val mtlsGatewayId = stringPreferencesKey("mtls_gateway_id")
+        val mtlsCaPem = stringPreferencesKey("mtls_ca_pem")
+        val mtlsClientCertPem = stringPreferencesKey("mtls_client_cert_pem")
+        val mtlsClientKeyPem = stringPreferencesKey("mtls_client_key_pem")
     }
 
     val settings: Flow<StoredSettings> = context.settingsDataStore.data.map { prefs ->
@@ -59,6 +69,11 @@ class SettingsStore(private val context: Context) {
             nodeFolderUri = prefs[Keys.nodeFolderUri].orEmpty(),
             nodeFolderName = prefs[Keys.nodeFolderName].orEmpty(),
             voiceBackend = prefs[Keys.voiceBackend] ?: "android",
+            mtlsEnabled = prefs[Keys.mtlsEnabled] ?: false,
+            mtlsGatewayId = prefs[Keys.mtlsGatewayId].orEmpty(),
+            mtlsCaPem = prefs[Keys.mtlsCaPem].orEmpty(),
+            mtlsClientCertPem = prefs[Keys.mtlsClientCertPem].orEmpty(),
+            mtlsClientKeyPem = prefs[Keys.mtlsClientKeyPem].orEmpty(),
         )
     }
 
@@ -96,6 +111,22 @@ class SettingsStore(private val context: Context) {
         context.settingsDataStore.edit { prefs ->
             prefs[Keys.nodeFolderUri] = uri
             prefs[Keys.nodeFolderName] = name
+        }
+    }
+
+    suspend fun saveMtlsEnabled(enabled: Boolean) {
+        context.settingsDataStore.edit { prefs -> prefs[Keys.mtlsEnabled] = enabled }
+    }
+
+    suspend fun saveMtlsGatewayId(id: String) {
+        context.settingsDataStore.edit { prefs -> prefs[Keys.mtlsGatewayId] = id.trim() }
+    }
+
+    suspend fun saveMtlsMaterial(ca: String?, cert: String?, key: String?) {
+        context.settingsDataStore.edit { prefs ->
+            ca?.let { prefs[Keys.mtlsCaPem] = it }
+            cert?.let { prefs[Keys.mtlsClientCertPem] = it }
+            key?.let { prefs[Keys.mtlsClientKeyPem] = it }
         }
     }
 

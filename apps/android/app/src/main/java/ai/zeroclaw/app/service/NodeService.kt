@@ -15,6 +15,7 @@ import ai.zeroclaw.app.R
 import ai.zeroclaw.app.data.DeviceCapabilities
 import ai.zeroclaw.app.data.NodeClient
 import ai.zeroclaw.app.data.NodeRuntime
+import ai.zeroclaw.app.data.MtlsTransport
 import ai.zeroclaw.app.data.NodeStatus
 import ai.zeroclaw.app.data.SettingsStore
 import kotlinx.coroutines.CoroutineScope
@@ -61,8 +62,13 @@ class NodeService : Service() {
                 stopSelf()
                 return@launch
             }
+            val transport = when (val result = MtlsTransport.build(settings)) {
+                is MtlsTransport.Result.Ready -> result.built.client
+                is MtlsTransport.Result.Unavailable -> MtlsTransport.plainClient()
+            }
             val nodeClient = NodeClient(
                 scope = scope,
+                http = transport,
                 onStatus = { status ->
                     NodeRuntime.set(status)
                     notify(buildNotification(describe(status)))

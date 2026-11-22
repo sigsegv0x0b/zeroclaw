@@ -88,6 +88,25 @@ The app allows cleartext `ws://` so first-run LAN pairing works. That is the
 same trade-off the dashboard makes on `localhost`; do not rely on it over the
 public internet.
 
+## Identity-based mTLS transport
+
+For remote use without a public CA, enable the gateway's `[gateway.mtls]`
+listener and import its client certificate into the app:
+
+1. On the gateway, enable `[gateway.mtls]` and read the generated id from
+   `<data_dir>/gateway-mtls/gateway_id`.
+2. Issue a client certificate with the gateway's CA:
+   `zeroclaw security issue-client-cert --name phone --ca-dir <data_dir>/gateway-mtls --out-dir /tmp/phone-mtls`.
+3. In the app: **Settings → Transport**, enable *Identity-based mTLS*, enter the
+   gateway id, and import the CA, client certificate and client key (PEM files).
+4. Set the Gateway URL to `https://<host>:42618` (the mTLS listener) and
+   *Save and reconnect*.
+
+The server identity is a generated URI (`spiffe://zeroclaw/gateway/<id>`), not a
+DNS name or IP, so public IP and DDNS changes do not invalidate the
+certificates. The client pins the gateway CA and verifies that URI; ordinary
+hostname matching is intentionally not used.
+
 ## Device link: phone capabilities
 
 The chat socket makes the phone a *client*. Alarms and timers need the phone to

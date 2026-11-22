@@ -48,6 +48,9 @@ fun ZeroClawRoot(viewModel: AppViewModel = viewModel()) {
                 onNodeEnabled = viewModel::setNodeEnabled,
                 onFolderPicked = viewModel::saveNodeFolder,
                 onVoiceBackend = viewModel::setVoiceBackend,
+                onMtlsEnabled = viewModel::setMtlsEnabled,
+                onMtlsGatewayId = viewModel::setMtlsGatewayId,
+                onMtlsImport = viewModel::importMtlsMaterial,
             )
             !state.paired -> OnboardingScreen(
                 booting = state.booting,
