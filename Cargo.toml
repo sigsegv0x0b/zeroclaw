@@ -89,6 +89,7 @@ path = "src/lib.rs"
 zeroclaw-buildinfo.workspace = true
 
 [dependencies]
+qrcode = { version = "0.14", default-features = false }
 # Internal workspace crates — versions and paths declared once in [workspace.dependencies]
 zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true

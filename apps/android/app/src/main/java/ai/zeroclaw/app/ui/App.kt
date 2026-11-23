@@ -56,8 +56,13 @@ fun ZeroClawRoot(viewModel: AppViewModel = viewModel()) {
                 booting = state.booting,
                 error = state.error,
                 deviceName = state.deviceName,
+                secureEnrolling = state.secureEnrolling,
+                secureSas = state.secureSas,
                 onPair = viewModel::pair,
                 onTokenConnect = viewModel::reconnect,
+                onSecureEnroll = viewModel::beginSecureEnroll,
+                onConfirmSas = viewModel::confirmSecureEnroll,
+                onCancelSas = viewModel::cancelSecureEnroll,
                 onDismissError = viewModel::dismissError,
             )
             else -> MainShell(state = state, viewModel = viewModel)
