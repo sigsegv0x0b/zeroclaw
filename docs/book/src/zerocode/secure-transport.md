@@ -12,6 +12,12 @@ securely, in three topologies:
 For the 60-second quickstart see [Remote setup (WSS)](./remote.md); this page is
 the deeper, knob-by-knob guide.
 
+> The same identity-based design (private CA, pairing-code enrollment, SAS,
+> URI identity, mandatory client certificates) is available for the gateway's
+> HTTP/WebSocket plane as an additive listener: see
+> [identity-based mTLS transport](../gateway/mtls-transport.md). The two planes
+> share the model but keep separate material directories.
+
 ## Mental model: two envelopes, one trust boundary
 
 There are two TLS layers, and only one of them is the security boundary:

@@ -686,6 +686,28 @@ Other gateway surfaces keep the pairing check per handler and adopt the
 layer in follow-ups; a [dashboard sign-in](#dashboard-sign-in) session
 also satisfies that check when its account is an administrator.
 
+### Gateway mutual TLS
+
+`[gateway.mtls]` is an additive listener beside the normal gateway transport.
+It serves the same API and requires a client certificate on every connection,
+so it is the remote-access option for deployments without a public CA:
+
+```toml
+[gateway.mtls]
+enabled = true
+bind = "127.0.0.1"
+port = 42618
+```
+
+The generated server certificate carries a stable URI identity
+(`spiffe://zeroclaw/gateway/<id>`) and no DNS or IP SANs, so the client may
+reach it through a changing public IP or DDNS name. Clients pin the private CA,
+verify the URI, and present a certificate issued from the same CA
+(`zeroclaw security issue-client-cert --ca-dir <data_dir>/gateway-mtls`). The
+paired bearer token still authorizes the request; the certificate only proves
+the device. See [Identity-based mTLS transport](../gateway/mtls-transport.md)
+for issuance, revocation, and the Node smoke client.
+
 ## Dashboard sign-in
 
 The web dashboard can offer sign-in through a configured OIDC provider
@@ -709,10 +731,11 @@ Turning it on needs:
   The official Docker image writes `require_pairing = false` into its
   default config; set it to `true` there, or with
   `ZEROCLAW_gateway__require_pairing=true`.
-- HTTPS (`[gateway.tls]`, a reverse proxy with
-  `trust_forwarded_headers`, or a relay-served dashboard with
-  `[relay.dashboard]`, which is relay-terminated: see
-  [secure transport, 3e](../zerocode/secure-transport.md)). Sign-in is
+- HTTPS (`[gateway.tls]`, the identity-based `[gateway.mtls]` listener, a
+  reverse proxy with `trust_forwarded_headers`, or a relay-served dashboard
+  with `[relay.dashboard]`, which is relay-terminated: see
+  [secure transport, 3e](../zerocode/secure-transport.md) and
+  [identity-based mTLS](../gateway/mtls-transport.md)). Sign-in is
   refused over plain HTTP unless the browser runs on the gateway's own
   machine. A relay-served dashboard offers sign-in alone: the relay would
   see a pairing code or token, so pairing and paired tokens are refused

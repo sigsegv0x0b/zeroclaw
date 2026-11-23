@@ -20,8 +20,26 @@ exposes an "Authentication" panel where you paste the token before issuing
 authenticated calls.
 
 Local-bound by default. Over-the-network access requires TLS termination at
-the gateway or in front of it; the per-property and PATCH endpoints are not
-safe to expose unauthenticated regardless of TLS posture.
+the gateway (`[gateway.tls]` or the additive identity-based `[gateway.mtls]`
+listener) or in front of it; the per-property and PATCH endpoints are not safe
+to expose unauthenticated regardless of TLS posture. See
+[Identity-based mTLS transport](./mtls-transport.md).
+
+## Voice transcription
+
+`POST /api/transcribe` decodes a short audio recording with the gateway's
+configured speech-to-text provider (the Android app's "ZeroClaw gateway" voice
+backend uses it). The body is raw audio bytes with an `audio/wav` (or another
+provider-supported) content type, and the request needs the same bearer token
+as the rest of the authenticated API. The response is `{"text": "..."}`.
+
+It requires `[transcription] enabled = true` plus at least one configured
+provider (`[transcription]` Groq, `[transcription.openai]`,
+`[transcription.deepgram]`, `[transcription.google]`,
+`[transcription.local_whisper]`, or `[providers.transcription.<type>.<alias>]`).
+When transcription is disabled or no provider is configured, the endpoint
+returns `503` with an actionable message. The route accepts up to 25 MB and has
+a longer timeout than ordinary control-plane requests.
 
 ## Channel-plugin webhook ingress
 
