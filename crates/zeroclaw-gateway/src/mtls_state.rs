@@ -19,6 +19,10 @@ use tokio_util::sync::CancellationToken;
 
 use zeroclaw_config::pairing::PairingGuard;
 
+/// Peer certificate fingerprint attached to requests served on the mTLS listener.
+#[derive(Clone, Debug)]
+pub struct PeerCertFingerprint(pub String);
+
 /// One client certificate issued by the gateway mTLS CA.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssuedCert {
@@ -37,7 +41,9 @@ pub struct MtlsState {
     pub ca_cert_pem: String,
     pub ca_key_pem: zeroize::Zeroizing<String>,
     pub pairing: Arc<PairingGuard>,
+    pub pinned_client_certs: Vec<String>,
     revoked: Arc<RwLock<HashSet<String>>>,
+    acceptor: RwLock<Option<Arc<tokio_rustls::TlsAcceptor>>>,
     active: Mutex<HashMap<String, Vec<CancellationToken>>>,
     enroll_attempts: Mutex<HashMap<IpAddr, Vec<Instant>>>,
 }
@@ -49,6 +55,7 @@ impl MtlsState {
         ca_cert_pem: String,
         ca_key_pem: zeroize::Zeroizing<String>,
         pairing: Arc<PairingGuard>,
+        pinned_client_certs: Vec<String>,
     ) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let mut revoked = HashSet::new();
@@ -70,7 +77,9 @@ impl MtlsState {
             ca_cert_pem,
             ca_key_pem,
             pairing,
+            pinned_client_certs,
             revoked: Arc::new(RwLock::new(revoked)),
+            acceptor: RwLock::new(None),
             active: Mutex::new(HashMap::new()),
             enroll_attempts: Mutex::new(HashMap::new()),
         }))
@@ -102,6 +111,14 @@ impl MtlsState {
         entries.retain(|existing| existing.fingerprint != entry.fingerprint);
         entries.push(entry);
         self.write_ledger(&entries)
+    }
+
+    pub fn set_acceptor(&self, acceptor: tokio_rustls::TlsAcceptor) {
+        *self.acceptor.write() = Some(Arc::new(acceptor));
+    }
+
+    pub fn acceptor(&self) -> Option<Arc<tokio_rustls::TlsAcceptor>> {
+        self.acceptor.read().clone()
     }
 
     /// Whether a peer certificate fingerprint is revoked.
@@ -145,6 +162,16 @@ impl MtlsState {
     /// certificates are cancelled immediately, and the fingerprints are
     /// appended to the on-disk CRL so a restart keeps the revocation.
     pub fn revoke(&self, selector: &str) -> Result<Vec<String>> {
+        self.revoke_inner(selector, true)
+    }
+
+    /// Renewal revokes the old certificate for future handshakes but leaves the
+    /// caller's own connection alive long enough to return the new material.
+    pub fn revoke_for_renewal(&self, fingerprint: &str) -> Result<Vec<String>> {
+        self.revoke_inner(fingerprint, false)
+    }
+
+    fn revoke_inner(&self, selector: &str, cancel_active: bool) -> Result<Vec<String>> {
         let selector = selector.trim().replace(':', "").to_lowercase();
         let mut entries = self.read_ledger();
         let mut targets: Vec<String> = entries
@@ -180,11 +207,13 @@ impl MtlsState {
         }
         self.write_ledger(&entries)?;
 
-        let mut active = self.active.lock();
-        for fingerprint in &targets {
-            if let Some(tokens) = active.remove(fingerprint) {
-                for token in tokens {
-                    token.cancel();
+        if cancel_active {
+            let mut active = self.active.lock();
+            for fingerprint in &targets {
+                if let Some(tokens) = active.remove(fingerprint) {
+                    for token in tokens {
+                        token.cancel();
+                    }
                 }
             }
         }

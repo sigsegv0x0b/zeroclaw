@@ -5,6 +5,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
@@ -30,6 +31,8 @@ data class StoredSettings(
     val mtlsCaPem: String = "",
     val mtlsClientCertPem: String = "",
     val mtlsClientKeyPem: String = "",
+    val mtlsIssuedAt: Long = 0,
+    val mtlsNotAfter: Long = 0,
 )
 
 /**
@@ -55,6 +58,8 @@ class SettingsStore(private val context: Context) {
         val mtlsCaPem = stringPreferencesKey("mtls_ca_pem")
         val mtlsClientCertPem = stringPreferencesKey("mtls_client_cert_pem")
         val mtlsClientKeyPem = stringPreferencesKey("mtls_client_key_pem")
+        val mtlsIssuedAt = longPreferencesKey("mtls_issued_at")
+        val mtlsNotAfter = longPreferencesKey("mtls_not_after")
     }
 
     val settings: Flow<StoredSettings> = context.settingsDataStore.data.map { prefs ->
@@ -74,6 +79,8 @@ class SettingsStore(private val context: Context) {
             mtlsCaPem = prefs[Keys.mtlsCaPem].orEmpty(),
             mtlsClientCertPem = prefs[Keys.mtlsClientCertPem].orEmpty(),
             mtlsClientKeyPem = prefs[Keys.mtlsClientKeyPem].orEmpty(),
+            mtlsIssuedAt = prefs[Keys.mtlsIssuedAt] ?: 0L,
+            mtlsNotAfter = prefs[Keys.mtlsNotAfter] ?: 0L,
         )
     }
 
@@ -111,6 +118,13 @@ class SettingsStore(private val context: Context) {
         context.settingsDataStore.edit { prefs ->
             prefs[Keys.nodeFolderUri] = uri
             prefs[Keys.nodeFolderName] = name
+        }
+    }
+
+    suspend fun saveMtlsValidity(issuedAt: Long, notAfter: Long) {
+        context.settingsDataStore.edit { prefs ->
+            prefs[Keys.mtlsIssuedAt] = issuedAt
+            prefs[Keys.mtlsNotAfter] = notAfter
         }
     }
 

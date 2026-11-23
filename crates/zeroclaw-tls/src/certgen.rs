@@ -290,6 +290,41 @@ pub fn ensure_gateway_materials(dir: &Path) -> Result<GatewayMaterials> {
         (ca_cert, ca_key)
     };
 
+    write_gateway_server_leaf(dir, &gateway_id, &ca_cert, &ca_key)?;
+
+    Ok(GatewayMaterials {
+        gateway_id,
+        ..materials
+    })
+}
+
+/// Regenerate the gateway server leaf with a fresh private key, keeping the
+/// existing CA and gateway identity. Used by authenticated renewal.
+pub fn rotate_gateway_server_leaf(dir: &Path) -> Result<GatewayMaterials> {
+    let gateway_id = std::fs::read_to_string(dir.join("gateway_id"))
+        .with_context(|| format!("reading {}", dir.join("gateway_id").display()))?
+        .trim()
+        .to_string();
+    let ca_cert_pem = std::fs::read_to_string(dir.join("ca.crt"))
+        .with_context(|| format!("reading {}", dir.join("ca.crt").display()))?;
+    let ca_key_pem = load_ca_key_pem(&dir.join("ca.key"), &CaKeyProtection::None)?;
+    let (ca_cert, ca_key) = load_ca_from_pem(&ca_cert_pem, &ca_key_pem)?;
+    write_gateway_server_leaf(dir, &gateway_id, &ca_cert, &ca_key)?;
+    Ok(GatewayMaterials {
+        gateway_id,
+        ca_cert_path: dir.join("ca.crt"),
+        ca_key_path: dir.join("ca.key"),
+        server_cert_path: dir.join("server.crt"),
+        server_key_path: dir.join("server.key"),
+    })
+}
+
+fn write_gateway_server_leaf(
+    dir: &Path,
+    gateway_id: &str,
+    ca_cert: &rcgen::Certificate,
+    ca_key: &rcgen::KeyPair,
+) -> Result<()> {
     let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .context("generating gateway server key")?;
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
@@ -304,15 +339,10 @@ pub fn ensure_gateway_materials(dir: &Path) -> Result<GatewayMaterials> {
     params.subject_alt_names = vec![rcgen::SanType::URI(uri)];
     set_validity(&mut params, SERVER_VALIDITY_DAYS);
     let cert = params
-        .signed_by(&server_key, &ca_cert, &ca_key)
+        .signed_by(&server_key, ca_cert, ca_key)
         .context("signing gateway server certificate")?;
-    write_public_pem(&materials.server_cert_path, &cert.pem())?;
-    write_private_pem(&materials.server_key_path, &server_key.serialize_pem())?;
-
-    Ok(GatewayMaterials {
-        gateway_id,
-        ..materials
-    })
+    write_public_pem(&dir.join("server.crt"), &cert.pem())?;
+    write_private_pem(&dir.join("server.key"), &server_key.serialize_pem())
 }
 
 /// Ensure mTLS server materials exist under `dir`.

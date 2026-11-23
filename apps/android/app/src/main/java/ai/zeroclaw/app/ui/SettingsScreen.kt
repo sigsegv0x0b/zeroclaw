@@ -69,6 +69,7 @@ fun SettingsScreen(
     onMtlsEnabled: (Boolean) -> Unit,
     onMtlsGatewayId: (String) -> Unit,
     onMtlsImport: (kind: String, uri: android.net.Uri?) -> Unit,
+    onRenewCertificate: () -> Unit,
 ) {
     var url by remember(state.gatewayUrl) { mutableStateOf(state.gatewayUrl) }
     var gwId by remember(state.mtlsGatewayId) { mutableStateOf(state.mtlsGatewayId) }
@@ -305,6 +306,28 @@ fun SettingsScreen(
                 style = MaterialTheme.typography.labelSmall,
                 color = if (state.mtlsStatus.startsWith("mTLS ready")) Zc.Success else Zc.TextSubtle,
             )
+            if (state.mtlsEnabled) {
+                val expiry = if (state.mtlsNotAfter > 0) {
+                    java.time.format.DateTimeFormatter.ISO_LOCAL_DATE_TIME.format(
+                        java.time.Instant.ofEpochSecond(state.mtlsNotAfter)
+                            .atZone(java.time.ZoneId.systemDefault()),
+                    )
+                } else {
+                    "unknown"
+                }
+                Text(
+                    text = "Certificate expires: $expiry. Renewal is attempted at half " +
+                        "the lifetime; the server rotates both keys and revokes the old cert.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Zc.TextSubtle,
+                )
+                Spacer(Modifier.height(6.dp))
+                OutlinedButton(
+                    onClick = onRenewCertificate,
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Renew certificate") }
+            }
 
             Spacer(Modifier.height(26.dp))
             SectionLabel("Status")

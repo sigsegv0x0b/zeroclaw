@@ -53,6 +53,7 @@ object MtlsEnrollment {
         val gatewayId: String,
         val deviceId: String,
         val token: String,
+        val notAfter: Long,
     )
 
     suspend fun probe(
@@ -120,6 +121,56 @@ object MtlsEnrollment {
             gatewayId = json.getString("gateway_id"),
             deviceId = json.getString("device_id"),
             token = json.getString("token"),
+            notAfter = json.optLong("not_after", 0L),
+        )
+    }
+
+    /**
+     * Authenticated renewal: prove the bearer token and the current client
+     * certificate, submit a fresh CSR, and replace the stored material. The
+     * server rotates its own leaf key and revokes the old client certificate.
+     */
+    suspend fun renew(
+        settings: StoredSettings,
+        deviceName: String,
+    ): Result = withContext(Dispatchers.IO) {
+        val transport = when (val built = MtlsTransport.build(settings)) {
+            is MtlsTransport.Result.Ready -> built.built.client
+            is MtlsTransport.Result.Unavailable -> error(built.reason)
+        }
+        val keyPair = KeyPairGenerator.getInstance("EC").apply {
+            initialize(ECGenParameterSpec("secp256r1"), SecureRandom())
+        }.generateKeyPair()
+        val signer = JcaContentSignerBuilder("SHA256withECDSA").build(keyPair.private)
+        val csr = JcaPKCS10CertificationRequestBuilder(
+            X500Name("CN=${deviceName.replace(",", "")}"),
+            keyPair.public,
+        ).build(signer)
+        val payload = JSONObject()
+            .put("csr_pem", pem("CERTIFICATE REQUEST", csr.encoded))
+            .put("device_name", deviceName)
+        val request = Request.Builder()
+            .url("${settings.gatewayUrl.trimEnd('/')}/api/mtls/renew")
+            .header("Authorization", "Bearer ${settings.token}")
+            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        val body = transport.newCall(request).execute().use { response ->
+            val text = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                val error = runCatching { JSONObject(text).optString("error") }.getOrNull()
+                error("Renewal failed (HTTP ${response.code}): ${error ?: text}")
+            }
+            text
+        }
+        val json = JSONObject(body)
+        Result(
+            caPem = json.getString("ca_chain_pem"),
+            certPem = json.getString("cert_pem"),
+            keyPem = pem("PRIVATE KEY", keyPair.private.encoded),
+            gatewayId = json.getString("gateway_id"),
+            deviceId = json.getString("device_id"),
+            token = settings.token,
+            notAfter = json.optLong("not_after", 0L),
         )
     }
 
