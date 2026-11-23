@@ -1336,7 +1336,6 @@ async fn gateway_stop_requested(stopping: &mut tokio::sync::watch::Receiver<bool
 /// left untouched so existing transports keep working.
 struct PreparedMtls {
     listener: tokio::net::TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
     state: Arc<mtls_state::MtlsState>,
     materials: zeroclaw_tls::GatewayMaterials,
 }
@@ -1365,6 +1364,7 @@ async fn prepare_gateway_mtls(
         ca_cert_pem,
         ca_key_pem,
         pairing,
+        mtls.pinned_client_certs.clone(),
     )?;
     let acceptor = mtls_state::build_acceptor(
         &materials.server_cert_path,
@@ -1373,6 +1373,7 @@ async fn prepare_gateway_mtls(
         &mtls.pinned_client_certs,
         &state,
     )?;
+    state.set_acceptor(acceptor.clone());
     let listener = tokio::net::TcpListener::bind((mtls.bind.as_str(), mtls.port)).await?;
     ::zeroclaw_log::record!(
         INFO,
@@ -1388,7 +1389,6 @@ async fn prepare_gateway_mtls(
     );
     Ok(Some(PreparedMtls {
         listener,
-        acceptor,
         state,
         materials,
     }))
@@ -1400,7 +1400,6 @@ async fn prepare_gateway_mtls(
 fn spawn_gateway_mtls_listener(
     router: axum::Router,
     listener: tokio::net::TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
     state: Arc<mtls_state::MtlsState>,
     admission: Admission,
     mut stopping: tokio::sync::watch::Receiver<bool>,
@@ -1417,7 +1416,9 @@ fn spawn_gateway_mtls_listener(
                 Ok(pair) => pair,
                 Err(_) => continue,
             };
-            let acceptor = acceptor.clone();
+            let Some(acceptor) = state.acceptor() else {
+                continue;
+            };
             let admission = admission.clone();
             let svc = match tower::MakeService::<
                 SocketAddr,
@@ -1450,16 +1451,33 @@ fn spawn_gateway_mtls_listener(
                         return;
                     }
                 };
+                let fingerprint = tls_stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|certs| certs.first())
+                    .map(|cert| zeroclaw_tls::cert_sha256_fingerprint(cert.as_ref()));
+                let Some(fingerprint) = fingerprint else {
+                    return;
+                };
+                let token = state.register_active(fingerprint.clone());
+                let request_fingerprint = fingerprint.clone();
                 let hyper_svc = hyper::service::service_fn(
-                    move |req: hyper::Request<hyper::body::Incoming>| {
+                    move |mut req: hyper::Request<hyper::body::Incoming>| {
                         let svc = svc.clone();
                         let admission = admission.clone();
+                        req.extensions_mut()
+                            .insert(mtls_state::PeerCertFingerprint(request_fingerprint.clone()));
                         async move { serve_while_current(svc, &admission, req).await }
                     },
                 );
                 let builder = hyper_util::server::conn::auto::Builder::new(executor);
                 let io = hyper_util::rt::TokioIo::new(tls_stream);
-                let _ = builder.serve_connection_with_upgrades(io, hyper_svc).await;
+                tokio::select! {
+                    () = token.cancelled() => {}
+                    _ = builder.serve_connection_with_upgrades(io, hyper_svc) => {}
+                }
+                state.unregister_active(&fingerprint, &token);
             });
         }
     });
@@ -2735,6 +2753,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         // ── Admin routes (for CLI management) ──
         .route("/admin/mtls/list", get(api_mtls::handle_list))
         .route("/admin/mtls/revoke", post(api_mtls::handle_revoke))
+        .route("/api/mtls/renew", post(api_mtls::handle_renew))
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
         .route("/admin/sop/pending", get(api_sop::handle_sop_pending))
@@ -3193,7 +3212,6 @@ pub async fn run_gateway_with_plugin_webhooks(
         spawn_gateway_mtls_listener(
             router,
             prepared.listener,
-            prepared.acceptor,
             prepared.state,
             admission.clone(),
             shutdown_rx.clone(),

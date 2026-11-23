@@ -20,7 +20,7 @@ pub mod certgen;
 pub use certgen::{
     CaKeyProtection, GatewayMaterials, IssuedLeaf, Pem, ServerMaterials, ensure_gateway_materials,
     ensure_server_materials, ensure_server_materials_protected, generate_client_csr,
-    issue_client_cert, load_ca_key_pem, server_leaf_sans, sign_csr,
+    issue_client_cert, load_ca_key_pem, rotate_gateway_server_leaf, server_leaf_sans, sign_csr,
 };
 
 pub mod csr;

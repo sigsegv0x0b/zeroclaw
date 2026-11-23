@@ -31,6 +31,7 @@ data class UiState(
     val mtlsGatewayId: String = "",
     val mtlsLoaded: Boolean = false,
     val mtlsStatus: String = "",
+    val mtlsNotAfter: Long = 0,
     val secureEnrolling: Boolean = false,
     val secureSas: String? = null,
     val nodeStatus: NodeStatus = NodeStatus.Stopped,
@@ -73,6 +74,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             socket.state.collect { state ->
                 _ui.update { it.copy(socket = state) }
+            }
+        }
+        viewModelScope.launch {
+            // Renew at half the certificate lifetime. The loop wakes hourly so
+            // settings changes and clock jumps are picked up without a new
+            // process; a successful renewal moves the midpoint forward.
+            while (true) {
+                kotlinx.coroutines.delay(3_600_000L)
+                val saved = runCatching { store.current() }.getOrNull() ?: continue
+                if (!saved.mtlsEnabled || saved.mtlsIssuedAt <= 0 || saved.mtlsNotAfter <= 0) {
+                    continue
+                }
+                val midpoint = saved.mtlsIssuedAt + (saved.mtlsNotAfter - saved.mtlsIssuedAt) / 2
+                if (System.currentTimeMillis() >= midpoint) {
+                    renewInternal(manual = false)
+                }
             }
         }
         viewModelScope.launch {
@@ -124,6 +141,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         saved.mtlsClientCertPem.isNotBlank() &&
                         saved.mtlsClientKeyPem.isNotBlank(),
                     mtlsStatus = MtlsTransport.describe(saved),
+                    mtlsNotAfter = saved.mtlsNotAfter,
                     booting = false,
                 )
             }
@@ -414,6 +432,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             cert = result.certPem,
             key = result.keyPem,
         )
+        store.saveMtlsValidity(System.currentTimeMillis(), result.notAfter)
         store.saveMtlsGatewayId(result.gatewayId)
         store.saveMtlsEnabled(true)
         val baseUrl = "https://${probe.host}:$mtlsPort"
@@ -437,6 +456,41 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         NodeService.start(getApplication())
         loadWorkspace(null)
+    }
+
+    fun renewCertificate() {
+        viewModelScope.launch { renewInternal(manual = true) }
+    }
+
+    private suspend fun renewInternal(manual: Boolean) {
+        val settings = runCatching { store.current() }.getOrNull() ?: return
+        if (!settings.mtlsEnabled || settings.mtlsClientCertPem.isBlank()) return
+        runCatching {
+            MtlsEnrollment.renew(settings, settings.deviceName.ifBlank { "Android" })
+        }.onSuccess { result ->
+            store.saveMtlsMaterial(
+                ca = result.caPem,
+                cert = result.certPem,
+                key = result.keyPem,
+            )
+            store.saveMtlsGatewayId(result.gatewayId)
+            store.saveMtlsValidity(System.currentTimeMillis(), result.notAfter)
+            val saved = store.current()
+            applyMtlsTransport(saved, reconnect = false)
+            _ui.update {
+                it.copy(
+                    mtlsStatus = MtlsTransport.describe(saved),
+                    mtlsLoaded = true,
+                    mtlsNotAfter = saved.mtlsNotAfter,
+                    notice = "Client certificate renewed.",
+                )
+            }
+            if (manual) reconnect(_ui.value.gatewayUrl, _ui.value.token)
+        }.onFailure { error ->
+            if (manual) {
+                _ui.update { it.copy(error = "Certificate renewal failed: ${error.userMessage()}") }
+            }
+        }
     }
 
     fun setMtlsEnabled(enabled: Boolean) {
