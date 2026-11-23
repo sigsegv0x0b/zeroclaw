@@ -1143,6 +1143,29 @@ enum EvalCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum MtlsCommands {
+    /// List certificates issued by the gateway mTLS CA
+    List {
+        /// Emit JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke a certificate and drop its live connections
+    Delete {
+        /// Device id from `mtls list`
+        #[arg(
+            long,
+            conflicts_with = "fingerprint",
+            required_unless_present = "fingerprint"
+        )]
+        device: Option<String>,
+        /// Certificate SHA-256 fingerprint
+        #[arg(long, conflicts_with = "device", required_unless_present = "device")]
+        fingerprint: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum Commands {
     /// Quickstart — create one working agent end-to-end. Replaces the
     /// section-by-section onboarding flow with a single preset-driven
@@ -1282,6 +1305,12 @@ Examples:
     Gateway {
         #[command(subcommand)]
         gateway_command: Option<zeroclaw::GatewayCommands>,
+    },
+
+    /// Manage the gateway mTLS certificate ledger
+    Mtls {
+        #[command(subcommand)]
+        command: MtlsCommands,
     },
 
     /// Start ACP (Agent Control Protocol) server over stdio
@@ -8229,6 +8258,98 @@ mod wss_client_auth_tests {
 }
 
 #[cfg(feature = "agent-runtime")]
+async fn run_mtls_command(config: &Config, command: MtlsCommands) -> Result<()> {
+    let dir = if let Some(mtls) = config.gateway.mtls.as_ref() {
+        if mtls.dir.trim().is_empty() {
+            config.data_dir.join("gateway-mtls")
+        } else {
+            PathBuf::from(mtls.dir.trim())
+        }
+    } else {
+        config.data_dir.join("gateway-mtls")
+    };
+    match command {
+        MtlsCommands::List { json } => {
+            let path = dir.join("issued.json");
+            let entries: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Vec<serde_json::Value>>(&text).ok())
+                .unwrap_or_default();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+                return Ok(());
+            }
+            if entries.is_empty() {
+                println!("No client certificates issued by the gateway mTLS CA.");
+                return Ok(());
+            }
+            println!(
+                "{:<14} {:<12} {:<64} {:<22} {}",
+                "DEVICE", "REVOKED", "FINGERPRINT", "EXPIRES", "NAME"
+            );
+            for entry in entries {
+                let device = entry["device_id"].as_str().unwrap_or("-");
+                let revoked = entry["revoked"].as_bool().unwrap_or(false);
+                let fingerprint = entry["fingerprint"].as_str().unwrap_or("-");
+                let not_after = entry["not_after"].as_i64().unwrap_or(0);
+                let expires = chrono::DateTime::from_timestamp(not_after, 0)
+                    .map(|time| time.to_rfc3339())
+                    .unwrap_or_else(|| "-".to_string());
+                let name = entry["name"].as_str().unwrap_or("-");
+                println!("{device:<14} {revoked:<12} {fingerprint:<64} {expires:<22} {name}");
+            }
+            Ok(())
+        }
+        MtlsCommands::Delete {
+            device,
+            fingerprint,
+        } => {
+            let selector = device.or(fingerprint).unwrap_or_default();
+            if selector.trim().is_empty() {
+                anyhow::bail!("pass --device or --fingerprint");
+            }
+            let url = format!("http://127.0.0.1:{}/admin/mtls/revoke", config.gateway.port);
+            let response = reqwest::Client::new()
+                .post(&url)
+                .json(&serde_json::json!({"selector": selector.trim()}))
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    let body: serde_json::Value = response.json().await?;
+                    println!("{}", serde_json::to_string_pretty(&body)?);
+                }
+                Ok(response) => {
+                    anyhow::bail!(
+                        "gateway refused the revocation (HTTP {}): {}",
+                        response.status(),
+                        response.text().await.unwrap_or_default()
+                    );
+                }
+                Err(error) => {
+                    // Gateway not running: write the CRL directly so the next
+                    // start refuses the certificate. Live sessions end when the
+                    // gateway stops.
+                    let revoked = dir.join("revoked");
+                    use std::io::Write as _;
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&revoked)?;
+                    writeln!(file, "{}", selector.trim())?;
+                    println!(
+                        "Gateway not reachable ({error}); wrote {} to {}. Restart the gateway to apply it.",
+                        selector.trim(),
+                        revoked.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
 fn issue_wss_client_cert(
     config: &Config,
     name: &str,
@@ -10381,6 +10502,8 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 anyhow::bail!("ACP server requires the `channel-acp-server` feature")
             }
         }
+
+        Commands::Mtls { command } => run_mtls_command(&config, command).await,
 
         Commands::Gateway { gateway_command } => {
             if !cfg!(feature = "gateway") {

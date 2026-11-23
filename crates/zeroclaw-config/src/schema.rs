@@ -8309,6 +8309,14 @@ pub struct GatewayMtlsConfig {
     pub pinned_client_certs: Vec<String>,
     /// Optional CRL file (one revoked SHA-256 fingerprint per line).
     pub crl_path: String,
+    /// Serve the pairing-code-gated certificate enrollment endpoint for this
+    /// listener (default: false). The endpoint runs on its own TLS port so a
+    /// client can obtain its first certificate before it has one.
+    pub enroll: bool,
+    /// Address the enrollment listener binds on (default: 127.0.0.1).
+    pub enroll_bind: String,
+    /// Port the enrollment listener binds on (default: 42619).
+    pub enroll_port: u16,
 }
 
 impl Default for GatewayMtlsConfig {
@@ -8320,6 +8328,9 @@ impl Default for GatewayMtlsConfig {
             dir: String::new(),
             pinned_client_certs: Vec::new(),
             crl_path: String::new(),
+            enroll: false,
+            enroll_bind: "127.0.0.1".to_string(),
+            enroll_port: 42_619,
         }
     }
 }

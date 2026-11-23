@@ -12,6 +12,7 @@ pub mod api;
 pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
+pub mod api_mtls;
 pub mod api_oidc;
 mod api_oidc_enroll;
 pub mod api_pairing;
@@ -39,6 +40,8 @@ mod chat_core;
 pub mod core_rpc;
 pub mod dashboard_core;
 pub mod dashboard_session;
+mod mtls_enroll;
+pub mod mtls_state;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
@@ -758,6 +761,8 @@ pub struct AppState {
     pub memory_strategy: Arc<dyn MemoryStrategy>,
     pub auto_save: bool,
     pub pairing: Arc<PairingGuard>,
+    /// Identity-based mTLS listener state, when `[gateway.mtls]` is enabled.
+    pub mtls: Option<Arc<mtls_state::MtlsState>>,
     pub trust_forwarded_headers: bool,
     pub rate_limiter: Arc<GatewayRateLimiter>,
     pub auth_limiter: Arc<auth_rate_limit::AuthRateLimiter>,
@@ -1316,9 +1321,17 @@ async fn gateway_stop_requested(stopping: &mut tokio::sync::watch::Receiver<bool
 /// (`spiffe://zeroclaw/gateway/<id>`), never a DNS name or IP. Client
 /// certificates must chain to the generated CA; the normal gateway listener is
 /// left untouched so existing transports keep working.
-async fn build_gateway_mtls_listener(
+struct PreparedMtls {
+    listener: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    state: Arc<mtls_state::MtlsState>,
+    materials: zeroclaw_tls::GatewayMaterials,
+}
+
+async fn prepare_gateway_mtls(
     config: &Config,
-) -> anyhow::Result<Option<(tokio::net::TcpListener, tokio_rustls::TlsAcceptor, String)>> {
+    pairing: Arc<zeroclaw_config::pairing::PairingGuard>,
+) -> anyhow::Result<Option<PreparedMtls>> {
     let Some(mtls) = config.gateway.mtls.as_ref().filter(|m| m.enabled) else {
         return Ok(None);
     };
@@ -1328,12 +1341,24 @@ async fn build_gateway_mtls_listener(
         std::path::PathBuf::from(mtls.dir.trim())
     };
     let materials = zeroclaw_tls::ensure_gateway_materials(&dir)?;
-    let acceptor = zeroclaw_tls::build_mtls_acceptor(
-        &materials.server_cert_path.to_string_lossy(),
-        &materials.server_key_path.to_string_lossy(),
-        &materials.ca_cert_path.to_string_lossy(),
+    let ca_cert_pem = std::fs::read_to_string(&materials.ca_cert_path)?;
+    let ca_key_pem = zeroclaw_tls::load_ca_key_pem(
+        &materials.ca_key_path,
+        &zeroclaw_tls::CaKeyProtection::None,
+    )?;
+    let state = mtls_state::MtlsState::load(
+        dir,
+        materials.gateway_id.clone(),
+        ca_cert_pem,
+        ca_key_pem,
+        pairing,
+    )?;
+    let acceptor = mtls_state::build_acceptor(
+        &materials.server_cert_path,
+        &materials.server_key_path,
+        &materials.ca_cert_path,
         &mtls.pinned_client_certs,
-        &mtls.crl_path,
+        &state,
     )?;
     let listener = tokio::net::TcpListener::bind((mtls.bind.as_str(), mtls.port)).await?;
     ::zeroclaw_log::record!(
@@ -1348,9 +1373,13 @@ async fn build_gateway_mtls_listener(
         ),
         "Gateway mTLS listener up with identity-based certificates"
     );
-    Ok(Some((listener, acceptor, materials.gateway_id)))
+    Ok(Some(PreparedMtls {
+        listener,
+        acceptor,
+        state,
+        materials,
+    }))
 }
-
 /// Serve the same gateway app on the additional mTLS listener.
 ///
 /// Connections are tracked in the gateway's `ServeTasks` so the normal shutdown
@@ -1359,7 +1388,7 @@ fn spawn_gateway_mtls_listener(
     router: axum::Router,
     listener: tokio::net::TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
-    gateway_id: String,
+    state: Arc<mtls_state::MtlsState>,
     admission: Admission,
     mut stopping: tokio::sync::watch::Receiver<bool>,
     tasks: ServeTasks,
@@ -1376,7 +1405,6 @@ fn spawn_gateway_mtls_listener(
                 Err(_) => continue,
             };
             let acceptor = acceptor.clone();
-            let gateway_id = gateway_id.clone();
             let admission = admission.clone();
             let svc = match tower::MakeService::<
                 SocketAddr,
@@ -1388,6 +1416,7 @@ fn spawn_gateway_mtls_listener(
                 Err(_) => continue,
             };
             let executor = tasks.clone();
+            let state = Arc::clone(&state);
             tasks.spawn(async move {
                 let tls_stream = match acceptor.accept(tcp_stream).await {
                     Ok(stream) => stream,
@@ -1401,7 +1430,7 @@ fn spawn_gateway_mtls_listener(
                             .with_attrs(serde_json::json!({
                                 "error": format!("{error}"),
                                 "remote_addr": remote_addr,
-                                "gateway_id": gateway_id,
+                                "gateway_id": state.gateway_id,
                             })),
                             "gateway mTLS handshake failed"
                         );
@@ -2596,6 +2625,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         None => principal_gate::GatewayInboundAuth::from_config(&config, Arc::clone(&pairing))?,
     });
 
+    let mtls_prepared = prepare_gateway_mtls(&config, Arc::clone(&pairing)).await?;
     let state = AppState {
         config: config_state,
         config_authority: authority.clone(),
@@ -2607,6 +2637,9 @@ pub async fn run_gateway_with_plugin_webhooks(
         memory_strategy,
         auto_save: config.memory.auto_save,
         pairing,
+        mtls: mtls_prepared
+            .as_ref()
+            .map(|prepared| Arc::clone(&prepared.state)),
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
         rate_limiter,
         auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -2687,6 +2720,8 @@ pub async fn run_gateway_with_plugin_webhooks(
         .merge(api_oidc::routes())
         .merge(api_oidc_enroll::routes(Arc::clone(&inbound_auth), shared_cert_audit))
         // ── Admin routes (for CLI management) ──
+        .route("/admin/mtls/list", get(api_mtls::handle_list))
+        .route("/admin/mtls/revoke", post(api_mtls::handle_revoke))
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
         .route("/admin/sop/pending", get(api_sop::handle_sop_pending))
@@ -3110,8 +3145,7 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     // An additive, identity-based mTLS listener. The normal listener below
     // keeps whatever transport the operator configured.
-    let mtls_listener = build_gateway_mtls_listener(&config).await?;
-    let mtls_router = mtls_listener.as_ref().map(|_| app.clone());
+    let mtls_router = mtls_prepared.as_ref().map(|_| app.clone());
 
     // One accept loop for plain and TLS connections. Every connection
     // watches this gateway's stop and serves through `admission`, so after
@@ -3132,12 +3166,22 @@ pub async fn run_gateway_with_plugin_webhooks(
         stopping: shutdown_rx.clone(),
         tasks: tasks.clone(),
     };
-    if let (Some(router), Some((listener, acceptor, gateway_id))) = (mtls_router, mtls_listener) {
+    if let (Some(router), Some(prepared)) = (mtls_router, mtls_prepared) {
+        if let Some(mtls_config) = config.gateway.mtls.as_ref().filter(|mtls| mtls.enroll) {
+            mtls_enroll::spawn(
+                Arc::clone(&prepared.state),
+                mtls_config,
+                &prepared.materials,
+                shutdown_rx.clone(),
+                tasks.clone(),
+            )
+            .await?;
+        }
         spawn_gateway_mtls_listener(
             router,
-            listener,
-            acceptor,
-            gateway_id,
+            prepared.listener,
+            prepared.acceptor,
+            prepared.state,
             admission.clone(),
             shutdown_rx.clone(),
             tasks.clone(),
