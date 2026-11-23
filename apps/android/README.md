@@ -91,16 +91,26 @@ public internet.
 ## Identity-based mTLS transport
 
 For remote use without a public CA, enable the gateway's `[gateway.mtls]`
-listener and import its client certificate into the app:
+listener with `enroll = true`. On the gateway run:
 
-1. On the gateway, enable `[gateway.mtls]` and read the generated id from
-   `<data_dir>/gateway-mtls/gateway_id`.
-2. Issue a client certificate with the gateway's CA:
-   `zeroclaw security issue-client-cert --name phone --ca-dir <data_dir>/gateway-mtls --out-dir /tmp/phone-mtls`.
-3. In the app: **Settings → Transport**, enable *Identity-based mTLS*, enter the
-   gateway id, and import the CA, client certificate and client key (PEM files).
-4. Set the Gateway URL to `https://<host>:42618` (the mTLS listener) and
-   *Save and reconnect*.
+```sh
+zeroclaw pair --host <public-host-or-ddns> --qr
+```
+
+In the app's onboarding **Secure setup (mTLS)** section, scan that QR (or enter
+the host and pairing code). The app fetches the gateway CA, shows the SAS to
+confirm, generates its own key and CSR locally, receives a client certificate
+and bearer token from the gateway, and connects over mTLS. No certificates are
+copied by hand.
+
+The pairing code is single use; after enrollment the app stores the CA, client
+certificate, key, gateway id and token in app-private storage. Certificate
+lifecycle is managed on the gateway with `zeroclaw mtls list` and
+`zeroclaw mtls delete`, which revokes a device and drops its live connections.
+
+For a manual fallback, issue a certificate with
+`zeroclaw security issue-client-cert --ca-dir <data_dir>/gateway-mtls` and
+import the three PEMs under **Settings → Transport**.
 
 The server identity is a generated URI (`spiffe://zeroclaw/gateway/<id>`), not a
 DNS name or IP, so public IP and DDNS changes do not invalidate the

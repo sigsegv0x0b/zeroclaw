@@ -14,13 +14,20 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -41,8 +48,13 @@ fun OnboardingScreen(
     booting: Boolean,
     error: String?,
     deviceName: String,
+    secureEnrolling: Boolean,
+    secureSas: String?,
     onPair: (url: String, code: String, deviceName: String) -> Unit,
     onTokenConnect: (url: String, token: String) -> Unit,
+    onSecureEnroll: (host: String, mtlsPort: Int, enrollPort: Int, code: String, sas: String?) -> Unit,
+    onConfirmSas: () -> Unit,
+    onCancelSas: () -> Unit,
     onDismissError: () -> Unit,
 ) {
     var url by remember { mutableStateOf("") }
@@ -50,6 +62,27 @@ fun OnboardingScreen(
     var name by remember(deviceName) { mutableStateOf(deviceName) }
     var token by remember { mutableStateOf("") }
     var showToken by remember { mutableStateOf(false) }
+    var secureHost by remember { mutableStateOf("") }
+    var mtlsPort by remember { mutableStateOf("42618") }
+    var enrollPort by remember { mutableStateOf("42619") }
+    var secureCode by remember { mutableStateOf("") }
+    val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
+        val contents = result.contents ?: return@rememberLauncherForActivityResult
+        runCatching { org.json.JSONObject(contents) }.onSuccess { json ->
+            val host = json.optString("host")
+            val mtls = json.optInt("mtls", 42618)
+            val enroll = json.optInt("enroll", 42619)
+            val code = json.optString("code")
+            val sas = json.optString("sas").ifBlank { null }
+            if (host.isNotBlank() && code.isNotBlank()) {
+                secureHost = host
+                mtlsPort = mtls.toString()
+                enrollPort = enroll.toString()
+                secureCode = code
+                onSecureEnroll(host, mtls, enroll, code, sas)
+            }
+        }
+    }
     val colors = zcFieldColors()
 
     Column(
@@ -174,6 +207,100 @@ fun OnboardingScreen(
             )
         }
 
+        Spacer(Modifier.height(28.dp))
+        Text(
+            text = "Secure setup (mTLS)",
+            style = MaterialTheme.typography.titleSmall,
+            color = Zc.Text,
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = "Enter the gateway host and a pairing code, or scan the QR from " +
+                "`zeroclaw pair --qr`. The app fetches the gateway CA, shows the SAS, " +
+                "and enrolls its own certificate.",
+            style = MaterialTheme.typography.bodySmall,
+            color = Zc.TextSubtle,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.height(10.dp))
+        OutlinedTextField(
+            value = secureHost,
+            onValueChange = { secureHost = it },
+            label = { Text("Host (DDNS or IP)") },
+            placeholder = { Text("home.example.net") },
+            singleLine = true,
+            colors = colors,
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(10.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            OutlinedTextField(
+                value = mtlsPort,
+                onValueChange = { mtlsPort = it.filter(Char::isDigit) },
+                label = { Text("mTLS port") },
+                singleLine = true,
+                colors = colors,
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.weight(1f),
+            )
+            OutlinedTextField(
+                value = enrollPort,
+                onValueChange = { enrollPort = it.filter(Char::isDigit) },
+                label = { Text("Enroll port") },
+                singleLine = true,
+                colors = colors,
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.weight(1f),
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+        OutlinedTextField(
+            value = secureCode,
+            onValueChange = { secureCode = it },
+            label = { Text("Pairing code") },
+            singleLine = true,
+            colors = colors,
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(10.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            OutlinedButton(
+                onClick = {
+                    scanLauncher.launch(
+                        ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE),
+                    )
+                },
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.weight(1f),
+            ) { Text("Scan QR") }
+            Button(
+                onClick = {
+                    val mtls = mtlsPort.toIntOrNull() ?: 42618
+                    val enroll = enrollPort.toIntOrNull() ?: 42619
+                    onSecureEnroll(secureHost.trim(), mtls, enroll, secureCode.trim(), null)
+                },
+                enabled = !secureEnrolling && secureHost.isNotBlank() && secureCode.isNotBlank(),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Zc.Accent,
+                    contentColor = Color(0xFF00242B),
+                ),
+                modifier = Modifier.weight(1f),
+            ) {
+                if (secureEnrolling) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        strokeWidth = 2.dp,
+                        color = Color(0xFF00242B),
+                    )
+                } else {
+                    Text("Connect securely", style = MaterialTheme.typography.labelLarge)
+                }
+            }
+        }
+
         Spacer(Modifier.height(20.dp))
         Row(horizontalArrangement = Arrangement.Center) {
             Text(
@@ -187,5 +314,36 @@ fun OnboardingScreen(
                 color = Zc.TextMuted,
             )
         }
+    }
+
+    if (secureSas != null) {
+        AlertDialog(
+            onDismissRequest = onCancelSas,
+            title = { Text("Confirm the gateway SAS") },
+            text = {
+                Column {
+                    Text("The gateway shows this value; it must match exactly.")
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        text = secureSas,
+                        style = MaterialTheme.typography.headlineSmall,
+                        color = Zc.Accent,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        text = "If it does not match, cancel: a mismatched SAS means the CA " +
+                            "is not the one the gateway printed.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Zc.TextSubtle,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = onConfirmSas) { Text("Matches", color = Zc.Accent) }
+            },
+            dismissButton = {
+                TextButton(onClick = onCancelSas) { Text("Cancel", color = Zc.Danger) }
+            },
+        )
     }
 }

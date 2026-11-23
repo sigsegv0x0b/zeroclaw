@@ -31,6 +31,8 @@ data class UiState(
     val mtlsGatewayId: String = "",
     val mtlsLoaded: Boolean = false,
     val mtlsStatus: String = "",
+    val secureEnrolling: Boolean = false,
+    val secureSas: String? = null,
     val nodeStatus: NodeStatus = NodeStatus.Stopped,
     val agents: List<AgentEntry> = emptyList(),
     val agent: String = "",
@@ -56,6 +58,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val socket = ChatSocket(viewModelScope)
     private val androidVoice = AndroidVoiceInput(app)
     private val gatewayVoice = GatewayVoiceInput(app)
+    private var pendingProbe: MtlsEnrollment.Probe? = null
+    private var pendingMtlsPort: Int = 42618
 
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui.asStateFlow()
@@ -335,6 +339,104 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val snapshot = _ui.value
             if (snapshot.paired) reconnect(snapshot.gatewayUrl, snapshot.token)
         }
+    }
+
+    // ── Pairing-code mTLS enrollment ───────────────────────────────────────
+
+    fun beginSecureEnroll(
+        host: String,
+        mtlsPort: Int,
+        enrollPort: Int,
+        code: String,
+        expectedSas: String?,
+    ) {
+        viewModelScope.launch {
+            _ui.update { it.copy(secureEnrolling = true, error = null, secureSas = null) }
+            runCatching { MtlsEnrollment.probe(host.trim(), enrollPort, code.trim()) }
+                .onSuccess { probe ->
+                    pendingProbe = probe
+                    pendingMtlsPort = mtlsPort
+                    if (!expectedSas.isNullOrBlank() &&
+                        !expectedSas.equals(probe.sas, ignoreCase = true)
+                    ) {
+                        pendingProbe = null
+                        _ui.update {
+                            it.copy(
+                                secureEnrolling = false,
+                                error = "SAS mismatch: the QR expects $expectedSas but the gateway " +
+                                    "presented ${probe.sas}. Do not continue.",
+                            )
+                        }
+                    } else if (!expectedSas.isNullOrBlank()) {
+                        completeSecureEnroll(probe, mtlsPort)
+                    } else {
+                        _ui.update { it.copy(secureEnrolling = false, secureSas = probe.sas) }
+                    }
+                }
+                .onFailure { error ->
+                    _ui.update {
+                        it.copy(
+                            secureEnrolling = false,
+                            error = "Secure setup failed: ${error.userMessage()}",
+                        )
+                    }
+                }
+        }
+    }
+
+    fun confirmSecureEnroll() {
+        val probe = pendingProbe ?: return
+        viewModelScope.launch { completeSecureEnroll(probe, pendingMtlsPort) }
+    }
+
+    fun cancelSecureEnroll() {
+        pendingProbe = null
+        _ui.update { it.copy(secureEnrolling = false, secureSas = null) }
+    }
+
+    private suspend fun completeSecureEnroll(probe: MtlsEnrollment.Probe, mtlsPort: Int) {
+        _ui.update { it.copy(secureEnrolling = true, error = null, secureSas = null) }
+        val result = runCatching {
+            MtlsEnrollment.enroll(probe, _ui.value.deviceName.ifBlank { "Android" }, mtlsPort)
+        }.getOrElse { error ->
+            _ui.update {
+                it.copy(
+                    secureEnrolling = false,
+                    error = "Enrollment failed: ${error.userMessage()}",
+                )
+            }
+            pendingProbe = null
+            return
+        }
+        pendingProbe = null
+        store.saveMtlsMaterial(
+            ca = result.caPem,
+            cert = result.certPem,
+            key = result.keyPem,
+        )
+        store.saveMtlsGatewayId(result.gatewayId)
+        store.saveMtlsEnabled(true)
+        val baseUrl = "https://${probe.host}:$mtlsPort"
+        store.saveConnection(baseUrl, result.token)
+        val saved = store.current()
+        applyMtlsTransport(saved, reconnect = false)
+        _ui.update {
+            it.copy(
+                gatewayUrl = baseUrl,
+                token = result.token,
+                mtlsEnabled = true,
+                mtlsGatewayId = result.gatewayId,
+                mtlsLoaded = true,
+                mtlsStatus = MtlsTransport.describe(saved),
+                secureEnrolling = false,
+                secureSas = null,
+                settingsOpen = false,
+                error = null,
+                messages = emptyList(),
+            )
+        }
+        NodeService.start(getApplication())
+        loadWorkspace(null)
     }
 
     fun setMtlsEnabled(enabled: Boolean) {

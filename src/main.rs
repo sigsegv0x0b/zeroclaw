@@ -1307,6 +1307,16 @@ Examples:
         gateway_command: Option<zeroclaw::GatewayCommands>,
     },
 
+    /// Show a pairing code and optional QR for the Android app
+    Pair {
+        /// Public host or DDNS name the app should dial (defaults to gateway.host)
+        #[arg(long)]
+        host: Option<String>,
+        /// Print a scannable QR payload for the app
+        #[arg(long)]
+        qr: bool,
+    },
+
     /// Manage the gateway mTLS certificate ledger
     Mtls {
         #[command(subcommand)]
@@ -8258,6 +8268,85 @@ mod wss_client_auth_tests {
 }
 
 #[cfg(feature = "agent-runtime")]
+async fn run_pair_command(config: &Config, host: Option<String>, qr: bool) -> Result<()> {
+    let public_host = host.unwrap_or_else(|| config.gateway.host.clone());
+    let fetched = fetch_paircode(
+        &config.gateway.host,
+        config.gateway.port,
+        config.gateway.path_prefix.as_deref(),
+        &config.data_dir,
+        &PaircodeAction::AddClient,
+    )
+    .await?;
+    let code = match fetched {
+        PaircodeResult::Code { code, .. } => code,
+        PaircodeResult::NoCode { message } => {
+            anyhow::bail!(
+                "{}",
+                message.unwrap_or_else(|| "the gateway did not issue a pairing code".to_string())
+            )
+        }
+    };
+
+    let mtls = config.gateway.mtls.as_ref().filter(|mtls| mtls.enabled);
+    let dir = if let Some(mtls) = mtls {
+        if mtls.dir.trim().is_empty() {
+            config.data_dir.join("gateway-mtls")
+        } else {
+            PathBuf::from(mtls.dir.trim())
+        }
+    } else {
+        config.data_dir.join("gateway-mtls")
+    };
+    let gateway_id = std::fs::read_to_string(dir.join("gateway_id"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let sas = std::fs::read_to_string(dir.join("ca.crt"))
+        .ok()
+        .and_then(|ca| zeroclaw_tls::single_cert_pem_sha256_fingerprint(&ca).ok())
+        .map(|fingerprint| zeroclaw_tls::enrollment_sas(&code, &fingerprint));
+
+    println!("Pairing code: {code}");
+    if let Some(sas) = &sas {
+        println!("SAS:          {sas}   (the app must show the same value)");
+    }
+    if !gateway_id.is_empty() {
+        println!("Gateway ID:   {gateway_id}");
+    }
+    if let Some(mtls) = mtls {
+        println!(
+            "mTLS:         https://{public_host}:{}   enrollment: https://{public_host}:{}",
+            mtls.port, mtls.enroll_port
+        );
+    } else {
+        println!("mTLS:         [gateway.mtls] is not enabled");
+    }
+
+    if qr {
+        let Some(mtls) = mtls else {
+            anyhow::bail!("QR pairing needs [gateway.mtls] enabled");
+        };
+        let payload = serde_json::json!({
+            "v": 1,
+            "host": public_host,
+            "mtls": mtls.port,
+            "enroll": mtls.enroll_port,
+            "gw": gateway_id,
+            "code": code,
+            "sas": sas,
+        });
+        let qr_code = qrcode::QrCode::new(serde_json::to_string(&payload)?)?;
+        let image = qr_code
+            .render::<qrcode::render::unicode::Dense1x2>()
+            .quiet_zone(true)
+            .build();
+        println!("\n{image}");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "agent-runtime")]
 async fn run_mtls_command(config: &Config, command: MtlsCommands) -> Result<()> {
     let dir = if let Some(mtls) = config.gateway.mtls.as_ref() {
         if mtls.dir.trim().is_empty() {
@@ -10502,6 +10591,8 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 anyhow::bail!("ACP server requires the `channel-acp-server` feature")
             }
         }
+
+        Commands::Pair { host, qr } => run_pair_command(&config, host, qr).await,
 
         Commands::Mtls { command } => run_mtls_command(&config, command).await,
 

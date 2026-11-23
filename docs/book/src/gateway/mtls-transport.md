@@ -54,6 +54,37 @@ zeroclaw security issue-client-cert \
 The client keeps `client-phone.key` private and presents `client-phone.crt`
 plus `ca.crt`.
 
+## One-screen enrollment in the Android app
+
+With `enroll = true`, the app can bootstrap itself from one pairing code:
+
+1. On the gateway: `zeroclaw pair --host <public-host-or-ddns> --qr`.
+   It prints the pairing code and SAS, the gateway id, the mTLS/enrollment
+   URLs, and a scannable QR payload.
+2. In the app's **Secure setup (mTLS)** section, scan the QR (or enter the
+   host and pairing code).
+3. The app fetches `/enroll/ca` over provisional TLS, computes the SAS, and
+   shows it. Confirm it matches the gateway (the QR carries the expected SAS,
+   so a scan is checked automatically).
+4. The app generates a P-256 key and CSR locally and posts them with the
+   pairing code. The gateway returns the signed client certificate, CA chain,
+   gateway id, and a bearer token, and the app connects over mTLS.
+
+The pairing code is single use. Enrollment and the bearer token come from the
+same exchange, so there is no second code to enter.
+
+## Managing issued certificates
+
+```sh
+zeroclaw mtls list
+zeroclaw mtls delete --device dev-1a2b3c4d
+zeroclaw mtls delete --fingerprint <sha256>
+```
+
+`mtls list` reads the issued-certificate ledger. `mtls delete` revokes the
+certificate in the running gateway, cancels its live connections, and appends
+it to the on-disk CRL so a restart keeps it revoked.
+
 ## Validating with the Node client
 
 `tests/manual/mtls-smoke.mjs` checks the handshake, the URI identity, the mandatory
