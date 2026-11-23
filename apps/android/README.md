@@ -84,9 +84,11 @@ SDK first, then the libraries.
    `wss://` for anything that is not a trusted local network: the app's chat
    frames carry a bearer token.
 
-The app allows cleartext `ws://` so first-run LAN pairing works. That is the
-same trade-off the dashboard makes on `localhost`; do not rely on it over the
-public internet.
+Cleartext `http://`/`ws://` stays available so first-run LAN pairing works.
+Before the app opens a cleartext connection it shows a one-time warning for
+that origin; the operator chooses **Connect anyway** or **Cancel**, and an
+acceptance is remembered for that host and port. Use `https://` or Secure setup
+(mTLS) for anything outside a trusted network.
 
 ## Identity-based mTLS transport
 
@@ -374,5 +376,5 @@ OpenClaw source is vendored; the tokens were re-expressed here.
 - A dropped socket does not replay an in-flight turn (same as the dashboard).
 - Conversation rename/delete/archive are gateway endpoints the app does not
   expose yet.
-- `ws://` is allowed app-wide; a per-host cleartext allowlist is the next
-  hardening step.
+- Cleartext is accepted per origin after a one-time in-app warning; the
+  Android network-security-config allowlist is still app-wide.

@@ -1,6 +1,7 @@
 package ai.zeroclaw.app.data
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -23,6 +24,22 @@ class ProtocolTest {
     fun `derives websocket url from rest base`() {
         assertEquals("ws://127.0.0.1:42617", webSocketUrl("http://127.0.0.1:42617"))
         assertEquals("wss://gw.example.com", webSocketUrl("https://gw.example.com"))
+    }
+
+    @Test
+    fun `flags only plain http as insecure`() {
+        assertTrue(isInsecureHttp("http://10.0.2.2:42617"))
+        assertTrue(isInsecureHttp("HTTP://gateway.local:42617"))
+        assertFalse(isInsecureHttp("https://gateway.example"))
+        assertFalse(isInsecureHttp("wss://gateway.example"))
+    }
+
+    @Test
+    fun `origin keeps the port and drops user info and paths`() {
+        assertEquals("http://10.0.2.2:42617", httpOrigin("http://10.0.2.2:42617/api"))
+        assertEquals("http://gateway.local:80", httpOrigin("http://Gateway.Local"))
+        assertEquals("http://gateway.local:42617", httpOrigin("http://user:pass@gateway.local:42617"))
+        assertEquals("http://[::1]:42617", httpOrigin("http://[::1]:42617"))
     }
 
     @Test

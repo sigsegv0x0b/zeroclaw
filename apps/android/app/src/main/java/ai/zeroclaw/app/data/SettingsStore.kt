@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -33,6 +34,8 @@ data class StoredSettings(
     val mtlsClientKeyPem: String = "",
     val mtlsIssuedAt: Long = 0,
     val mtlsNotAfter: Long = 0,
+    /** Cleartext origins the operator explicitly accepted after a warning. */
+    val insecureHttpOrigins: Set<String> = emptySet(),
 )
 
 /**
@@ -60,6 +63,7 @@ class SettingsStore(private val context: Context) {
         val mtlsClientKeyPem = stringPreferencesKey("mtls_client_key_pem")
         val mtlsIssuedAt = longPreferencesKey("mtls_issued_at")
         val mtlsNotAfter = longPreferencesKey("mtls_not_after")
+        val insecureHttpOrigins = stringSetPreferencesKey("insecure_http_origins")
     }
 
     val settings: Flow<StoredSettings> = context.settingsDataStore.data.map { prefs ->
@@ -83,6 +87,7 @@ class SettingsStore(private val context: Context) {
             // Early builds stored the server's epoch seconds here. Normalize
             // on read so renewal deadlines and the expiry label use millis.
             mtlsNotAfter = normalizeEpochMillis(prefs[Keys.mtlsNotAfter] ?: 0L),
+            insecureHttpOrigins = prefs[Keys.insecureHttpOrigins] ?: emptySet(),
         )
     }
 
@@ -90,6 +95,16 @@ class SettingsStore(private val context: Context) {
 
     private fun normalizeEpochMillis(value: Long): Long =
         if (value in 1 until 1_000_000_000_000L) value * 1000L else value
+
+    suspend fun isInsecureOriginAllowed(origin: String): Boolean =
+        settings.first().insecureHttpOrigins.contains(origin.lowercase())
+
+    suspend fun allowInsecureOrigin(origin: String) {
+        context.settingsDataStore.edit { prefs ->
+            prefs[Keys.insecureHttpOrigins] =
+                (prefs[Keys.insecureHttpOrigins] ?: emptySet()) + origin.lowercase()
+        }
+    }
 
     suspend fun saveConnection(gatewayUrl: String, token: String) {
         context.settingsDataStore.edit { prefs ->
