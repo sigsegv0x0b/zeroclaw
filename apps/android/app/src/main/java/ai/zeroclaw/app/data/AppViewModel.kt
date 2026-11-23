@@ -45,11 +45,34 @@ data class UiState(
     val approval: ApprovalPrompt? = null,
     val error: String? = null,
     val notice: String? = null,
+    val insecurePrompt: InsecureConnectionPrompt? = null,
     val settingsOpen: Boolean = false,
     val drawerOpen: Boolean = false,
 ) {
     val paired: Boolean get() = gatewayUrl.isNotBlank() && token.isNotBlank()
     val connected: Boolean get() = socket is SocketState.Open
+}
+
+/** Shown once per cleartext origin before the app sends a token over HTTP. */
+data class InsecureConnectionPrompt(val origin: String)
+
+private sealed interface PendingConnection {
+    val base: String
+
+    data class Pair(
+        override val base: String,
+        val code: String,
+        val deviceName: String,
+    ) : PendingConnection
+
+    data class Reconnect(
+        override val base: String,
+        val token: String,
+    ) : PendingConnection
+
+    data class Startup(val settings: StoredSettings) : PendingConnection {
+        override val base: String get() = settings.gatewayUrl
+    }
 }
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
@@ -61,6 +84,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val gatewayVoice = GatewayVoiceInput(app)
     private var pendingProbe: MtlsEnrollment.Probe? = null
     private var pendingMtlsPort: Int = 42618
+    private var pendingInsecure: PendingConnection? = null
     private var appliedClientCertPem: String = ""
 
     private val _ui = MutableStateFlow(UiState())
@@ -152,15 +176,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     booting = false,
                 )
             }
-            // Apply first so a renewal below replaces the client that was
-            // just installed instead of the stale pre-renewal material.
-            applyMtlsTransport(saved)
-            maybeRenewBeforeConnect()
-            CertificateRenewalScheduler.schedule(getApplication())
-            if (saved.nodeEnabled) {
-                NodeService.start(getApplication())
-            }
-            loadWorkspace(saved.lastSessionId.ifBlank { null })
+            val startup = PendingConnection.Startup(saved)
+            if (!confirmCleartext(startup)) return@launch
+            performStartup(saved)
         }
     }
 
@@ -230,33 +248,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _ui.update { it.copy(error = "Enter the pairing code printed by the gateway.") }
             return
         }
-        _ui.update { it.copy(booting = true, error = null) }
-        viewModelScope.launch {
-            val token = runCatching {
-                if (!gateway.health(base)) throw GatewayException(0, "No gateway answered at $base.")
-                gateway.pair(base, code, deviceName)
-            }.getOrElse { error ->
-                _ui.update { it.copy(booting = false, error = error.userMessage()) }
-                return@launch
-            }
-            store.saveConnection(base, token)
-            store.saveDeviceName(deviceName)
-            val nodeId = runCatching { store.ensureDeviceId() }.getOrDefault("")
-            if (_ui.value.nodeEnabled && nodeId.isNotBlank()) {
-                NodeService.start(getApplication())
-            }
-            _ui.update {
-                it.copy(
-                    booting = false,
-                    gatewayUrl = base,
-                    token = token,
-                    deviceName = deviceName,
-                    deviceId = nodeId,
-                    error = null,
-                )
-            }
-            loadWorkspace(null)
-        }
+        requestConnection(PendingConnection.Pair(base, code, deviceName))
     }
 
     /** Settings can replace the token or address without re-pairing. */
@@ -267,26 +259,119 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _ui.update { it.copy(error = "Address and token are both required.") }
             return
         }
+        requestConnection(PendingConnection.Reconnect(base, trimmed))
+    }
+
+    /**
+     * Cleartext carries the bearer token and chat frames without encryption.
+     * Ask once per origin, then remember the decision; HTTPS never prompts.
+     */
+    private suspend fun confirmCleartext(request: PendingConnection): Boolean {
+        if (!isInsecureHttp(request.base)) return true
+        val origin = httpOrigin(request.base)
+        if (store.isInsecureOriginAllowed(origin)) return true
+        pendingInsecure = request
+        _ui.update { it.copy(insecurePrompt = InsecureConnectionPrompt(origin)) }
+        return false
+    }
+
+    fun acceptInsecureConnection() {
+        val request = pendingInsecure ?: return
         viewModelScope.launch {
-            maybeRenewBeforeConnect()
-            store.saveConnection(base, trimmed)
-            socket.close()
-            val nodeId = runCatching { store.ensureDeviceId() }.getOrDefault("")
-            if (_ui.value.nodeEnabled && nodeId.isNotBlank()) {
-                NodeService.start(getApplication())
-            }
-            _ui.update {
-                it.copy(
-                    gatewayUrl = base,
-                    token = trimmed,
-                    deviceId = nodeId,
-                    settingsOpen = false,
-                    messages = emptyList(),
-                    error = null,
-                )
-            }
-            loadWorkspace(null)
+            store.allowInsecureOrigin(httpOrigin(request.base))
+            pendingInsecure = null
+            _ui.update { it.copy(insecurePrompt = null) }
+            perform(request)
         }
+    }
+
+    fun rejectInsecureConnection() {
+        pendingInsecure = null
+        _ui.update {
+            it.copy(
+                insecurePrompt = null,
+                error = "Connection cancelled. Use https:// or Secure setup (mTLS) " +
+                    "to protect this phone.",
+            )
+        }
+    }
+
+    private fun requestConnection(request: PendingConnection) {
+        viewModelScope.launch {
+            if (!confirmCleartext(request)) return@launch
+            perform(request)
+        }
+    }
+
+    private suspend fun perform(request: PendingConnection) {
+        when (request) {
+            is PendingConnection.Pair -> performPair(request)
+            is PendingConnection.Reconnect -> performReconnect(request)
+            is PendingConnection.Startup -> performStartup(request.settings)
+        }
+    }
+
+    private suspend fun performPair(request: PendingConnection.Pair) {
+        _ui.update { it.copy(booting = true, error = null) }
+        val token = runCatching {
+            if (!gateway.health(request.base)) {
+                throw GatewayException(0, "No gateway answered at ${request.base}.")
+            }
+            gateway.pair(request.base, request.code, request.deviceName)
+        }.getOrElse { error ->
+            _ui.update { it.copy(booting = false, error = error.userMessage()) }
+            return
+        }
+        store.saveConnection(request.base, token)
+        store.saveDeviceName(request.deviceName)
+        val nodeId = runCatching { store.ensureDeviceId() }.getOrDefault("")
+        if (_ui.value.nodeEnabled && nodeId.isNotBlank()) {
+            NodeService.start(getApplication())
+        }
+        _ui.update {
+            it.copy(
+                booting = false,
+                gatewayUrl = request.base,
+                token = token,
+                deviceName = request.deviceName,
+                deviceId = nodeId,
+                error = null,
+            )
+        }
+        loadWorkspace(null)
+    }
+
+    private suspend fun performReconnect(request: PendingConnection.Reconnect) {
+        maybeRenewBeforeConnect()
+        store.saveConnection(request.base, request.token)
+        socket.close()
+        val nodeId = runCatching { store.ensureDeviceId() }.getOrDefault("")
+        if (_ui.value.nodeEnabled && nodeId.isNotBlank()) {
+            NodeService.start(getApplication())
+        }
+        _ui.update {
+            it.copy(
+                gatewayUrl = request.base,
+                token = request.token,
+                deviceId = nodeId,
+                settingsOpen = false,
+                messages = emptyList(),
+                error = null,
+            )
+        }
+        loadWorkspace(null)
+    }
+
+    private suspend fun performStartup(saved: StoredSettings) {
+        // Apply first so a renewal below replaces the client that was just
+        // installed instead of the stale pre-renewal material.
+        applyMtlsTransport(saved)
+        maybeRenewBeforeConnect()
+        CertificateRenewalScheduler.schedule(getApplication())
+        if (saved.nodeEnabled) {
+            NodeService.start(getApplication())
+        }
+        loadWorkspace(saved.lastSessionId.ifBlank { null })
     }
 
     fun forgetGateway() {

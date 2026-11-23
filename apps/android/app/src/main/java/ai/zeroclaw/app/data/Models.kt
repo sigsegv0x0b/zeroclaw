@@ -151,3 +151,21 @@ fun webSocketUrl(baseUrl: String): String = when {
     baseUrl.startsWith("http://", ignoreCase = true) -> "ws://" + baseUrl.substring(7)
     else -> "ws://$baseUrl"
 }
+
+/** True when the transport carries the token and chat frames in clear text. */
+fun isInsecureHttp(baseUrl: String): Boolean =
+    baseUrl.startsWith("http://", ignoreCase = true)
+
+/**
+ * Stable key for remembering one accepted cleartext gateway. The port is part
+ * of the origin, so accepting HTTP for a development port does not silently
+ * allow a different listener or host.
+ */
+fun httpOrigin(baseUrl: String): String {
+    val uri = runCatching { java.net.URI(baseUrl.trim()) }.getOrNull()
+        ?: return baseUrl.trimEnd('/').lowercase()
+    val host = uri.host ?: return baseUrl.trimEnd('/').lowercase()
+    val port = if (uri.port > 0) uri.port else 80
+    val hostPart = if (host.contains(":") && !host.startsWith("[")) "[$host]" else host
+    return "http://${hostPart.lowercase()}:$port"
+}
