@@ -185,6 +185,30 @@ pub struct GatewayMaterials {
     pub server_key_path: PathBuf,
 }
 
+/// Whether the server leaf at `path` carries `uri` as a URI SAN.
+fn server_leaf_has_uri(path: &Path, uri: &str) -> Result<bool> {
+    use x509_parser::prelude::*;
+    let pem = std::fs::read_to_string(path)
+        .with_context(|| format!("reading server certificate {}", path.display()))?;
+    let der = crate::load_certs_from_pem(&pem)?;
+    let leaf = der.first().ok_or_else(|| {
+        anyhow::Error::msg(format!("server certificate {} is empty", path.display()))
+    })?;
+    let (_, cert) =
+        X509Certificate::from_der(leaf.as_ref()).context("parsing server certificate DER")?;
+    let Some(ext) = cert
+        .subject_alternative_name()
+        .context("reading SAN extension")?
+    else {
+        return Ok(false);
+    };
+    Ok(ext
+        .value
+        .general_names
+        .iter()
+        .any(|name| matches!(name, GeneralName::URI(value) if *value == uri)))
+}
+
 /// Ensure the gateway mTLS CA and identity server certificate exist under `dir`.
 ///
 /// The CA is never silently rotated; the server leaf is regenerated only when
@@ -225,12 +249,15 @@ pub fn ensure_gateway_materials(dir: &Path) -> Result<GatewayMaterials> {
         );
     }
 
-    let id_marker = dir.join("server.gateway_id");
-    let id_changed = std::fs::read_to_string(&id_marker)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .as_deref()
-        != Some(gateway_id.as_str());
+    let expected_uri = format!("spiffe://zeroclaw/gateway/{gateway_id}");
+    // The leaf certificate itself records the identity; no second copy on disk.
+    let id_changed = if materials.server_cert_path.exists() {
+        !server_leaf_has_uri(&materials.server_cert_path, &expected_uri)?
+    } else {
+        true
+    };
+    // Older builds wrote a marker file; remove it so the identity has one source.
+    let _ = std::fs::remove_file(dir.join("server.gateway_id"));
     let all_present = materials.ca_cert_path.exists()
         && materials.ca_key_path.exists()
         && materials.server_cert_path.exists()
@@ -281,8 +308,6 @@ pub fn ensure_gateway_materials(dir: &Path) -> Result<GatewayMaterials> {
         .context("signing gateway server certificate")?;
     write_public_pem(&materials.server_cert_path, &cert.pem())?;
     write_private_pem(&materials.server_key_path, &server_key.serialize_pem())?;
-    std::fs::write(&id_marker, format!("{gateway_id}\n"))
-        .with_context(|| format!("writing {}", id_marker.display()))?;
 
     Ok(GatewayMaterials {
         gateway_id,
