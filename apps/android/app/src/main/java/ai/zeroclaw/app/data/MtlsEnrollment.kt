@@ -121,7 +121,7 @@ object MtlsEnrollment {
             gatewayId = json.getString("gateway_id"),
             deviceId = json.getString("device_id"),
             token = json.getString("token"),
-            notAfter = json.optLong("not_after", 0L),
+            notAfter = notAfterMillis(json.optLong("not_after", 0L)),
         )
     }
 
@@ -170,9 +170,14 @@ object MtlsEnrollment {
             gatewayId = json.getString("gateway_id"),
             deviceId = json.getString("device_id"),
             token = settings.token,
-            notAfter = json.optLong("not_after", 0L),
+            notAfter = notAfterMillis(json.optLong("not_after", 0L)),
         )
     }
+
+    /** The wire format and the certificate use epoch seconds; app state uses
+     *  epoch milliseconds so it can be compared with `currentTimeMillis`. */
+    internal fun notAfterMillis(epochSeconds: Long): Long =
+        if (epochSeconds > 0) epochSeconds * 1000L else 0L
 
     /** Must match `zeroclaw_tls::enrollment_sas` exactly. */
     internal fun sas(code: String, caPem: String): String {

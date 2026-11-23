@@ -5,17 +5,19 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import ai.zeroclaw.app.MainActivity
 import ai.zeroclaw.app.R
 import ai.zeroclaw.app.data.DeviceCapabilities
+import ai.zeroclaw.app.data.MtlsTransport
 import ai.zeroclaw.app.data.NodeClient
 import ai.zeroclaw.app.data.NodeRuntime
-import ai.zeroclaw.app.data.MtlsTransport
 import ai.zeroclaw.app.data.NodeStatus
 import ai.zeroclaw.app.data.SettingsStore
 import kotlinx.coroutines.CoroutineScope
@@ -37,9 +39,21 @@ class NodeService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var client: NodeClient? = null
 
+    private val certificateRenewed = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == ACTION_CERTIFICATE_RENEWED) connect()
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         createChannel()
+        ContextCompat.registerReceiver(
+            this,
+            certificateRenewed,
+            IntentFilter(ACTION_CERTIFICATE_RENEWED),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -133,6 +147,7 @@ class NodeService : Service() {
     }
 
     override fun onDestroy() {
+        runCatching { unregisterReceiver(certificateRenewed) }
         client?.stop()
         client = null
         NodeRuntime.set(NodeStatus.Stopped)
@@ -143,6 +158,7 @@ class NodeService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     companion object {
+        private const val ACTION_CERTIFICATE_RENEWED = "ai.zeroclaw.app.mtls.CERTIFICATE_RENEWED"
         private const val CHANNEL_ID = "zeroclaw_node"
         private const val NOTIFICATION_ID = 4102
         private const val ACTION_START = "ai.zeroclaw.app.node.START"
@@ -156,6 +172,18 @@ class NodeService : Service() {
         fun stop(context: Context) {
             runCatching { context.stopService(Intent(context, NodeService::class.java)) }
             NodeRuntime.set(NodeStatus.Stopped)
+        }
+
+        /**
+         * Ask a running link to rebuild its TLS client after the certificate
+         * was rotated. The explicit package keeps the broadcast inside the
+         * app; if the service is not running the next start reads the new
+         * material from settings.
+         */
+        fun notifyCertificateRenewed(context: Context) {
+            context.sendBroadcast(
+                Intent(ACTION_CERTIFICATE_RENEWED).setPackage(context.packageName),
+            )
         }
     }
 }
