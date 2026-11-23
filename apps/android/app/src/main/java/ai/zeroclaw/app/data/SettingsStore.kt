@@ -80,11 +80,16 @@ class SettingsStore(private val context: Context) {
             mtlsClientCertPem = prefs[Keys.mtlsClientCertPem].orEmpty(),
             mtlsClientKeyPem = prefs[Keys.mtlsClientKeyPem].orEmpty(),
             mtlsIssuedAt = prefs[Keys.mtlsIssuedAt] ?: 0L,
-            mtlsNotAfter = prefs[Keys.mtlsNotAfter] ?: 0L,
+            // Early builds stored the server's epoch seconds here. Normalize
+            // on read so renewal deadlines and the expiry label use millis.
+            mtlsNotAfter = normalizeEpochMillis(prefs[Keys.mtlsNotAfter] ?: 0L),
         )
     }
 
     suspend fun current(): StoredSettings = settings.first()
+
+    private fun normalizeEpochMillis(value: Long): Long =
+        if (value in 1 until 1_000_000_000_000L) value * 1000L else value
 
     suspend fun saveConnection(gatewayUrl: String, token: String) {
         context.settingsDataStore.edit { prefs ->

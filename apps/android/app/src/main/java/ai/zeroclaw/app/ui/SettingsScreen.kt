@@ -309,7 +309,7 @@ fun SettingsScreen(
             if (state.mtlsEnabled) {
                 val expiry = if (state.mtlsNotAfter > 0) {
                     java.time.format.DateTimeFormatter.ISO_LOCAL_DATE_TIME.format(
-                        java.time.Instant.ofEpochSecond(state.mtlsNotAfter)
+                        java.time.Instant.ofEpochMilli(state.mtlsNotAfter)
                             .atZone(java.time.ZoneId.systemDefault()),
                     )
                 } else {

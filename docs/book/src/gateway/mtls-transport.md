@@ -73,6 +73,21 @@ With `enroll = true`, the app can bootstrap itself from one pairing code:
 The pairing code is single use. Enrollment and the bearer token come from the
 same exchange, so there is no second code to enter.
 
+## Renewal
+
+Client certificates live for 30 days. The app renews at half the lifetime over
+the still-valid connection: it sends a fresh CSR to `POST /api/mtls/renew` with
+the current client certificate and bearer token. The gateway signs the new
+leaf, revokes the old one, rotates its own server leaf key, and returns the new
+CA chain and certificate. The CA and gateway identity stay the same, so peers
+do not need to re-pair.
+
+Renewal is not a periodic poll. A single deferred WorkManager job is armed for
+the midpoint (batched with other background work and surviving reboots); if the
+app is open at or after the midpoint, it renews before connecting instead.
+**Settings → Transport → Renew certificate** triggers it manually. The stored
+certificate and expiry are shown in the same section.
+
 ## Managing issued certificates
 
 ```sh

@@ -10,10 +10,14 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
+import ai.zeroclaw.app.data.AppViewModel
 import ai.zeroclaw.app.ui.ZeroClawRoot
 import ai.zeroclaw.app.ui.theme.ZeroClawTheme
 
 class MainActivity : ComponentActivity() {
+
+    private val viewModel: AppViewModel by viewModels()
 
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
@@ -34,8 +38,13 @@ class MainActivity : ComponentActivity() {
         }
         setContent {
             ZeroClawTheme(darkTheme = true) {
-                ZeroClawRoot()
+                ZeroClawRoot(viewModel)
             }
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        viewModel.onForeground()
     }
 }

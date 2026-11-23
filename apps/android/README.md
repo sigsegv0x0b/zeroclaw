@@ -104,9 +104,14 @@ and bearer token from the gateway, and connects over mTLS. No certificates are
 copied by hand.
 
 The pairing code is single use; after enrollment the app stores the CA, client
-certificate, key, gateway id and token in app-private storage. Certificate
-lifecycle is managed on the gateway with `zeroclaw mtls list` and
-`zeroclaw mtls delete`, which revokes a device and drops its live connections.
+certificate, key, gateway id and token in app-private storage. The client
+certificate is valid for 30 days and is renewed at half its lifetime: a single
+deferred WorkManager job (not an hourly poll) is armed for the midpoint, and the
+foreground app also renews before connecting when the midpoint has passed. The
+gateway revokes the old leaf and rotates both keys on success. Use **Settings →
+Transport → Renew certificate** to renew immediately, or `zeroclaw mtls list`
+and `zeroclaw mtls delete` to inspect or revoke a device; revocation drops its
+live connections.
 
 For a manual fallback, issue a certificate with
 `zeroclaw security issue-client-cert --ca-dir <data_dir>/gateway-mtls` and
