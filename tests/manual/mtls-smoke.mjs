@@ -10,7 +10,7 @@
 //     over mTLS.
 //
 // Usage:
-//   node scripts/mtls-smoke.mjs \
+//   node tests/manual/mtls-smoke.mjs \
 //     --host home.example.net --port 42618 \
 //     --ca ca.crt --cert client-phone.crt --key client-phone.key \
 //     --gateway-id gw_1a2b3c4d5e6f7788 \

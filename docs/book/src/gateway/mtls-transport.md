@@ -56,11 +56,11 @@ plus `ca.crt`.
 
 ## Validating with the Node client
 
-`scripts/mtls-smoke.mjs` checks the handshake, the URI identity, the mandatory
+`tests/manual/mtls-smoke.mjs` checks the handshake, the URI identity, the mandatory
 client certificate, and (optionally) pairing plus an authenticated API call:
 
 ```sh
-node scripts/mtls-smoke.mjs \
+node tests/manual/mtls-smoke.mjs \
   --host home.example.net --port 42618 \
   --ca /tmp/phone-mtls/ca.crt \
   --cert /tmp/phone-mtls/client-phone.crt \
