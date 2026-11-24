@@ -1,24 +1,32 @@
 package ai.zeroclaw.app.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import ai.zeroclaw.app.ui.theme.MonoFamily
 import ai.zeroclaw.app.ui.theme.Zc
@@ -30,8 +38,57 @@ sealed interface MdBlock {
     data class Bullets(val items: List<String>) : MdBlock
     data class Numbers(val items: List<String>) : MdBlock
     data class Quote(val text: String) : MdBlock
+    data class Table(
+        val headers: List<String>,
+        val alignments: List<MdTableAlign>,
+        val rows: List<List<String>>,
+    ) : MdBlock
     data class Code(val language: String, val code: String) : MdBlock
     data object Rule : MdBlock
+}
+
+enum class MdTableAlign { Left, Center, Right }
+
+private val TableSeparator = Regex(
+    """^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$""",
+)
+
+private fun splitTableRow(line: String): List<String> {
+    var text = line.trim()
+    if (text.startsWith("|")) text = text.substring(1)
+    if (text.endsWith("|") && !text.endsWith("\\|")) text = text.dropLast(1)
+    val cells = mutableListOf<String>()
+    val cell = StringBuilder()
+    var index = 0
+    while (index < text.length) {
+        val char = text[index]
+        when {
+            char == '\\' && index + 1 < text.length && text[index + 1] == '|' -> {
+                cell.append('|')
+                index += 2
+            }
+            char == '|' -> {
+                cells += cell.toString().trim()
+                cell.clear()
+                index += 1
+            }
+            else -> {
+                cell.append(char)
+                index += 1
+            }
+        }
+    }
+    cells += cell.toString().trim()
+    return cells
+}
+
+private fun tableAlignment(cell: String): MdTableAlign {
+    val value = cell.trim()
+    return when {
+        value.startsWith(":") && value.endsWith(":") -> MdTableAlign.Center
+        value.endsWith(":") -> MdTableAlign.Right
+        else -> MdTableAlign.Left
+    }
 }
 
 fun parseMarkdown(source: String): List<MdBlock> {
@@ -76,6 +133,28 @@ fun parseMarkdown(source: String): List<MdBlock> {
                     index += 1
                 }
                 blocks += MdBlock.Code(language, code.toString().trimEnd())
+            }
+
+            line.contains('|') &&
+                index + 1 < lines.size &&
+                TableSeparator.matches(lines[index + 1].trim()) -> {
+                flushAll()
+                val headers = splitTableRow(line)
+                val separator = splitTableRow(lines[index + 1])
+                val alignments = headers.indices.map { column ->
+                    tableAlignment(separator.getOrNull(column).orEmpty())
+                }
+                val rows = mutableListOf<List<String>>()
+                var next = index + 2
+                while (next < lines.size) {
+                    val row = lines[next]
+                    if (row.isBlank() || !row.contains('|')) break
+                    val cells = splitTableRow(row)
+                    rows += headers.indices.map { column -> cells.getOrNull(column).orEmpty() }
+                    next += 1
+                }
+                blocks += MdBlock.Table(headers, alignments, rows)
+                index = next - 1
             }
 
             line.startsWith("#") -> {
@@ -128,11 +207,80 @@ fun parseMarkdown(source: String): List<MdBlock> {
     return blocks
 }
 
+/** Flatten parsed Markdown into readable clipboard/share text. */
+fun plainTextForClipboard(source: String): String {
+    val parts = mutableListOf<String>()
+    parseMarkdown(source).forEach { block ->
+        when (block) {
+            is MdBlock.Paragraph -> parts += inlineMarkdown(block.text).text
+            is MdBlock.Heading -> parts += inlineMarkdown(block.text).text
+            is MdBlock.Bullets -> parts += block.items.joinToString("\n") {
+                "• ${inlineMarkdown(it).text}"
+            }
+            is MdBlock.Numbers -> parts += block.items.mapIndexed { index, item ->
+                "${index + 1}. ${inlineMarkdown(item).text}"
+            }.joinToString("\n")
+            is MdBlock.Quote -> parts += inlineMarkdown(block.text).text
+            is MdBlock.Code -> parts += block.code
+            is MdBlock.Table -> {
+                val lines = mutableListOf(
+                    block.headers.joinToString(" | ") { inlineMarkdown(it).text },
+                )
+                block.rows.forEach { row ->
+                    lines += row.joinToString(" | ") { inlineMarkdown(it).text }
+                }
+                parts += lines.joinToString("\n")
+            }
+            MdBlock.Rule -> Unit
+        }
+    }
+    return parts.filter { it.isNotBlank() }.joinToString("\n\n").trim()
+}
+
+/** Flatten parsed Markdown into readable speech without syntax markers. */
+fun plainTextForSpeech(source: String): String {
+    val parts = mutableListOf<String>()
+    parseMarkdown(source).forEach { block ->
+        when (block) {
+            is MdBlock.Paragraph -> parts += inlineMarkdown(block.text).text
+            is MdBlock.Heading -> parts += inlineMarkdown(block.text).text
+            is MdBlock.Bullets -> block.items.forEach { parts += inlineMarkdown(it).text }
+            is MdBlock.Numbers -> block.items.forEach { parts += inlineMarkdown(it).text }
+            is MdBlock.Quote -> parts += inlineMarkdown(block.text).text
+            is MdBlock.Code -> parts += block.code
+            is MdBlock.Table -> block.rows.forEach { row ->
+                val pairs = row.mapIndexedNotNull { index, cell ->
+                    val value = inlineMarkdown(cell).text
+                    if (value.isBlank()) {
+                        null
+                    } else {
+                        val header = block.headers.getOrNull(index).orEmpty()
+                        if (header.isBlank()) value else "$header: $value"
+                    }
+                }
+                if (pairs.isNotEmpty()) parts += pairs.joinToString(", ")
+            }
+            MdBlock.Rule -> Unit
+        }
+    }
+    return parts
+        .filter { it.isNotBlank() }
+        .joinToString(". ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+}
+
 @Composable
 fun MarkdownBlocks(blocks: List<MdBlock>, modifier: Modifier = Modifier) {
     Column(modifier = modifier) {
         blocks.forEachIndexed { position, block ->
-            if (position > 0) Spacer(Modifier.height(if (block is MdBlock.Code) 10.dp else 6.dp))
+            if (position > 0) {
+                Spacer(
+                    Modifier.height(
+                        if (block is MdBlock.Code || block is MdBlock.Table) 10.dp else 6.dp,
+                    ),
+                )
+            }
             when (block) {
                 is MdBlock.Paragraph -> Text(
                     text = inlineMarkdown(block.text),
@@ -152,13 +300,13 @@ fun MarkdownBlocks(blocks: List<MdBlock>, modifier: Modifier = Modifier) {
 
                 is MdBlock.Bullets -> Column {
                     block.items.forEach { item ->
-                        Row(item = "•", text = item)
+                        ListRow(item = "•", text = item)
                     }
                 }
 
                 is MdBlock.Numbers -> Column {
                     block.items.forEachIndexed { number, item ->
-                        Row(item = "${number + 1}.", text = item)
+                        ListRow(item = "${number + 1}.", text = item)
                     }
                 }
 
@@ -175,6 +323,8 @@ fun MarkdownBlocks(blocks: List<MdBlock>, modifier: Modifier = Modifier) {
                     )
                 }
 
+                is MdBlock.Table -> TableBlock(block)
+
                 is MdBlock.Code -> CodeBlock(block.language, block.code)
 
                 MdBlock.Rule -> Spacer(
@@ -189,8 +339,8 @@ fun MarkdownBlocks(blocks: List<MdBlock>, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun Row(item: String, text: String) {
-    androidx.compose.foundation.layout.Row(Modifier.fillMaxWidth()) {
+private fun ListRow(item: String, text: String) {
+    Row(Modifier.fillMaxWidth()) {
         Text(
             text = item,
             style = MaterialTheme.typography.bodyLarge,
@@ -202,6 +352,106 @@ private fun Row(item: String, text: String) {
             style = MaterialTheme.typography.bodyLarge,
             color = Zc.Text,
         )
+    }
+}
+
+@Composable
+private fun TableBlock(table: MdBlock.Table) {
+    if (table.headers.isEmpty()) return
+    val minCellWidth = 72.dp
+    val maxCellWidth = 220.dp
+    val widths = table.headers.indices.map { column ->
+        val longest = (sequenceOf(table.headers.getOrNull(column).orEmpty()) +
+            table.rows.asSequence().map { it.getOrNull(column).orEmpty() })
+            .maxOfOrNull { it.length } ?: 0
+        (longest * 7).dp.coerceIn(minCellWidth, maxCellWidth)
+    }
+    val totalWidth = widths.fold(0.dp) { total, width -> total + width }
+
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val scroll = totalWidth > maxWidth
+        val fill = !scroll
+        Column(
+            Modifier
+                .then(
+                    if (scroll) {
+                        Modifier.horizontalScroll(rememberScrollState())
+                    } else {
+                        Modifier.fillMaxWidth()
+                    },
+                )
+                .clip(RoundedCornerShape(10.dp))
+                .background(Zc.SurfaceRaised)
+                .border(1.dp, Zc.Border, RoundedCornerShape(10.dp)),
+        ) {
+            TableRow(
+                cells = table.headers,
+                widths = widths,
+                header = true,
+                alignments = table.alignments,
+                fill = fill,
+                totalWidth = totalWidth,
+            )
+            table.rows.forEachIndexed { index, row ->
+                if (index > 0) TableDivider(fill, totalWidth)
+                TableRow(
+                    cells = row,
+                    widths = widths,
+                    header = false,
+                    alignments = table.alignments,
+                    fill = fill,
+                    totalWidth = totalWidth,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TableDivider(fill: Boolean, totalWidth: Dp) {
+    Box(
+        Modifier
+            .then(if (fill) Modifier.fillMaxWidth() else Modifier.width(totalWidth))
+            .height(1.dp)
+            .background(Zc.Border),
+    )
+}
+
+@Composable
+private fun TableRow(
+    cells: List<String>,
+    widths: List<Dp>,
+    header: Boolean,
+    alignments: List<MdTableAlign>,
+    fill: Boolean,
+    totalWidth: Dp,
+) {
+    Row(
+        Modifier
+            .then(if (fill) Modifier.fillMaxWidth() else Modifier.width(totalWidth))
+            .then(if (header) Modifier.background(Zc.SurfacePressed) else Modifier),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        widths.forEachIndexed { column, width ->
+            Box(
+                Modifier
+                    .then(if (fill) Modifier.weight(width.value) else Modifier.width(width))
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                contentAlignment = when (alignments.getOrNull(column) ?: MdTableAlign.Left) {
+                    MdTableAlign.Left -> Alignment.CenterStart
+                    MdTableAlign.Center -> Alignment.Center
+                    MdTableAlign.Right -> Alignment.CenterEnd
+                },
+            ) {
+                Text(
+                    text = inlineMarkdown(cells.getOrNull(column).orEmpty()),
+                    style = MaterialTheme.typography.bodySmall.copy(
+                        fontWeight = if (header) FontWeight.SemiBold else FontWeight.Normal,
+                    ),
+                    color = if (header) Zc.Text else Zc.TextMuted,
+                )
+            }
+        }
     }
 }
 
@@ -261,8 +511,47 @@ fun inlineMarkdown(text: String): AnnotatedString = buildAnnotatedString {
                 }
             }
 
+            text.startsWith("***", index) -> {
+                val end = text.indexOf("***", index + 3)
+                if (end > index) {
+                    pushStyle(SpanStyle(fontWeight = FontWeight.SemiBold, fontStyle = FontStyle.Italic))
+                    append(text.substring(index + 3, end))
+                    pop()
+                    index = end + 3
+                } else {
+                    append(char)
+                    index += 1
+                }
+            }
+
             text.startsWith("**", index) -> {
                 val end = text.indexOf("**", index + 2)
+                if (end > index) {
+                    pushStyle(SpanStyle(fontWeight = FontWeight.SemiBold))
+                    append(text.substring(index + 2, end))
+                    pop()
+                    index = end + 2
+                } else {
+                    append(char)
+                    index += 1
+                }
+            }
+
+            text.startsWith("___", index) -> {
+                val end = text.indexOf("___", index + 3)
+                if (end > index) {
+                    pushStyle(SpanStyle(fontWeight = FontWeight.SemiBold, fontStyle = FontStyle.Italic))
+                    append(text.substring(index + 3, end))
+                    pop()
+                    index = end + 3
+                } else {
+                    append(char)
+                    index += 1
+                }
+            }
+
+            text.startsWith("__", index) -> {
+                val end = text.indexOf("__", index + 2)
                 if (end > index) {
                     pushStyle(SpanStyle(fontWeight = FontWeight.SemiBold))
                     append(text.substring(index + 2, end))
@@ -288,8 +577,12 @@ fun inlineMarkdown(text: String): AnnotatedString = buildAnnotatedString {
             }
 
             char == '*' || char == '_' -> {
+                val before = text.getOrNull(index - 1)
+                val boundaryBefore = before == null || !before.isLetterOrDigit()
                 val end = text.indexOf(char, index + 1)
-                if (end > index + 1) {
+                val after = end.takeIf { it >= 0 }?.let { text.getOrNull(it + 1) }
+                val boundaryAfter = after == null || !after.isLetterOrDigit()
+                if (boundaryBefore && end > index + 1 && boundaryAfter) {
                     pushStyle(SpanStyle(fontStyle = FontStyle.Italic))
                     append(text.substring(index + 1, end))
                     pop()
