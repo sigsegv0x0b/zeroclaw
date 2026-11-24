@@ -1,5 +1,9 @@
 package ai.zeroclaw.app.ui
 
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.widget.Toast
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -16,6 +20,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -26,6 +31,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
@@ -35,7 +41,9 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -47,8 +55,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
@@ -59,6 +70,8 @@ import ai.zeroclaw.app.data.MessageBlock
 import ai.zeroclaw.app.data.MessageRole
 import ai.zeroclaw.app.data.SocketState
 import ai.zeroclaw.app.data.ToolCallCard
+import ai.zeroclaw.app.data.TtsController
+import ai.zeroclaw.app.data.TtsStatus
 import ai.zeroclaw.app.ui.theme.MonoFamily
 import ai.zeroclaw.app.ui.theme.Zc
 
@@ -118,13 +131,13 @@ fun BrandMark(size: Int = 32) {
 
 
 @Composable
-fun MessageItem(message: ChatMessage, localNodeId: String) {
+fun MessageItem(message: ChatMessage, localNodeId: String, tts: TtsController) {
     when (message.role) {
-        MessageRole.User -> Row(
+        MessageRole.User -> Column(
             Modifier
                 .fillMaxWidth()
                 .padding(vertical = 6.dp),
-            horizontalArrangement = Arrangement.End,
+            horizontalAlignment = Alignment.End,
         ) {
             Surface(
                 color = Zc.UserBubble,
@@ -132,13 +145,21 @@ fun MessageItem(message: ChatMessage, localNodeId: String) {
                 border = androidx.compose.foundation.BorderStroke(1.dp, Zc.Accent.copy(alpha = 0.22f)),
                 modifier = Modifier.fillMaxWidth(0.88f),
             ) {
-                Text(
-                    text = message.text,
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = Zc.Text,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                )
+                SelectionContainer {
+                    Text(
+                        text = message.text,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = Zc.Text,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    )
+                }
             }
+            MessageActions(
+                text = message.text,
+                tts = tts,
+                ttsKey = message.id,
+                speechText = message.text,
+            )
         }
 
         MessageRole.System -> Text(
@@ -156,45 +177,151 @@ fun MessageItem(message: ChatMessage, localNodeId: String) {
                 .padding(vertical = 6.dp),
         ) {
             val blocks = message.contentBlocks
-            blocks.forEachIndexed { index, block ->
-                when (block) {
-                    is MessageBlock.Thinking -> {
-                        ThinkingBlock(
-                            text = block.text,
-                            streaming = message.streaming && index == blocks.lastIndex,
-                        )
-                    }
-
-                    is MessageBlock.Text -> {
-                        if (message.isError) {
-                            Surface(
-                                color = Zc.DangerSoft,
-                                shape = RoundedCornerShape(10.dp),
-                                modifier = Modifier.fillMaxWidth(),
-                            ) {
-                                Text(
+            SelectionContainer {
+                Column {
+                    blocks.forEachIndexed { index, block ->
+                        when (block) {
+                            is MessageBlock.Thinking -> {
+                                ThinkingBlock(
                                     text = block.text,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = Zc.Danger,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                    streaming = message.streaming && index == blocks.lastIndex,
                                 )
                             }
-                        } else {
-                            MarkdownBlocks(parseMarkdown(block.text))
+
+                            is MessageBlock.Text -> {
+                                if (message.isError) {
+                                    Surface(
+                                        color = Zc.DangerSoft,
+                                        shape = RoundedCornerShape(10.dp),
+                                        modifier = Modifier.fillMaxWidth(),
+                                    ) {
+                                        Text(
+                                            text = block.text,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = Zc.Danger,
+                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                        )
+                                    }
+                                } else {
+                                    MarkdownBlocks(parseMarkdown(block.text))
+                                }
+                            }
+
+                            is MessageBlock.Tool -> ToolCallRow(block.card, localNodeId)
+                        }
+                        if (index != blocks.lastIndex) {
+                            Spacer(Modifier.height(8.dp))
                         }
                     }
-
-                    is MessageBlock.Tool -> ToolCallRow(block.card, localNodeId)
-                }
-                if (index != blocks.lastIndex) {
-                    Spacer(Modifier.height(8.dp))
+                    if (message.streaming && blocks.isEmpty()) {
+                        ThinkingDots()
+                    }
                 }
             }
-            if (message.streaming && blocks.isEmpty()) {
-                ThinkingDots()
+            if (!message.streaming) {
+                val copyText = blocks
+                    .filterIsInstance<MessageBlock.Text>()
+                    .joinToString("") { it.text }
+                MessageActions(
+                    text = copyText,
+                    clipboardText = plainTextForClipboard(copyText),
+                    speechText = plainTextForSpeech(copyText),
+                    tts = tts,
+                    ttsKey = message.id,
+                )
             }
         }
     }
+}
+
+/** Copy/share actions beneath a chat block. The whole block is copied as text. */
+@Composable
+fun MessageActions(
+    text: String,
+    tts: TtsController,
+    ttsKey: String,
+    clipboardText: String = text,
+    speechText: String = text,
+    modifier: Modifier = Modifier,
+) {
+    if (text.isBlank() && clipboardText.isBlank()) return
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
+    val playback by tts.state.collectAsState()
+    val active = playback.key == ttsKey && playback.status != TtsStatus.Idle
+    val speaking = active && playback.status == TtsStatus.Playing
+    val speakLabel = when {
+        speaking -> "Pause"
+        active -> "Resume"
+        else -> "Speak"
+    }
+
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(top = 2.dp),
+        horizontalArrangement = Arrangement.End,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (speechText.isNotBlank()) {
+            TextButton(
+                onClick = { tts.toggle(ttsKey, speechText) },
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+            ) {
+                Text(
+                    text = speakLabel,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Zc.Accent,
+                )
+            }
+            if (active) {
+                TextButton(
+                    onClick = { tts.reset() },
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                ) {
+                    Text(
+                        text = "Reset",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Zc.TextSubtle,
+                    )
+                }
+            }
+        }
+        TextButton(
+            onClick = {
+                clipboard.setText(AnnotatedString(clipboardText))
+                Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+            },
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+        ) {
+            Text(
+                text = "Copy",
+                style = MaterialTheme.typography.labelSmall,
+                color = Zc.TextSubtle,
+            )
+        }
+        TextButton(
+            onClick = { shareText(context, clipboardText) },
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+        ) {
+            Text(
+                text = "Share",
+                style = MaterialTheme.typography.labelSmall,
+                color = Zc.TextSubtle,
+            )
+        }
+    }
+}
+
+private fun shareText(context: Context, text: String) {
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_TEXT, text)
+    }
+    val chooser = Intent.createChooser(send, "Share reply").apply {
+        if (context !is Activity) addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    context.startActivity(chooser)
 }
 
 /** Collapsible reasoning text: two lines by default, full scrollable text when open. */

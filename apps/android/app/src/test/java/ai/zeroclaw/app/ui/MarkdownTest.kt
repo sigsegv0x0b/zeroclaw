@@ -61,4 +61,86 @@ class MarkdownTest {
     fun `strikethrough markers are removed`() {
         assertEquals("old", inlineMarkdown("~~old~~").text)
     }
+
+    @Test
+    fun `parses a gfm table with alignment and inline cells`() {
+        val blocks = parseMarkdown(
+            """
+            | Spec | Value |
+            | :--- | ---: |
+            | Host | `slowmini` |
+            | OS | macOS |
+            """.trimIndent(),
+        )
+        val table = blocks.single() as MdBlock.Table
+        assertEquals(listOf("Spec", "Value"), table.headers)
+        assertEquals(listOf(MdTableAlign.Left, MdTableAlign.Right), table.alignments)
+        assertEquals(2, table.rows.size)
+        assertEquals(listOf("Host", "`slowmini`"), table.rows[0])
+        assertEquals(listOf("OS", "macOS"), table.rows[1])
+    }
+
+    @Test
+    fun `parses a table without outer pipes and escaped separators`() {
+        val blocks = parseMarkdown(
+            """
+            Name | Detail
+            --- | ---
+            A \| B | backslash pipe
+            """.trimIndent(),
+        )
+        val table = blocks.single() as MdBlock.Table
+        assertEquals(listOf("Name", "Detail"), table.headers)
+        assertEquals(listOf("A | B", "backslash pipe"), table.rows.single())
+    }
+
+    @Test
+    fun `pipe paragraph without a separator stays a paragraph`() {
+        val blocks = parseMarkdown("a | b\nnot a separator")
+        assertEquals(MdBlock.Paragraph("a | b not a separator"), blocks.single())
+    }
+
+    @Test
+    fun `underscore bold markers are removed`() {
+        assertEquals("bold", inlineMarkdown("__bold__").text)
+    }
+
+    @Test
+    fun `triple emphasis markers are removed`() {
+        assertEquals("both", inlineMarkdown("***both***").text)
+        assertEquals("both", inlineMarkdown("___both___").text)
+    }
+
+    @Test
+    fun `underscores inside identifiers are not italic markers`() {
+        assertEquals("snake_case_name", inlineMarkdown("snake_case_name").text)
+    }
+
+    @Test
+    fun `speech text flattens markup and tables`() {
+        val speech = plainTextForSpeech(
+            """
+            **Host:** `slowmini`
+
+            | Spec | Value |
+            | --- | --- |
+            | OS | macOS |
+            """.trimIndent(),
+        )
+        assertEquals("Host: slowmini. Spec: OS, Value: macOS", speech)
+    }
+
+    @Test
+    fun `clipboard text keeps readable block layout`() {
+        val text = plainTextForClipboard(
+            """
+            **Host:** `slowmini`
+
+            | Spec | Value |
+            | --- | --- |
+            | OS | macOS |
+            """.trimIndent(),
+        )
+        assertEquals("Host: slowmini\n\nSpec | Value\nOS | macOS", text)
+    }
 }

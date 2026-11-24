@@ -22,6 +22,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -38,6 +39,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -46,6 +48,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -54,6 +57,7 @@ import ai.zeroclaw.app.data.ApprovalPrompt
 import ai.zeroclaw.app.data.ChatMessage
 import ai.zeroclaw.app.data.ElicitationPrompt
 import ai.zeroclaw.app.data.NodeStatus
+import ai.zeroclaw.app.data.TtsController
 import ai.zeroclaw.app.data.UiState
 import ai.zeroclaw.app.ui.theme.Zc
 
@@ -63,6 +67,12 @@ fun ChatScreen(
     viewModel: AppViewModel,
     onOpenDrawer: () -> Unit,
 ) {
+    val context = LocalContext.current
+    val tts = remember { TtsController(context.applicationContext) }
+    DisposableEffect(tts) {
+        onDispose { tts.shutdown() }
+    }
+
     Column(
         Modifier
             .fillMaxSize()
@@ -89,7 +99,7 @@ fun ChatScreen(
             if (state.messages.isEmpty()) {
                 EmptyChat(agent = state.agent)
             } else {
-                MessageList(state.messages, state.deviceId)
+                MessageList(state.messages, state.deviceId, tts)
             }
         }
 
@@ -116,6 +126,7 @@ fun ChatScreen(
             onAlways = { viewModel.answerApproval(true, always = true) },
             onDeny = { viewModel.answerApproval(false) },
             localNodeId = state.deviceId,
+            tts = tts,
         )
     }
 
@@ -124,6 +135,7 @@ fun ChatScreen(
             prompt = prompt,
             onSend = viewModel::answerElicitation,
             onCancel = viewModel::cancelElicitation,
+            tts = tts,
         )
     }
 }
@@ -214,7 +226,11 @@ private fun ChatTopBar(
 }
 
 @Composable
-private fun MessageList(messages: List<ChatMessage>, localNodeId: String) {
+private fun MessageList(
+    messages: List<ChatMessage>,
+    localNodeId: String,
+    tts: TtsController,
+) {
     val listState = rememberLazyListState()
     val last = messages.lastOrNull()
 
@@ -236,7 +252,7 @@ private fun MessageList(messages: List<ChatMessage>, localNodeId: String) {
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         items(messages, key = { it.id }) { message ->
-            MessageItem(message, localNodeId)
+            MessageItem(message, localNodeId, tts)
         }
     }
 }
@@ -268,6 +284,7 @@ private fun ElicitationDialog(
     prompt: ElicitationPrompt,
     onSend: (List<String>, String?) -> Unit,
     onCancel: () -> Unit,
+    tts: TtsController,
 ) {
     var selected by remember(prompt.requestId) { mutableStateOf(emptySet<String>()) }
     var freeForm by remember(prompt.requestId) { mutableStateOf("") }
@@ -295,10 +312,23 @@ private fun ElicitationDialog(
                     .heightIn(max = 380.dp)
                     .verticalScroll(rememberScrollState()),
             ) {
-                Text(
-                    text = prompt.message,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Zc.Text,
+                SelectionContainer {
+                    Text(
+                        text = prompt.message,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Zc.Text,
+                    )
+                }
+                MessageActions(
+                    text = buildString {
+                        append(prompt.message)
+                        if (prompt.options.isNotEmpty()) {
+                            append("\n\n")
+                            prompt.options.forEach { append("• ${it.label}\n") }
+                        }
+                    },
+                    tts = tts,
+                    ttsKey = prompt.requestId,
                 )
                 if (prompt.options.isNotEmpty()) {
                     Spacer(Modifier.height(8.dp))
@@ -405,6 +435,7 @@ private fun ApprovalDialog(
     onAlways: () -> Unit,
     onDeny: () -> Unit,
     localNodeId: String,
+    tts: TtsController,
 ) {
     AlertDialog(
         onDismissRequest = onDeny,
@@ -458,6 +489,17 @@ private fun ApprovalDialog(
                         )
                     }
                 }
+                MessageActions(
+                    text = buildString {
+                        append("ZeroClaw wants to run ${display.name}.")
+                        if (prompt.argumentsSummary.isNotBlank()) {
+                            append("\n\n")
+                            append(prompt.argumentsSummary)
+                        }
+                    },
+                    tts = tts,
+                    ttsKey = prompt.requestId,
+                )
                 prompt.timeoutSecs?.let { seconds ->
                     // Live countdown: the gateway's auto-deny window starts when
                     // the request is sent, so tick once a second from the value
