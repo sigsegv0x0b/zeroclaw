@@ -30,7 +30,7 @@ impl AskUserTool {
 }
 
 /// Format a question with optional choices for display.
-fn format_question(question: &str, choices: Option<&[String]>) -> String {
+fn format_question(question: &str, choices: Option<&[String]>, multi_select: bool) -> String {
     let mut lines = Vec::new();
     lines.push(format!("**{question}**"));
 
@@ -40,7 +40,11 @@ fn format_question(question: &str, choices: Option<&[String]>) -> String {
             lines.push(format!("{}. {choice}", i + 1));
         }
         lines.push(String::new());
-        lines.push("_Reply with a number or type your answer._".to_string());
+        lines.push(if multi_select {
+            "_Reply with one or more numbers, or type your answer._".to_string()
+        } else {
+            "_Reply with a number or type your answer._".to_string()
+        });
     }
 
     lines.join("\n")
@@ -55,7 +59,9 @@ impl Tool for AskUserTool {
     fn description(&self) -> &str {
         "Ask the user a question and wait for their response. \
          Sends the question to a messaging channel and blocks until the user replies \
-         or the timeout expires. Optionally provide choices for structured responses."
+         or the timeout expires. Provide `choices` to render selectable options; set \
+         `multi_select` to allow more than one. The Android and WebSocket clients also \
+         offer a free-form 'type your own' answer alongside the options."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -69,7 +75,11 @@ impl Tool for AskUserTool {
                 "choices": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional list of choices (renders as buttons on Telegram, numbered list on CLI)"
+                    "description": "Optional list of choices. Renders as radio buttons (or checkboxes with multi_select) on the Android app, buttons on Telegram, and a numbered list on CLI."
+                },
+                "multi_select": {
+                    "type": "boolean",
+                    "description": "Allow selecting more than one choice. Default: false (single choice)."
                 },
                 "timeout_secs": {
                     "type": "integer",
@@ -128,6 +138,11 @@ impl Tool for AskUserTool {
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_TIMEOUT_SECS);
+
+        let multi_select = args
+            .get("multi_select")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let requested_channel = args
             .get("channel")
@@ -194,40 +209,85 @@ impl Tool for AskUserTool {
         if let Some(ref choices_vec) = choices
             && !choices_vec.is_empty()
         {
-            match channel
-                .request_choice(&question, choices_vec, timeout)
-                .await
-            {
-                Ok(Some(answer)) => {
-                    return Ok(ToolResult {
-                        success: true,
-                        output: answer.into(),
-                        error: None,
-                    });
+            if multi_select {
+                match channel
+                    .request_multi_choice(&question, choices_vec, 1, choices_vec.len() + 1, timeout)
+                    .await
+                {
+                    Ok(Some(answers)) => {
+                        return Ok(ToolResult {
+                            success: true,
+                            output: json!({
+                                "question": &question,
+                                "answers": answers,
+                                "channel": &channel_name,
+                            })
+                            .to_string()
+                            .into(),
+                            error: None,
+                        });
+                    }
+                    Ok(None) if channel.supports_free_form_ask() => {
+                        /* fall through to send+listen */
+                    }
+                    Ok(None) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(format!(
+                                "Channel '{channel_name}' did not complete the structured \
+                                 multi-select question (user cancelled/declined, or the channel \
+                                 has no free-form fallback). Retry ask_user, or ask a \
+                                 single-choice question."
+                            )),
+                        });
+                    }
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(format!(
+                                "Failed to ask question on channel '{channel_name}': {e}"
+                            )),
+                        });
+                    }
                 }
-                Ok(None) if channel.supports_free_form_ask() => {
-                    /* fall through to send+listen */
-                }
-                Ok(None) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!(
-                            "Channel '{channel_name}' did not complete the structured choice \
-                             (user cancelled/declined, or the channel has no free-form fallback). \
-                             Retry ask_user; free-form questions on this channel await ACP \
-                             elicitation Phase 2."
-                        )),
-                    });
-                }
-                Err(e) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!(
-                            "Failed to ask question on channel '{channel_name}': {e}"
-                        )),
-                    });
+            } else {
+                match channel
+                    .request_choice(&question, choices_vec, timeout)
+                    .await
+                {
+                    Ok(Some(answer)) => {
+                        return Ok(ToolResult {
+                            success: true,
+                            output: answer.into(),
+                            error: None,
+                        });
+                    }
+                    Ok(None) if channel.supports_free_form_ask() => {
+                        /* fall through to send+listen */
+                    }
+                    Ok(None) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(format!(
+                                "Channel '{channel_name}' did not complete the structured choice \
+                                 (user cancelled/declined, or the channel has no free-form fallback). \
+                                 Retry ask_user; free-form questions on this channel await ACP \
+                                 elicitation Phase 2."
+                            )),
+                        });
+                    }
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(format!(
+                                "Failed to ask question on channel '{channel_name}': {e}"
+                            )),
+                        });
+                    }
                 }
             }
         } else if !channel.supports_free_form_ask() {
@@ -242,7 +302,7 @@ impl Tool for AskUserTool {
         }
 
         // Format and send the question
-        let text = format_question(&question, choices.as_deref());
+        let text = format_question(&question, choices.as_deref(), multi_select);
         let msg = SendMessage::new(&text, "");
         if let Err(e) = channel.send(&msg).await {
             return Ok(ToolResult {
@@ -436,12 +496,14 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["question"].is_object());
         assert!(schema["properties"]["choices"].is_object());
+        assert!(schema["properties"]["multi_select"].is_object());
         assert!(schema["properties"]["timeout_secs"].is_object());
         assert!(schema["properties"]["channel"].is_object());
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "question"));
-        // choices, timeout_secs, channel are optional
+        // choices, multi_select, timeout_secs, channel are optional
         assert!(!required.iter().any(|v| v == "choices"));
+        assert!(!required.iter().any(|v| v == "multi_select"));
         assert!(!required.iter().any(|v| v == "timeout_secs"));
         assert!(!required.iter().any(|v| v == "channel"));
     }
@@ -462,7 +524,7 @@ mod tests {
 
     #[test]
     fn format_question_without_choices() {
-        let text = format_question("Are you sure?", None);
+        let text = format_question("Are you sure?", None, false);
         assert!(text.contains("Are you sure?"));
         assert!(!text.contains("1."));
     }
@@ -470,7 +532,7 @@ mod tests {
     #[test]
     fn format_question_with_choices() {
         let choices = vec!["Yes".to_string(), "No".to_string(), "Maybe".to_string()];
-        let text = format_question("Continue?", Some(&choices));
+        let text = format_question("Continue?", Some(&choices), false);
         assert!(text.contains("Continue?"));
         assert!(text.contains("1. Yes"));
         assert!(text.contains("2. No"));
@@ -576,6 +638,80 @@ mod tests {
             .unwrap();
         assert!(result.success, "error: {:?}", result.error);
         assert_eq!(result.output, "2");
+    }
+
+    struct MultiChoiceChannel {
+        answers: Vec<String>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for MultiChoiceChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "multi"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for MultiChoiceChannel {
+        fn name(&self) -> &str {
+            "multi"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_free_form_ask(&self) -> bool {
+            false
+        }
+
+        async fn request_multi_choice(
+            &self,
+            _question: &str,
+            _choices: &[String],
+            _min_items: usize,
+            _max_items: usize,
+            _timeout: std::time::Duration,
+        ) -> anyhow::Result<Option<Vec<String>>> {
+            Ok(Some(self.answers.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_select_returns_selected_answers_as_json() {
+        let tool = make_tool_with_channels(vec![(
+            "multi",
+            Arc::new(MultiChoiceChannel {
+                answers: vec!["Camera".to_string(), "Calendar".to_string()],
+            }) as Arc<dyn Channel>,
+        )]);
+        let result = tool
+            .execute(json!({
+                "question": "Which capabilities?",
+                "choices": ["Camera", "SMS", "Calendar"],
+                "multi_select": true,
+                "channel": "multi",
+                "timeout_secs": 5
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "error: {:?}", result.error);
+        let parsed: serde_json::Value =
+            serde_json::from_str(result.output.as_str()).expect("structured answers");
+        assert_eq!(parsed["question"], "Which capabilities?");
+        assert_eq!(parsed["answers"], json!(["Camera", "Calendar"]));
+        assert_eq!(parsed["channel"], "multi");
     }
 
     #[tokio::test]

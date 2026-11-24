@@ -48,6 +48,7 @@ data class UiState(
     val socket: SocketState = SocketState.Idle,
     val busy: Boolean = false,
     val approval: ApprovalPrompt? = null,
+    val choice: ChoicePrompt? = null,
     val error: String? = null,
     val notice: String? = null,
     val insecurePrompt: InsecureConnectionPrompt? = null,
@@ -935,6 +936,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 messages = emptyList(),
                 busy = false,
                 approval = null,
+                choice = null,
                 error = null,
                 drawerOpen = false,
             )
@@ -1018,6 +1020,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update { it.copy(approval = null) }
     }
 
+    fun answerChoice(selected: List<String>, freeForm: String?) {
+        val prompt = _ui.value.choice ?: return
+        socket.sendChoice(
+            requestId = prompt.requestId,
+            selected = selected,
+            freeForm = freeForm?.trim()?.takeIf { it.isNotEmpty() },
+        )
+        _ui.update { it.copy(choice = null) }
+    }
+
+    fun cancelChoice() {
+        val prompt = _ui.value.choice ?: return
+        socket.sendChoice(prompt.requestId, emptyList(), null, cancelled = true)
+        _ui.update { it.copy(choice = null) }
+    }
+
     // ── Socket events ──────────────────────────────────────────────────────
 
     private fun handleEvent(event: ChatEvent) {
@@ -1035,14 +1053,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             message.copy(streaming = false)
                         }
                     }
-                    state.copy(messages = messages, busy = false)
+                    state.copy(messages = messages, busy = false, choice = null)
                 }
                 viewModelScope.launch { reloadSessions() }
             }
-            is ChatEvent.Failure -> finishAssistant(event.message, isError = true)
+            is ChatEvent.Failure -> {
+                finishAssistant(event.message, isError = true)
+                _ui.update { it.copy(choice = null) }
+            }
             ChatEvent.Aborted -> {
                 updateAssistant { it.copy(streaming = false) }
-                _ui.update { it.copy(busy = false, notice = "Turn stopped.") }
+                _ui.update { it.copy(busy = false, notice = "Turn stopped.", choice = null) }
             }
             is ChatEvent.ApprovalRequest -> _ui.update {
                 it.copy(
@@ -1050,6 +1071,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         requestId = event.requestId,
                         tool = event.tool,
                         argumentsSummary = event.argumentsSummary,
+                        timeoutSecs = event.timeoutSecs,
+                    ),
+                )
+            }
+            is ChatEvent.ChoiceRequest -> _ui.update {
+                it.copy(
+                    choice = ChoicePrompt(
+                        requestId = event.requestId,
+                        question = event.question,
+                        choices = event.choices,
+                        multiSelect = event.multiSelect,
+                        allowFreeForm = event.allowFreeForm,
                         timeoutSecs = event.timeoutSecs,
                     ),
                 )

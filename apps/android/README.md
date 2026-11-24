@@ -18,6 +18,7 @@ on-phone voice transcription.
 | Streaming chat over `/ws/chat` | Done |
 | Markdown replies, code blocks, tool cards | Done |
 | Tool approval prompts (approve / always / deny) | Done |
+| Interactive questions (radio / checkbox / typed answer) | Done |
 | Conversation list from `/api/sessions` | Done |
 | Agent switcher from `/api/agents/available` | Done |
 | Stop an in-flight turn (`/abort`) | Done |
@@ -314,13 +315,20 @@ Chat sockets authenticate with `Sec-WebSocket-Protocol: zeroclaw.v1,
 bearer.<token>`, which the gateway accepts alongside the `Authorization` header
 and `?token=` fallback.
 
-Client → server frames: `{"type":"message","content":…}` and
-`{"type":"approval_response","request_id":…,"decision":"approve|deny|always"}`.
+Client → server frames: `{"type":"message","content":…}`,
+`{"type":"approval_response","request_id":…,"decision":"approve|deny|always"}`,
+and `{"type":"choice_response","request_id":…,"selected":[…],
+"free_form":"…","cancelled":false}`. Omit `free_form`/`selected` when unused,
+or set `cancelled: true` to dismiss the question.
 
 Server → client frames handled: `session_start`, `chunk`, `message`,
 `thinking`, `tool_call`, `tool_result`, `done`, `error`, `aborted`,
-`approval_request`, `history_trimmed`, `safeguard_fallback`. Unknown frames are
-ignored so a newer gateway does not break the app.
+`approval_request`, `choice_request`, `history_trimmed`, `safeguard_fallback`.
+Unknown frames are ignored so a newer gateway does not break the app.
+
+A `choice_request` comes from `ask_user` or `poll` with choices. The app renders
+radio buttons for a single choice and checkboxes when `multi_select` is true,
+plus a "type your own" field when `allow_free_form` is set.
 
 The client owns the session id (a UUID) exactly as the web dashboard does, so
 history written on the phone is visible on the dashboard and vice versa.

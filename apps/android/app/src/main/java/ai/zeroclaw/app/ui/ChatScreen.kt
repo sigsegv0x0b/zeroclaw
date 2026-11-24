@@ -1,6 +1,7 @@
 package ai.zeroclaw.app.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -10,6 +11,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -19,20 +21,26 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -44,6 +52,7 @@ import androidx.compose.ui.unit.dp
 import ai.zeroclaw.app.data.AppViewModel
 import ai.zeroclaw.app.data.ApprovalPrompt
 import ai.zeroclaw.app.data.ChatMessage
+import ai.zeroclaw.app.data.ChoicePrompt
 import ai.zeroclaw.app.data.NodeStatus
 import ai.zeroclaw.app.data.UiState
 import ai.zeroclaw.app.ui.theme.Zc
@@ -107,6 +116,14 @@ fun ChatScreen(
             onAlways = { viewModel.answerApproval(true, always = true) },
             onDeny = { viewModel.answerApproval(false) },
             localNodeId = state.deviceId,
+        )
+    }
+
+    state.choice?.let { prompt ->
+        ChoiceDialog(
+            prompt = prompt,
+            onSend = viewModel::answerChoice,
+            onCancel = viewModel::cancelChoice,
         )
     }
 }
@@ -239,6 +256,137 @@ private fun NoticeBar(text: String, onDismiss: () -> Unit) {
             Text("×", style = MaterialTheme.typography.titleMedium, color = Zc.Accent)
         }
     }
+}
+
+@Composable
+private fun ChoiceDialog(
+    prompt: ChoicePrompt,
+    onSend: (List<String>, String?) -> Unit,
+    onCancel: () -> Unit,
+) {
+    var selected by remember(prompt.requestId) { mutableStateOf(emptySet<String>()) }
+    var freeForm by remember(prompt.requestId) { mutableStateOf("") }
+    val canSend = selected.isNotEmpty() || freeForm.isNotBlank()
+
+    AlertDialog(
+        onDismissRequest = onCancel,
+        containerColor = Zc.SurfaceRaised,
+        titleContentColor = Zc.Text,
+        textContentColor = Zc.TextMuted,
+        shape = RoundedCornerShape(18.dp),
+        title = {
+            Text(
+                text = if (prompt.multiSelect) "Choose one or more" else "Choose an option",
+                style = MaterialTheme.typography.titleLarge,
+            )
+        },
+        text = {
+            Column(
+                Modifier
+                    .heightIn(max = 380.dp)
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                Text(
+                    text = prompt.question,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Zc.Text,
+                )
+                if (prompt.choices.isNotEmpty()) {
+                    Spacer(Modifier.height(8.dp))
+                    prompt.choices.forEach { choice ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    if (prompt.multiSelect) {
+                                        selected = if (choice in selected) {
+                                            selected - choice
+                                        } else {
+                                            selected + choice
+                                        }
+                                    } else {
+                                        selected = setOf(choice)
+                                        freeForm = ""
+                                    }
+                                }
+                                .padding(vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            if (prompt.multiSelect) {
+                                Checkbox(
+                                    checked = choice in selected,
+                                    onCheckedChange = null,
+                                )
+                            } else {
+                                RadioButton(
+                                    selected = choice in selected,
+                                    onClick = null,
+                                )
+                            }
+                            Text(
+                                text = choice,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Zc.Text,
+                                modifier = Modifier.padding(start = 4.dp),
+                            )
+                        }
+                    }
+                }
+                if (prompt.allowFreeForm) {
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = freeForm,
+                        onValueChange = { value ->
+                            freeForm = value
+                            if (!prompt.multiSelect && value.isNotBlank()) {
+                                selected = emptySet()
+                            }
+                        },
+                        label = { Text("Type your own") },
+                        modifier = Modifier.fillMaxWidth(),
+                        maxLines = 3,
+                    )
+                }
+                prompt.timeoutSecs?.let { seconds ->
+                    var remaining by remember(prompt.requestId) { mutableIntStateOf(seconds) }
+                    LaunchedEffect(prompt.requestId) {
+                        while (remaining > 0) {
+                            kotlinx.coroutines.delay(1_000)
+                            remaining -= 1
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = if (remaining > 0) {
+                            "Auto-cancels in ${remaining}s."
+                        } else {
+                            "Response window elapsed — waiting for the gateway."
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (remaining <= 10 && remaining > 0) Zc.Warning else Zc.TextSubtle,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    onSend(
+                        selected.toList(),
+                        freeForm.trim().takeIf { it.isNotEmpty() },
+                    )
+                },
+                enabled = canSend,
+            ) {
+                Text("Send", color = if (canSend) Zc.Accent else Zc.TextSubtle)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onCancel) {
+                Text("Cancel", color = Zc.Danger)
+            }
+        },
+    )
 }
 
 @Composable

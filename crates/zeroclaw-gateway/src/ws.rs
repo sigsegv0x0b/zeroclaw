@@ -8,7 +8,10 @@ use super::{
     AppState, GW_SESSION_PREFIX, gateway_cancel_key, register_cancel_token,
     remove_cancel_token_if_current,
 };
-use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
+use crate::ws_approval::{
+    ChoiceReply, PendingApprovals, PendingChoices, WsApprovalChannel, new_pending_approvals,
+    new_pending_choices,
+};
 use axum::{
     Extension,
     extract::{
@@ -925,9 +928,11 @@ async fn handle_socket(
     let (approval_event_tx, mut approval_event_rx) =
         tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(8);
     let pending_approvals: PendingApprovals = new_pending_approvals();
+    let pending_choices: PendingChoices = new_pending_choices();
     let approval_channel = Arc::new(WsApprovalChannel::new(
         approval_event_tx.clone(),
         pending_approvals.clone(),
+        pending_choices.clone(),
         Duration::from_secs(WS_APPROVAL_TIMEOUT_SECS),
     ));
     // The approval bridge fans out through the `ask_user` map. A channel-less
@@ -1020,6 +1025,7 @@ async fn handle_socket(
                             &mut receiver,
                             &mut approval_event_rx,
                             &pending_approvals,
+                            &pending_choices,
                             &mut ping_interval,
                             &ws_memory,
                             &mut persisted_watermark,
@@ -1175,6 +1181,25 @@ async fn handle_socket(
                     continue;
                 }
 
+                if msg_type == "choice_response" {
+                    let Some((request_id, reply)) = choice_response_from_frame(&parsed) else {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": "choice_response requires request_id and at least one of \
+                                        selected, free_form, or cancelled",
+                            "code": "INVALID_CHOICE_RESPONSE"
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        continue;
+                    };
+                    if let Some(tx) = pending_choices.lock().remove(&request_id) {
+                        let _ = tx.send(reply);
+                    } else {
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "choice_response with no matching pending request");
+                    }
+                    continue;
+                }
+
                 if msg_type != "message" {
                     let err = serde_json::json!({
                         "type": "error",
@@ -1240,6 +1265,7 @@ async fn handle_socket(
                     &mut receiver,
                     &mut approval_event_rx,
                     &pending_approvals,
+                    &pending_choices,
                     &mut ping_interval,
                     &ws_memory,
                     &mut persisted_watermark,
@@ -1308,6 +1334,21 @@ async fn handle_socket(
                         "arguments_summary": arguments_summary,
                         "timeout_secs": timeout_secs,
                     }),
+                    zeroclaw_api::agent::TurnEvent::ChoiceRequest {
+                        request_id,
+                        question,
+                        choices,
+                        multi_select,
+                        allow_free_form,
+                        timeout_secs,
+                    } => choice_request_frame(
+                        request_id,
+                        question,
+                        choices,
+                        multi_select,
+                        allow_free_form,
+                        timeout_secs,
+                    ),
                     other => {
                         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"kind": format!("{:?}", other)})), "non-ApprovalRequest event leaked into approval channel");
                         continue;
@@ -1674,8 +1715,14 @@ fn classify_client_frame(frame: Option<Result<Message, axum::Error>>) -> ClientF
 /// oneshot: with nobody attached to answer, the approval channel resolves each
 /// as an unreachable-operator deny immediately instead of after the prompt
 /// timeout. The turn itself keeps running.
-fn detach_mid_turn(session_key: &str, turn_id: &str, pending_approvals: &PendingApprovals) {
+fn detach_mid_turn(
+    session_key: &str,
+    turn_id: &str,
+    pending_approvals: &PendingApprovals,
+    pending_choices: &PendingChoices,
+) {
     let parked: Vec<_> = pending_approvals.lock().drain().collect();
+    let parked_choices: Vec<_> = pending_choices.lock().drain().collect();
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
@@ -1683,11 +1730,70 @@ fn detach_mid_turn(session_key: &str, turn_id: &str, pending_approvals: &Pending
                 "session_key": session_key,
                 "trace_id": turn_id,
                 "parked_approvals": parked.len(),
+                "parked_choices": parked_choices.len(),
             })
         ),
         "WebSocket client detached mid-turn; turn continues unattended"
     );
     drop(parked);
+    drop(parked_choices);
+}
+
+/// Parse the client's `choice_response` frame. Returns `None` for a malformed
+/// frame so the caller can report it (top-level) or ignore it (mid-turn).
+fn choice_response_from_frame(parsed: &serde_json::Value) -> Option<(String, ChoiceReply)> {
+    let request_id = parsed["request_id"].as_str()?.trim();
+    if request_id.is_empty() {
+        return None;
+    }
+    let cancelled = parsed["cancelled"].as_bool().unwrap_or(false);
+    let selected: Vec<String> = parsed["selected"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let free_form = parsed["free_form"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if !cancelled && selected.is_empty() && free_form.is_none() {
+        return None;
+    }
+    Some((
+        request_id.to_string(),
+        ChoiceReply {
+            selected,
+            free_form,
+            cancelled,
+        },
+    ))
+}
+
+fn choice_request_frame(
+    request_id: String,
+    question: String,
+    choices: Vec<String>,
+    multi_select: bool,
+    allow_free_form: bool,
+    timeout_secs: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "choice_request",
+        "request_id": request_id,
+        "question": question,
+        "choices": choices,
+        "multi_select": multi_select,
+        "allow_free_form": allow_free_form,
+        "timeout_secs": timeout_secs,
+    })
 }
 
 fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessage]) -> bool {
@@ -2129,6 +2235,7 @@ async fn process_chat_message(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
     approval_event_rx: &mut tokio::sync::mpsc::Receiver<zeroclaw_api::agent::TurnEvent>,
     pending_approvals: &PendingApprovals,
+    pending_choices: &PendingChoices,
     ping_interval: &mut Option<tokio::time::Interval>,
     ws_memory: &Option<Arc<dyn zeroclaw_memory::Memory>>,
     // Transcript generation and length this connection's history reflects;
@@ -2295,12 +2402,12 @@ async fn process_chat_message(
                 match send_unless_lost(&mut *sender, $message, &mut *session, state).await {
                     Sent::Delivered => {}
                     Sent::PeerGone => {
-                        detach_mid_turn(session_key, &turn_id, pending_approvals);
+                        detach_mid_turn(session_key, &turn_id, pending_approvals, pending_choices);
                         *session = None;
                         client_gone = true;
                     }
                     Sent::SessionLost(code) => {
-                        detach_mid_turn(session_key, &turn_id, pending_approvals);
+                        detach_mid_turn(session_key, &turn_id, pending_approvals, pending_choices);
                         *session = None;
                         close_with(
                             &mut *sender,
@@ -2319,7 +2426,9 @@ async fn process_chat_message(
                             biased;
                             _ = cancel_token.cancelled(), if !cancel_drained => {
                                 let drained: Vec<_> = pending_approvals.lock().drain().collect();
+                                let drained_choices: Vec<_> = pending_choices.lock().drain().collect();
                                 drop(drained);
+                                drop(drained_choices);
                                 cancel_drained = true;
                                 // Fall through; the agent loop will now wake from the
                                 // approval await, see the cancel token, and propagate
@@ -2331,7 +2440,7 @@ async fn process_chat_message(
                             // finishes, and is treated as a viewer that left. Ahead of
                             // the client arm so buffered input cannot win the race.
                             code = crate::dashboard_session::session_lost(&mut *session, state), if !client_gone => {
-                                detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                detach_mid_turn(session_key, &turn_id, pending_approvals, pending_choices);
                                 *session = None;
                                 close_with(&mut *sender, &mut *receiver, code, "dashboard session ended").await;
                                 client_gone = true;
@@ -2345,7 +2454,7 @@ async fn process_chat_message(
                                     }
                                     ClientFrame::Ignore => continue,
                                     ClientFrame::Gone => {
-                                        detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                        detach_mid_turn(session_key, &turn_id, pending_approvals, pending_choices);
                                         *session = None;
                                         client_gone = true;
                                         continue;
@@ -2354,7 +2463,7 @@ async fn process_chat_message(
                                 if let Err(code) =
                                     crate::dashboard_session::session_admits_now(&mut *session, state).await
                                 {
-                                    detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                    detach_mid_turn(session_key, &turn_id, pending_approvals, pending_choices);
                                     *session = None;
                                     close_with(&mut *sender, &mut *receiver, code, "dashboard session ended").await;
                                     client_gone = true;
@@ -2402,6 +2511,19 @@ async fn process_chat_message(
                                             ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
                                         }
                                     }
+                                    Some("choice_response") => {
+                                        if let Some((request_id, reply)) =
+                                            choice_response_from_frame(&parsed)
+                                        {
+                                            if let Some(tx) =
+                                                pending_choices.lock().remove(&request_id)
+                                            {
+                                                let _ = tx.send(reply);
+                                            } else {
+                                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "choice_response with no matching pending request (mid-turn)");
+                                            }
+                                        }
+                                    }
                                     Some("message") => {
                                         let content = parsed["content"].as_str().unwrap_or("").to_string();
                                         if content.is_empty() {
@@ -2438,28 +2560,55 @@ async fn process_chat_message(
                             }
                             approval = approval_event_rx.recv() => {
                                 let Some(event) = approval else { continue };
-                                if let TurnEvent::ApprovalRequest {
-                                    request_id,
-                                    tool_name,
-                                    arguments_summary,
-                                    timeout_secs,
-                                } = event {
-                                    if client_gone {
-                                        // Nobody is attached to answer: drop the parked
-                                        // oneshot so the approval channel resolves it as an
-                                        // unreachable-operator deny now, not at the timeout.
-                                        drop(pending_approvals.lock().remove(&request_id));
+                                let frame = match event {
+                                    TurnEvent::ApprovalRequest {
+                                        request_id,
+                                        tool_name,
+                                        arguments_summary,
+                                        timeout_secs,
+                                    } => {
+                                        if client_gone {
+                                            // Nobody is attached to answer: drop the parked
+                                            // oneshot so the approval channel resolves it as an
+                                            // unreachable-operator deny now, not at the timeout.
+                                            drop(pending_approvals.lock().remove(&request_id));
+                                            continue;
+                                        }
+                                        serde_json::json!({
+                                            "type": "approval_request",
+                                            "request_id": request_id,
+                                            "tool": tool_name,
+                                            "arguments_summary": arguments_summary,
+                                            "timeout_secs": timeout_secs,
+                                        })
+                                    }
+                                    TurnEvent::ChoiceRequest {
+                                        request_id,
+                                        question,
+                                        choices,
+                                        multi_select,
+                                        allow_free_form,
+                                        timeout_secs,
+                                    } => {
+                                        if client_gone {
+                                            drop(pending_choices.lock().remove(&request_id));
+                                            continue;
+                                        }
+                                        choice_request_frame(
+                                            request_id,
+                                            question,
+                                            choices,
+                                            multi_select,
+                                            allow_free_form,
+                                            timeout_secs,
+                                        )
+                                    }
+                                    other => {
+                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"kind": format!("{:?}", other)})), "non-interactive event leaked into approval channel");
                                         continue;
                                     }
-                                    let frame = serde_json::json!({
-                                        "type": "approval_request",
-                                        "request_id": request_id,
-                                        "tool": tool_name,
-                                        "arguments_summary": arguments_summary,
-                                        "timeout_secs": timeout_secs,
-                                    });
-                                    send_to_viewer!(Message::Text(frame.to_string().into()));
-                                }
+                                };
+                                send_to_viewer!(Message::Text(frame.to_string().into()));
                             }
                             _ = tick_websocket_ping(ping_interval), if !client_gone => {
                                 send_to_viewer!(Message::Ping(Vec::new().into()));
@@ -2509,6 +2658,27 @@ async fn process_chat_message(
                                             "arguments_summary": arguments_summary,
                                             "timeout_secs": timeout_secs,
                                         })
+                                    }
+                                    TurnEvent::ChoiceRequest {
+                                        request_id,
+                                        question,
+                                        choices,
+                                        multi_select,
+                                        allow_free_form,
+                                        timeout_secs,
+                                    } => {
+                                        if client_gone {
+                                            drop(pending_choices.lock().remove(&request_id));
+                                            continue;
+                                        }
+                                        choice_request_frame(
+                                            request_id,
+                                            question,
+                                            choices,
+                                            multi_select,
+                                            allow_free_form,
+                                            timeout_secs,
+                                        )
                                     }
                                     TurnEvent::HistoryTrimmed {
                                         dropped_messages,
@@ -5543,6 +5713,7 @@ data: {\"type\":\"message_stop\"}\n\n",
         let approval_channel = Arc::new(WsApprovalChannel::new(
             tx,
             pending,
+            new_pending_choices(),
             Duration::from_secs(WS_APPROVAL_TIMEOUT_SECS),
         ));
 
@@ -6252,20 +6423,68 @@ data: {\"type\":\"message_stop\"}\n\n",
     #[test]
     fn detach_mid_turn_drops_parked_approvals_so_they_fail_closed() {
         let pending = new_pending_approvals();
+        let pending_choices = new_pending_choices();
         let (tx, rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
         pending.lock().insert("req-1".to_string(), tx);
+        let (choice_tx, choice_rx) = tokio::sync::oneshot::channel::<ChoiceReply>();
+        pending_choices
+            .lock()
+            .insert("choice-1".to_string(), choice_tx);
 
-        detach_mid_turn("gw_detached", "turn-1", &pending);
+        detach_mid_turn("gw_detached", "turn-1", &pending, &pending_choices);
 
         assert!(
             pending.lock().is_empty(),
             "parked approvals are cleared on detach"
         );
         assert!(
+            pending_choices.lock().is_empty(),
+            "parked choices are cleared on detach"
+        );
+        assert!(
             rx.blocking_recv().is_err(),
             "the parked oneshot is dropped, which WsApprovalChannel reports as an \
              unreachable-operator deny instead of waiting for the prompt timeout"
         );
+        assert!(
+            choice_rx.blocking_recv().is_err(),
+            "a parked choice is dropped so the tool fails closed immediately"
+        );
+    }
+
+    #[test]
+    fn choice_response_frame_requires_a_choice_or_cancellation() {
+        assert!(
+            choice_response_from_frame(&serde_json::json!({"request_id": "req-1"})).is_none(),
+            "an empty response must be rejected instead of resolving the tool with no answer"
+        );
+        assert!(
+            choice_response_from_frame(&serde_json::json!({
+                "request_id": "",
+                "selected": ["A"]
+            }))
+            .is_none(),
+            "the correlation id is required"
+        );
+
+        let (request_id, reply) = choice_response_from_frame(&serde_json::json!({
+            "request_id": "req-2",
+            "selected": ["A", "B"],
+            "free_form": "  Custom  "
+        }))
+        .expect("selected answers are valid");
+        assert_eq!(request_id, "req-2");
+        assert_eq!(reply.selected, ["A", "B"]);
+        assert_eq!(reply.free_form.as_deref(), Some("Custom"));
+        assert!(!reply.cancelled);
+
+        let (_, reply) = choice_response_from_frame(&serde_json::json!({
+            "request_id": "req-3",
+            "cancelled": true
+        }))
+        .expect("an explicit cancel is valid");
+        assert!(reply.cancelled);
+        assert!(reply.selected.is_empty());
     }
 
     #[test]
