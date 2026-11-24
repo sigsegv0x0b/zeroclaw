@@ -106,6 +106,7 @@ class NodeService : Service() {
         is NodeStatus.Connected ->
             "Linked as ${status.nodeId} · ${status.capabilityCount} capabilities"
         is NodeStatus.Connecting -> "Linking this phone…"
+        is NodeStatus.Disabled -> "Phone actions unavailable: node endpoint disabled"
         is NodeStatus.Error -> "Link lost: ${status.message}"
         NodeStatus.Stopped -> "Device link stopped"
     }

@@ -9,6 +9,8 @@ sealed interface NodeStatus {
     data object Stopped : NodeStatus
     data object Connecting : NodeStatus
     data class Connected(val nodeId: String, val capabilityCount: Int) : NodeStatus
+    /** The gateway answered, but it does not expose `/ws/nodes`. */
+    data class Disabled(val message: String) : NodeStatus
     data class Error(val message: String) : NodeStatus
 }
 

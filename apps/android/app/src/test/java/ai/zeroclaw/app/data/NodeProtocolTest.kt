@@ -4,6 +4,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -34,6 +35,15 @@ class NodeProtocolTest {
         assertTrue(first["description"] != null)
         assertTrue(first["parameters"] is JsonObject)
         assertEquals("alarm.set", first["name"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `disabled node endpoint is identified from the upgrade response`() {
+        assertTrue(isNodeEndpointMissing(404, "Expected HTTP 101 response but was '404 Not Found'"))
+        assertTrue(isNodeEndpointMissing(501, null))
+        assertTrue(isNodeEndpointMissing(null, "Expected HTTP 101 response but was '404 Not Found'"))
+        assertFalse(isNodeEndpointMissing(null, "timeout"))
+        assertFalse(isNodeEndpointMissing(500, "server error"))
     }
 
     @Test

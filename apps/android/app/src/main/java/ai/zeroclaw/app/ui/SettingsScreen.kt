@@ -367,6 +367,7 @@ fun SettingsScreen(
                         style = MaterialTheme.typography.labelSmall,
                         color = when (state.nodeStatus) {
                             is NodeStatus.Connected -> Zc.Success
+                            is NodeStatus.Disabled -> Zc.Danger
                             is NodeStatus.Error -> Zc.Danger
                             is NodeStatus.Connecting -> Zc.Warning
                             NodeStatus.Stopped -> Zc.TextSubtle
@@ -612,6 +613,7 @@ fun SettingsScreen(
 private fun nodeStatusLabel(state: UiState): String = when (val status = state.nodeStatus) {
     is NodeStatus.Connected -> "Linked as ${status.nodeId} · ${status.capabilityCount} capabilities"
     is NodeStatus.Connecting -> "Connecting…"
+    is NodeStatus.Disabled -> status.message
     is NodeStatus.Error -> "Link lost: ${status.message}"
     NodeStatus.Stopped -> if (state.nodeEnabled) "Starting…" else "Off"
 }
