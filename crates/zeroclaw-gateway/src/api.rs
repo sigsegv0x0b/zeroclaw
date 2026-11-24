@@ -1951,6 +1951,11 @@ pub async fn handle_api_session_messages(
             // tool result rows and keep only the visible narration text from
             // assistant tool-call carriers.
             let visible = zeroclaw_providers::visible_chat_message(&m.message)?;
+            // The failure marker closes an orphaned turn for model context;
+            // it is not a chat message the operator should read after reload.
+            if visible.role == "assistant" && visible.content == crate::ws::TASK_FAILED_MARKER {
+                return None;
+            }
             Some(serde_json::json!({
                 "role": visible.role,
                 "content": visible.content,
