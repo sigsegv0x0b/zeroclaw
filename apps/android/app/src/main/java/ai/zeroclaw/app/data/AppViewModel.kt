@@ -145,6 +145,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                                 token = snapshot.token,
                                 sessionId = snapshot.sessionId,
                                 agent = snapshot.agent,
+                                nodeId = snapshot.deviceId,
                             ),
                         )
                     }
@@ -953,6 +954,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     token = _ui.value.token,
                     sessionId = sessionId,
                     agent = agentAlias,
+                    nodeId = _ui.value.deviceId,
                 ),
             )
         }
@@ -967,6 +969,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 token = snapshot.token,
                 sessionId = snapshot.sessionId,
                 agent = snapshot.agent,
+                nodeId = snapshot.deviceId,
             ),
         )
     }

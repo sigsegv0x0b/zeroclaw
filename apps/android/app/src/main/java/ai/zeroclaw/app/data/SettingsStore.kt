@@ -12,8 +12,18 @@ import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 private val Context.settingsDataStore: DataStore<Preferences> by preferencesDataStore(name = "zeroclaw_settings")
+
+/**
+ * Serializes device-id generation across the app process. Bootstrap and the
+ * node service both ask for the id at startup; without this lock they can read
+ * a blank preference and persist two different ids, so the chat scopes its
+ * phone tools to an id the node link never registered.
+ */
+private val deviceIdLock = Mutex()
 
 data class StoredSettings(
     val gatewayUrl: String = "",
@@ -126,12 +136,12 @@ class SettingsStore(private val context: Context) {
     }
 
     /** Stable, provider-safe node id (`^[a-z0-9-]+$`, short enough for a tool name). */
-    suspend fun ensureDeviceId(): String {
+    suspend fun ensureDeviceId(): String = deviceIdLock.withLock {
         val existing = settings.first().deviceId
-        if (existing.isNotBlank()) return existing
+        if (existing.isNotBlank()) return@withLock existing
         val generated = "android-" + java.util.UUID.randomUUID().toString().take(8)
         context.settingsDataStore.edit { prefs -> prefs[Keys.deviceId] = generated }
-        return generated
+        generated
     }
 
     suspend fun saveNodeFolder(uri: String, name: String) {

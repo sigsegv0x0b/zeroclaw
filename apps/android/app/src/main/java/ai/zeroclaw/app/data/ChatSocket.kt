@@ -46,6 +46,8 @@ class ChatSocket(
         val token: String,
         val sessionId: String,
         val agent: String,
+        /** Local node id; scopes the gateway's phone tools to this device. */
+        val nodeId: String = "",
     )
 
     private val _events = MutableSharedFlow<ChatEvent>(extraBufferCapacity = 512)
@@ -107,6 +109,11 @@ class ChatSocket(
         val request = Request.Builder()
             .url(url)
             .header("Sec-WebSocket-Protocol", "zeroclaw.v1, bearer.${cfg.token}")
+            .apply {
+                if (cfg.nodeId.isNotBlank()) {
+                    header("X-ZeroClaw-Node-Id", cfg.nodeId)
+                }
+            }
             .build()
         _state.value = if (attempt == 0) SocketState.Connecting else SocketState.Reconnecting(attempt)
         socket = http.newWebSocket(request, listener)
