@@ -70,8 +70,15 @@ class NodeService : Service() {
         scope.launch {
             client?.stop()
             client = null
-            val settings = SettingsStore(applicationContext).current()
-            if (settings.gatewayUrl.isBlank() || settings.token.isBlank() || settings.deviceId.isBlank()) {
+            val store = SettingsStore(applicationContext)
+            val settings = store.current()
+            if (settings.gatewayUrl.isBlank() || settings.token.isBlank()) {
+                NodeRuntime.set(NodeStatus.Stopped)
+                stopSelf()
+                return@launch
+            }
+            val deviceId = store.ensureDeviceId()
+            if (deviceId.isBlank()) {
                 NodeRuntime.set(NodeStatus.Stopped)
                 stopSelf()
                 return@launch
@@ -96,7 +103,7 @@ class NodeService : Service() {
                 NodeClient.Config(
                     baseUrl = settings.gatewayUrl,
                     token = settings.token,
-                    nodeId = settings.deviceId,
+                    nodeId = deviceId,
                 ),
             )
         }

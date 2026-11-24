@@ -94,6 +94,10 @@ pub struct WsQuery {
     /// session is bound to an explicit agent (no default agent exists).
     #[serde(default, alias = "agentAlias", alias = "agent")]
     pub agent_alias: Option<String>,
+    /// Node id of the phone that opened this chat. When set, node tools are
+    /// scoped to that node so another connected phone cannot answer instead.
+    #[serde(default)]
+    pub node_id: Option<String>,
     /// Project root / working directory for this session.
     #[serde(default)]
     pub cwd: Option<String>,
@@ -146,6 +150,14 @@ pub async fn handle_ws_chat(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    let chat_node = headers
+        .get("x-zeroclaw-node-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| params.node_id.clone());
+
     // A scoped dashboard session chats through the core, as its own
     // principal, whenever this gateway runs inside the daemon: the core
     // applies the account's grants and keeps the conversation as its own.
@@ -260,6 +272,7 @@ pub async fn handle_ws_chat(
     let caller = SocketCaller {
         approval_subject: auth_subject,
         session: session_watch,
+        node_id: chat_node,
     };
     ws.on_upgrade(move |socket| {
         handle_socket(
@@ -587,6 +600,8 @@ struct SocketCaller {
     /// The dashboard session that opened the socket, if one did. The socket
     /// closes when the session stops admitting it.
     session: Option<crate::dashboard_session::SessionWatch>,
+    /// Node id of the phone that opened this chat, when the client sent one.
+    node_id: Option<String>,
 }
 
 async fn handle_socket(
@@ -601,6 +616,7 @@ async fn handle_socket(
     let SocketCaller {
         approval_subject: auth_subject,
         session: mut session_watch,
+        node_id,
     } = caller;
     let (mut sender, mut receiver) = socket.split();
     // An upgraded socket outlives the listener it arrived on, so a reload or
@@ -820,9 +836,12 @@ async fn handle_socket(
         state.config.clone(),
         state.agent_lifecycle.clone(),
     )
-    .with_tool_source(Arc::new(crate::node_tool::NodeToolSource::new(
-        state.node_registry.clone(),
-    )));
+    .with_tool_source(Arc::new(match node_id {
+        Some(node_id) => {
+            crate::node_tool::NodeToolSource::for_node(state.node_registry.clone(), node_id)
+        }
+        None => crate::node_tool::NodeToolSource::new(state.node_registry.clone()),
+    }));
     let mut agent =
         match zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
             state.config.clone(),

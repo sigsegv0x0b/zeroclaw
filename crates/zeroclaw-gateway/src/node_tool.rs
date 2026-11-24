@@ -103,11 +103,25 @@ fn sanitize_component(raw: &str) -> String {
 /// disconnected phone simply contributes no tools.
 pub struct NodeToolSource {
     registry: Arc<NodeRegistry>,
+    node_id: Option<String>,
 }
 
 impl NodeToolSource {
     pub fn new(registry: Arc<NodeRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            node_id: None,
+        }
+    }
+
+    /// Scope the tools to the node that originated the chat prompt. If that
+    /// node is disconnected the user gets no phone tools rather than another
+    /// connected node silently answering in its place.
+    pub fn for_node(registry: Arc<NodeRegistry>, node_id: String) -> Self {
+        Self {
+            registry,
+            node_id: Some(node_id),
+        }
     }
 
     /// Build one tool per connected capability. Split from [`ToolSource::tools`]
@@ -116,6 +130,11 @@ impl NodeToolSource {
         self.registry
             .all_capabilities()
             .into_iter()
+            .filter(|(node_id, _, _)| {
+                self.node_id
+                    .as_deref()
+                    .is_none_or(|wanted| wanted == node_id)
+            })
             .map(|(node_id, capability_name, capability)| {
                 Box::new(NodeTool::new(
                     node_id,
@@ -360,6 +379,37 @@ mod tests {
 
         let empty = NodeToolSource::new(Arc::new(NodeRegistry::new(10)));
         assert!(empty.collect().is_empty());
+    }
+
+    #[test]
+    fn node_tool_source_scopes_to_the_prompting_node() {
+        let registry = Arc::new(NodeRegistry::new(10));
+        for node_id in ["android-origin", "android-other"] {
+            let (invoke_tx, _invoke_rx) = tokio::sync::mpsc::channel(32);
+            registry.register(NodeInfo {
+                node_id: node_id.to_string(),
+                capabilities: vec![NodeCapability {
+                    name: "time.get".to_string(),
+                    description: "Read the phone clock".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                }],
+                invoke_tx,
+            });
+        }
+
+        let scoped = NodeToolSource::for_node(Arc::clone(&registry), "android-origin".to_string());
+        let tools = scoped.collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "node_android-origin__time_get");
+
+        // A scoped node that is no longer connected contributes no tools, so
+        // another phone cannot answer the prompt in its place.
+        let disconnected =
+            NodeToolSource::for_node(Arc::clone(&registry), "android-gone".to_string());
+        assert!(disconnected.collect().is_empty());
+
+        let all = NodeToolSource::new(Arc::clone(&registry));
+        assert_eq!(all.collect().len(), 2);
     }
 
     #[test]
