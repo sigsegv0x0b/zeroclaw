@@ -14500,6 +14500,10 @@ pub fn default_auto_approve() -> Vec<String> {
         "image_info".into(),
         "weather".into(),
         "tool_search".into(),
+        // `ask_user` only displays a question and waits for the operator's
+        // answer. A separate tool-approval prompt before the question is
+        // redundant and can strand the turn when the client disconnects.
+        "ask_user".into(),
         // `browser_open` only hands a URL to the system browser — no
         // scraping, no page interaction — so it stays auto-approved. The
         // full `browser` automation tool is deliberately absent: it drives a
@@ -36450,6 +36454,16 @@ auto_approve = ["my_custom_tool", "another_tool"]
     async fn default_auto_approve_includes_tool_search() {
         let defaults = default_auto_approve();
         assert!(defaults.contains(&"tool_search".to_string()));
+    }
+
+    #[test]
+    async fn default_auto_approve_includes_ask_user() {
+        let defaults = default_auto_approve();
+        assert!(
+            defaults.contains(&"ask_user".to_string()),
+            "ask_user only presents a question; gating it behind a tool approval \
+             hides the question behind another prompt"
+        );
     }
 
     /// Security guard: the full `browser` automation tool drives a real
