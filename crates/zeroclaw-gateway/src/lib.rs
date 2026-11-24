@@ -3225,7 +3225,9 @@ pub async fn run_gateway_with_plugin_webhooks(
             .enrollment
             .attach_runtime(tasks.clone(), shutdown_rx.clone());
         if config.gateway.mtls.as_ref().is_some_and(|mtls| mtls.enroll) {
-            Arc::clone(&prepared.state.enrollment).open(None).await?;
+            Arc::clone(&prepared.state.enrollment)
+                .open(None, None)
+                .await?;
         }
         spawn_gateway_mtls_listener(
             router,
@@ -6012,6 +6014,8 @@ fn admin_revocation_not_admitted(
 struct AdminEnrollOpenBody {
     #[serde(default)]
     timeout_secs: Option<u64>,
+    #[serde(default)]
+    port: Option<u16>,
 }
 
 /// POST /admin/enroll/open — bind the enrollment listener on demand.
@@ -6029,11 +6033,17 @@ async fn handle_admin_enroll_open(
             Json(serde_json::json!({"error": "[gateway.mtls] is not enabled"})),
         ));
     };
+    if body.port == Some(0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "enrollment port must be 1-65535"})),
+        ));
+    }
     let timeout = body
         .timeout_secs
         .map(|secs| Duration::from_secs(secs.clamp(1, 600)));
     let info = Arc::clone(&mtls.enrollment)
-        .open(timeout)
+        .open(timeout, body.port)
         .await
         .map_err(|error| {
             (
@@ -6044,6 +6054,7 @@ async fn handle_admin_enroll_open(
     Ok(Json(serde_json::json!({
         "success": true,
         "active": true,
+        "port": info.port,
         "auto_close": info.auto_close,
         "timeout_secs": info.expires_in_secs,
     })))
@@ -6084,9 +6095,11 @@ async fn handle_admin_enroll_status(
     let status = mtls.enrollment.status();
     Ok(Json(serde_json::json!({
         "success": true,
-        "active": status.is_some(),
-        "auto_close": status.map(|value| value.auto_close).unwrap_or(false),
-        "expires_in_secs": status.and_then(|value| value.expires_in_secs),
+        "active": status.active,
+        "port": status.port,
+        "auto_close": status.auto_close,
+        "expires_in_secs": status.expires_in_secs,
+        "last_close": status.last_close.map(|reason| reason.as_str()),
     })))
 }
 

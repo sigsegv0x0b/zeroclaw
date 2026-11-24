@@ -42,11 +42,34 @@ pub struct IssuedCert {
     pub revoked: bool,
 }
 
-/// What the operator asked the enrollment window to do.
+/// Why the last enrollment window closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollmentCloseReason {
+    Paired,
+    Timeout,
+    Closed,
+    Replaced,
+}
+
+impl EnrollmentCloseReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Paired => "paired",
+            Self::Timeout => "timeout",
+            Self::Closed => "closed",
+            Self::Replaced => "replaced",
+        }
+    }
+}
+
+/// State of the enrollment window.
 #[derive(Debug, Clone, Copy)]
 pub struct EnrollmentInfo {
+    pub active: bool,
+    pub port: u16,
     pub auto_close: bool,
     pub expires_in_secs: Option<u64>,
+    pub last_close: Option<EnrollmentCloseReason>,
 }
 
 #[derive(Clone)]
@@ -57,6 +80,7 @@ struct EnrollmentRuntime {
 
 struct EnrollmentWindow {
     id: u64,
+    port: u16,
     token: CancellationToken,
     expires_at: Option<Instant>,
     auto_close: bool,
@@ -73,6 +97,7 @@ pub struct EnrollmentControl {
     server_key_path: PathBuf,
     runtime: Mutex<Option<EnrollmentRuntime>>,
     window: Mutex<Option<EnrollmentWindow>>,
+    last_close: Mutex<Option<EnrollmentCloseReason>>,
     next_id: AtomicU64,
 }
 
@@ -92,6 +117,7 @@ impl EnrollmentControl {
             server_key_path,
             runtime: Mutex::new(None),
             window: Mutex::new(None),
+            last_close: Mutex::new(None),
             next_id: AtomicU64::new(0),
         }
     }
@@ -104,7 +130,12 @@ impl EnrollmentControl {
         *self.runtime.lock() = Some(EnrollmentRuntime { tasks, shutdown });
     }
 
-    pub async fn open(self: &Arc<Self>, timeout: Option<Duration>) -> Result<EnrollmentInfo> {
+    pub async fn open(
+        self: &Arc<Self>,
+        timeout: Option<Duration>,
+        port: Option<u16>,
+    ) -> Result<EnrollmentInfo> {
+        let port = port.unwrap_or(self.port);
         let runtime = {
             self.runtime
                 .lock()
@@ -117,13 +148,11 @@ impl EnrollmentControl {
             .context("mTLS state is no longer available")?;
 
         // Replacing a window must release its port first.
-        self.close();
+        self.close_reason(EnrollmentCloseReason::Replaced);
 
-        let listener = tokio::net::TcpListener::bind((self.bind.as_str(), self.port))
+        let listener = tokio::net::TcpListener::bind((self.bind.as_str(), port))
             .await
-            .with_context(|| {
-                format!("binding enrollment listener on {}:{}", self.bind, self.port)
-            })?;
+            .with_context(|| format!("binding enrollment listener on {}:{port}", self.bind))?;
         let acceptor = crate::mtls_enroll::build_enrollment_acceptor(
             &self.server_cert_path,
             &self.server_key_path,
@@ -141,38 +170,49 @@ impl EnrollmentControl {
 
         *self.window.lock() = Some(EnrollmentWindow {
             id,
+            port,
             token: token.clone(),
             expires_at: timeout.map(|duration| Instant::now() + duration),
             auto_close: timeout.is_some(),
         });
+        *self.last_close.lock() = None;
 
         if let Some(timeout) = timeout {
             let weak = Arc::downgrade(self);
             runtime.tasks.spawn(async move {
                 tokio::time::sleep(timeout).await;
                 if let Some(control) = weak.upgrade() {
-                    control.close_if(id);
+                    control.close_if(id, EnrollmentCloseReason::Timeout);
                 }
             });
         }
 
         Ok(EnrollmentInfo {
+            active: true,
+            port,
             auto_close: timeout.is_some(),
             expires_in_secs: timeout.map(|duration| duration.as_secs()),
+            last_close: None,
         })
     }
 
     pub fn close(&self) {
+        self.close_reason(EnrollmentCloseReason::Closed);
+    }
+
+    fn close_reason(&self, reason: EnrollmentCloseReason) {
         if let Some(window) = self.window.lock().take() {
             window.token.cancel();
         }
+        *self.last_close.lock() = Some(reason);
     }
 
-    fn close_if(&self, id: u64) {
+    fn close_if(&self, id: u64, reason: EnrollmentCloseReason) {
         let mut guard = self.window.lock();
         if guard.as_ref().is_some_and(|window| window.id == id) {
             if let Some(window) = guard.take() {
                 window.token.cancel();
+                *self.last_close.lock() = Some(reason);
             }
         }
     }
@@ -184,18 +224,31 @@ impl EnrollmentControl {
         if guard.as_ref().is_some_and(|window| window.auto_close) {
             if let Some(window) = guard.take() {
                 window.token.cancel();
+                *self.last_close.lock() = Some(EnrollmentCloseReason::Paired);
             }
         }
     }
 
-    pub fn status(&self) -> Option<EnrollmentInfo> {
+    pub fn status(&self) -> EnrollmentInfo {
         let guard = self.window.lock();
-        guard.as_ref().map(|window| EnrollmentInfo {
-            auto_close: window.auto_close,
-            expires_in_secs: window
-                .expires_at
-                .map(|deadline| deadline.saturating_duration_since(Instant::now()).as_secs()),
-        })
+        match guard.as_ref() {
+            Some(window) => EnrollmentInfo {
+                active: true,
+                port: window.port,
+                auto_close: window.auto_close,
+                expires_in_secs: window
+                    .expires_at
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now()).as_secs()),
+                last_close: None,
+            },
+            None => EnrollmentInfo {
+                active: false,
+                port: 0,
+                auto_close: false,
+                expires_in_secs: None,
+                last_close: *self.last_close.lock(),
+            },
+        }
     }
 }
 

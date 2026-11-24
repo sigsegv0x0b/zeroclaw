@@ -64,9 +64,10 @@ the pairing window:
    --pair-timeout 120`.
    It asks the running gateway to bind the enrollment port, then prints the
    pairing code, SAS, gateway id, mTLS/enrollment URLs, and a scannable QR
-   payload. The port closes when the timeout expires or after the first
-   successful enrollment. The timeout is capped at 600 seconds by the pairing
-   code lifetime.
+   payload. On a terminal it then shows a live countdown: the port closes when
+   the timeout expires, when the first enrollment succeeds, or immediately when
+   the operator presses `q`. The timeout is capped at 600 seconds by the pairing
+   code lifetime. The same status screen is shown with or without `--qr`.
 2. In the app's **Secure setup (mTLS)** section, scan the QR (or enter the
    host and pairing code).
 3. The app fetches `/enroll/ca` over provisional TLS, computes the SAS, and
@@ -78,6 +79,10 @@ the pairing window:
 
 The pairing code is single use. Enrollment and the bearer token come from the
 same exchange, so there is no second code to enter.
+
+`--enroll-port <port>` overrides the enrollment listener and the port advertised
+in the QR for that window. It requires `--pair-timeout`; without it the
+configured `gateway.mtls.enroll_port` is used.
 
 `--pair-timeout` requires `[gateway.mtls]` enabled and a running gateway on the
 same host, because it uses the localhost-only admin token to open the window.
