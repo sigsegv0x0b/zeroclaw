@@ -41,11 +41,13 @@ class NodeClient(
     private var closedByUser = true
     private var attempt = 0
     private var reconnectJob: Job? = null
+    private var endpointDisabled = false
 
     fun start(config: Config) {
         this.config = config
         closedByUser = false
         attempt = 0
+        endpointDisabled = false
         reconnectJob?.cancel()
         socket?.cancel()
         open()
@@ -66,7 +68,7 @@ class NodeClient(
             .url("${webSocketUrl(cfg.baseUrl)}/ws/nodes")
             .header("Sec-WebSocket-Protocol", "zeroclaw.nodes.v1, bearer.${cfg.token}")
             .build()
-        onStatus(NodeStatus.Connecting)
+        if (!endpointDisabled) onStatus(NodeStatus.Connecting)
         socket = http.newWebSocket(request, listener)
     }
 
@@ -75,6 +77,7 @@ class NodeClient(
             if (webSocket !== socket) return
             val cfg = config ?: return
             attempt = 0
+            endpointDisabled = false
             val frame = RegisterFrame(
                 nodeId = cfg.nodeId,
                 capabilities = DeviceCapabilities.definitions,
@@ -108,7 +111,18 @@ class NodeClient(
             if (webSocket !== socket) return
             socket = null
             if (closedByUser) return
-            onStatus(NodeStatus.Error(t.message ?: "Device link failed"))
+            val message = t.message.orEmpty()
+            if (isNodeEndpointMissing(response?.code, message)) {
+                endpointDisabled = true
+                onStatus(
+                    NodeStatus.Disabled(
+                        "The gateway's phone-tools endpoint is disabled.",
+                    ),
+                )
+            } else {
+                endpointDisabled = false
+                onStatus(NodeStatus.Error(message.ifBlank { "Device link failed" }))
+            }
             scheduleReconnect()
         }
     }
@@ -149,3 +163,13 @@ class NodeClient(
 
 private fun JsonObject.str(key: String): String? =
     (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
+
+/**
+ * A disabled `/ws/nodes` route answers the WebSocket upgrade with 404 (or 501
+ * on a proxy). OkHttp may surface only the message, so check both.
+ */
+internal fun isNodeEndpointMissing(responseCode: Int?, message: String?): Boolean {
+    if (responseCode == 404 || responseCode == 501) return true
+    val text = message.orEmpty()
+    return text.contains("was '404") || text.contains("was '501")
+}

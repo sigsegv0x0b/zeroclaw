@@ -38,11 +38,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import ai.zeroclaw.app.data.AppViewModel
 import ai.zeroclaw.app.data.ApprovalPrompt
 import ai.zeroclaw.app.data.ChatMessage
+import ai.zeroclaw.app.data.NodeStatus
 import ai.zeroclaw.app.data.UiState
 import ai.zeroclaw.app.ui.theme.Zc
 
@@ -69,6 +71,9 @@ fun ChatScreen(
         }
         state.notice?.let { message ->
             NoticeBar(text = message, onDismiss = viewModel::dismissNotice)
+        }
+        if (state.nodeEnabled && state.nodeStatus is NodeStatus.Disabled) {
+            NodeEndpointWarning()
         }
 
         Box(Modifier.weight(1f)) {
@@ -101,6 +106,41 @@ fun ChatScreen(
             onApprove = { viewModel.answerApproval(true) },
             onAlways = { viewModel.answerApproval(true, always = true) },
             onDeny = { viewModel.answerApproval(false) },
+        )
+    }
+}
+
+@Composable
+private fun NodeEndpointWarning() {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 6.dp)
+            .background(Zc.Warning.copy(alpha = 0.12f), RoundedCornerShape(10.dp))
+            .padding(12.dp),
+    ) {
+        Text(
+            text = "Phone tools are unavailable",
+            style = MaterialTheme.typography.labelLarge,
+            color = Zc.Warning,
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = "The gateway's node endpoint is disabled, so the agent cannot use " +
+                "this phone's alarms, timers, location, files, or other capabilities.",
+            style = MaterialTheme.typography.bodySmall,
+            color = Zc.TextMuted,
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = "zeroclaw config set nodes.enabled true",
+            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            color = Zc.Text,
+        )
+        Text(
+            text = "Run that on the gateway, restart it, and this link will retry automatically.",
+            style = MaterialTheme.typography.labelSmall,
+            color = Zc.TextSubtle,
         )
     }
 }
