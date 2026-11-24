@@ -156,17 +156,10 @@ fun MessageItem(message: ChatMessage) {
         ) {
             val thinking = message.thinking
             if (!thinking.isNullOrBlank()) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    ThinkingDots()
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        text = thinking,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Zc.TextSubtle,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
+                ThinkingBlock(
+                    text = thinking,
+                    streaming = message.streaming && message.text.isBlank(),
+                )
                 Spacer(Modifier.height(6.dp))
             }
 
@@ -189,7 +182,9 @@ fun MessageItem(message: ChatMessage) {
                 }
             }
 
-            if (message.streaming && message.text.isBlank() && message.tools.isEmpty()) {
+            if (message.streaming && message.text.isBlank() && message.tools.isEmpty() &&
+                thinking.isNullOrBlank()
+            ) {
                 ThinkingDots()
             }
 
@@ -197,6 +192,55 @@ fun MessageItem(message: ChatMessage) {
                 Spacer(Modifier.height(8.dp))
                 ToolCallRow(card)
             }
+        }
+    }
+}
+
+/** Collapsible reasoning text: two lines by default, full scrollable text when open. */
+@Composable
+private fun ThinkingBlock(text: String, streaming: Boolean) {
+    var expanded by remember { mutableStateOf(false) }
+    Surface(
+        color = Zc.Surface,
+        shape = RoundedCornerShape(10.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Zc.Border),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { expanded = !expanded },
+    ) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (streaming) {
+                    ThinkingDots()
+                    Spacer(Modifier.width(8.dp))
+                }
+                Text(
+                    text = "Thinking",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Zc.TextSubtle,
+                )
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = if (expanded) "Hide" else "Show",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Zc.Accent,
+                )
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = text,
+                style = MaterialTheme.typography.bodySmall,
+                color = Zc.TextMuted,
+                maxLines = if (expanded) Int.MAX_VALUE else 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = if (expanded) {
+                    Modifier
+                        .heightIn(max = 240.dp)
+                        .verticalScroll(rememberScrollState())
+                } else {
+                    Modifier
+                },
+            )
         }
     }
 }
@@ -222,9 +266,46 @@ private fun ThinkingDots() {
     }
 }
 
+internal data class ToolDisplay(
+    val name: String,
+    val label: String,
+    val isNode: Boolean,
+)
+
+/** Gateway node tools are `node_<node_id>__<capability>`; everything else runs on the gateway. */
+internal fun toolDisplay(name: String): ToolDisplay {
+    if (name.startsWith("node_")) {
+        val separator = name.indexOf("__")
+        if (separator > "node_".length) {
+            return ToolDisplay(
+                name = name.substring(separator + 2).ifBlank { name },
+                label = "phone",
+                isNode = true,
+            )
+        }
+    }
+    return ToolDisplay(name = name, label = "server", isNode = false)
+}
+
+@Composable
+internal fun ToolOriginBadge(display: ToolDisplay) {
+    Surface(
+        color = if (display.isNode) Zc.AccentSoft else Zc.SurfacePressed,
+        shape = RoundedCornerShape(5.dp),
+    ) {
+        Text(
+            text = display.label,
+            style = MaterialTheme.typography.labelSmall,
+            color = if (display.isNode) Zc.Accent else Zc.TextSubtle,
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
+        )
+    }
+}
+
 @Composable
 fun ToolCallRow(card: ToolCallCard) {
     var expanded by remember(card.id) { mutableStateOf(false) }
+    val display = remember(card.name) { toolDisplay(card.name) }
     Surface(
         color = Zc.SurfaceRaised,
         shape = RoundedCornerShape(10.dp),
@@ -242,11 +323,16 @@ fun ToolCallRow(card: ToolCallCard) {
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    text = card.name,
+                    text = display.name,
                     style = MaterialTheme.typography.labelMedium.copy(fontFamily = MonoFamily),
                     color = Zc.Accent,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
                 )
-                Spacer(Modifier.weight(1f))
+                Spacer(Modifier.width(6.dp))
+                ToolOriginBadge(display)
+                Spacer(Modifier.width(8.dp))
                 Text(
                     text = when {
                         card.finished -> "done"
@@ -255,30 +341,58 @@ fun ToolCallRow(card: ToolCallCard) {
                     style = MaterialTheme.typography.labelSmall,
                     color = if (card.finished) Zc.TextSubtle else Zc.Warning,
                 )
-            }
-            val detail = when {
-                expanded -> card.output ?: card.args
-                card.args != null -> card.args
-                else -> null
-            }
-            if (!detail.isNullOrBlank()) {
-                Spacer(Modifier.height(6.dp))
+                Spacer(Modifier.width(8.dp))
                 Text(
-                    text = detail,
-                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = MonoFamily),
-                    color = Zc.TextMuted,
-                    maxLines = if (expanded) Int.MAX_VALUE else 3,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = if (expanded) {
-                        Modifier
-                            .heightIn(max = 280.dp)
-                            .verticalScroll(rememberScrollState())
-                    } else {
-                        Modifier
+                    text = if (expanded) "Hide" else "Show",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Zc.Accent,
+                )
+            }
+            if (expanded) {
+                Spacer(Modifier.height(10.dp))
+                ToolDetailSection(
+                    label = "Parameters",
+                    text = card.args?.ifBlank { "{}" } ?: "{}",
+                    maxHeight = 160,
+                )
+                Spacer(Modifier.height(8.dp))
+                ToolDetailSection(
+                    label = "Result",
+                    text = when {
+                        !card.output.isNullOrBlank() -> card.output
+                        card.finished -> "(no output)"
+                        else -> "Running…"
                     },
+                    maxHeight = 240,
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun ToolDetailSection(label: String, text: String, maxHeight: Int) {
+    Text(
+        text = label.uppercase(),
+        style = MaterialTheme.typography.labelSmall,
+        color = Zc.TextSubtle,
+        modifier = Modifier.padding(horizontal = 2.dp),
+    )
+    Spacer(Modifier.height(4.dp))
+    Surface(
+        color = Zc.CodeBg,
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodySmall.copy(fontFamily = MonoFamily),
+            color = Zc.TextMuted,
+            modifier = Modifier
+                .heightIn(max = maxHeight.dp)
+                .verticalScroll(rememberScrollState())
+                .padding(8.dp),
+        )
     }
 }
 

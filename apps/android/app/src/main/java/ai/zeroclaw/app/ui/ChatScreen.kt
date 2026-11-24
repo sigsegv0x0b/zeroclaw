@@ -260,11 +260,27 @@ private fun ApprovalDialog(
             )
         },
         text = {
+            val display = remember(prompt.tool) { toolDisplay(prompt.tool) }
             Column {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "ZeroClaw wants to run ${display.name}.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Zc.Text,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    ToolOriginBadge(display)
+                }
+                Spacer(Modifier.height(4.dp))
                 Text(
-                    text = "ZeroClaw wants to run ${prompt.tool}.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Zc.Text,
+                    text = if (display.isNode) {
+                        "This action runs on your phone."
+                    } else {
+                        "This action runs on the gateway."
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Zc.TextSubtle,
                 )
                 if (prompt.argumentsSummary.isNotBlank()) {
                     Spacer(Modifier.height(10.dp))

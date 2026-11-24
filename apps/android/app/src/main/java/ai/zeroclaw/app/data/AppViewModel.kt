@@ -865,7 +865,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun handleEvent(event: ChatEvent) {
         when (event) {
             is ChatEvent.Chunk -> appendToAssistant(event.content)
-            is ChatEvent.Thinking -> updateAssistant { it.copy(thinking = event.content) }
+            is ChatEvent.Thinking -> appendThinking(event.content)
             is ChatEvent.ToolCall -> addToolCall(event)
             is ChatEvent.ToolResult -> completeToolCall(event)
             is ChatEvent.Done -> {
@@ -922,13 +922,35 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 messages[index] = message.copy(
                     text = message.text + chunk,
                     streaming = true,
-                    thinking = null,
                 )
             } else {
                 messages += ChatMessage(
                     id = newId(),
                     role = MessageRole.Assistant,
                     text = chunk,
+                    streaming = true,
+                )
+            }
+            state.copy(messages = messages, busy = true)
+        }
+    }
+
+    private fun appendThinking(chunk: String) {
+        if (chunk.isEmpty()) return
+        _ui.update { state ->
+            val messages = state.messages.toMutableList()
+            val index = messages.indexOfLast { it.role == MessageRole.Assistant }
+            if (index >= 0) {
+                val message = messages[index]
+                messages[index] = message.copy(
+                    thinking = (message.thinking ?: "") + chunk,
+                    streaming = true,
+                )
+            } else {
+                messages += ChatMessage(
+                    id = newId(),
+                    role = MessageRole.Assistant,
+                    thinking = chunk,
                     streaming = true,
                 )
             }
