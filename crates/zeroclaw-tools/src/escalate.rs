@@ -363,7 +363,7 @@ impl Tool for EscalateToHumanTool {
                 output: ToolOutput::default(),
                 error: Some(format!(
                     "Channel '{channel_name}' cannot receive a free-form reply, \
-                     so `wait_for_response` is unsupported (awaits ACP elicitation Phase 2). \
+                     so `wait_for_response` is unsupported. \
                      Retry with `wait_for_response: false`."
                 )),
             });

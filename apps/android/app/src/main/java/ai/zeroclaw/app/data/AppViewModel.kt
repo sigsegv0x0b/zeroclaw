@@ -16,6 +16,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 
 /** A press shorter than this is a tap: let silence detection finish the turn. */
@@ -48,7 +49,7 @@ data class UiState(
     val socket: SocketState = SocketState.Idle,
     val busy: Boolean = false,
     val approval: ApprovalPrompt? = null,
-    val choice: ChoicePrompt? = null,
+    val elicitation: ElicitationPrompt? = null,
     val error: String? = null,
     val notice: String? = null,
     val insecurePrompt: InsecureConnectionPrompt? = null,
@@ -936,7 +937,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 messages = emptyList(),
                 busy = false,
                 approval = null,
-                choice = null,
+                elicitation = null,
                 error = null,
                 drawerOpen = false,
             )
@@ -1020,20 +1021,31 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update { it.copy(approval = null) }
     }
 
-    fun answerChoice(selected: List<String>, freeForm: String?) {
-        val prompt = _ui.value.choice ?: return
-        socket.sendChoice(
-            requestId = prompt.requestId,
-            selected = selected,
-            freeForm = freeForm?.trim()?.takeIf { it.isNotEmpty() },
-        )
-        _ui.update { it.copy(choice = null) }
+    fun answerElicitation(selected: List<String>, freeForm: String?) {
+        val prompt = _ui.value.elicitation ?: return
+        val typed = freeForm?.trim()?.takeIf { it.isNotEmpty() }
+        val content = buildJsonObject {
+            if (prompt.choiceProperty != null && selected.isNotEmpty()) {
+                if (prompt.multiSelect) {
+                    put("choices", buildJsonArray { selected.forEach { add(JsonPrimitive(it)) } })
+                } else if (typed == null) {
+                    // For a single choice the typed answer overrides the
+                    // selection, so send only one of them.
+                    put("choice", JsonPrimitive(selected.first()))
+                }
+            }
+            if (prompt.freeFormProperty != null && typed != null) {
+                put(prompt.freeFormProperty, JsonPrimitive(typed))
+            }
+        }
+        socket.sendElicitation(prompt.requestId, "accept", content)
+        _ui.update { it.copy(elicitation = null) }
     }
 
-    fun cancelChoice() {
-        val prompt = _ui.value.choice ?: return
-        socket.sendChoice(prompt.requestId, emptyList(), null, cancelled = true)
-        _ui.update { it.copy(choice = null) }
+    fun cancelElicitation() {
+        val prompt = _ui.value.elicitation ?: return
+        socket.sendElicitation(prompt.requestId, "cancel")
+        _ui.update { it.copy(elicitation = null) }
     }
 
     // ── Socket events ──────────────────────────────────────────────────────
@@ -1053,17 +1065,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             message.copy(streaming = false)
                         }
                     }
-                    state.copy(messages = messages, busy = false, choice = null)
+                    state.copy(messages = messages, busy = false, elicitation = null)
                 }
                 viewModelScope.launch { reloadSessions() }
             }
             is ChatEvent.Failure -> {
                 finishAssistant(event.message, isError = true)
-                _ui.update { it.copy(choice = null) }
+                _ui.update { it.copy(elicitation = null) }
             }
             ChatEvent.Aborted -> {
                 updateAssistant { it.copy(streaming = false) }
-                _ui.update { it.copy(busy = false, notice = "Turn stopped.", choice = null) }
+                _ui.update { it.copy(busy = false, notice = "Turn stopped.", elicitation = null) }
             }
             is ChatEvent.ApprovalRequest -> _ui.update {
                 it.copy(
@@ -1075,17 +1087,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     ),
                 )
             }
-            is ChatEvent.ChoiceRequest -> _ui.update {
-                it.copy(
-                    choice = ChoicePrompt(
-                        requestId = event.requestId,
-                        question = event.question,
-                        choices = event.choices,
-                        multiSelect = event.multiSelect,
-                        allowFreeForm = event.allowFreeForm,
-                        timeoutSecs = event.timeoutSecs,
-                    ),
-                )
+            is ChatEvent.ElicitationRequest -> _ui.update {
+                it.copy(elicitation = event.prompt)
             }
             is ChatEvent.HistoryTrimmed -> _ui.update {
                 it.copy(notice = "Older context was trimmed to fit the model window.")

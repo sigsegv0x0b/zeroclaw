@@ -605,6 +605,10 @@ impl Channel for PacedChannel {
             .await
     }
 
+    async fn request_free_form(&self, question: &str, timeout: Duration) -> Result<Option<String>> {
+        self.inner.request_free_form(question, timeout).await
+    }
+
     fn supports_free_form_ask(&self) -> bool {
         self.inner.supports_free_form_ask()
     }

@@ -1,7 +1,7 @@
 //! ACP elicitation primitives.
 //!
-//! Implements the subset of the ACP `elicitation/create` RFD that
-//! ZeroClaw uses for multiple-choice prompts. See the ACP elicitation
+//! Implements the form-mode subset of ACP `elicitation/create` that
+//! ZeroClaw uses for choice and free-form prompts. See the ACP elicitation
 //! RFD: <https://agentclientprotocol.com/rfds/elicitation>
 //! for the design rationale.
 
@@ -50,9 +50,9 @@ impl ElicitationCapabilities {
 
 /// Elicitation transport mode.
 ///
-/// Phase 1 callers only ever emit `Form`. `Url` is defined so the wire
-/// types are complete and so a stray future caller compiles, but the
-/// send-site in `AcpChannel` asserts the mode is `Form`.
+/// In-tree callers only emit `Form`. `Url` is defined so the wire types are
+/// complete and so a stray future caller compiles, but the send-site in
+/// `AcpChannel` asserts the mode is `Form`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ElicitationMode {
@@ -62,8 +62,8 @@ pub enum ElicitationMode {
 
 /// Params for an outbound `elicitation/create` JSON-RPC request.
 ///
-/// Only the session-scoped variant is modeled — Phase 1 has no
-/// caller for request-scoped elicitation (auth/config phase).
+/// Only the session-scoped variant is modeled; no in-tree caller uses
+/// request-scoped elicitation (auth/config phase).
 #[derive(Debug, Clone, Serialize)]
 pub struct ElicitationRequest {
     #[serde(rename = "sessionId")]
@@ -77,9 +77,8 @@ pub struct ElicitationRequest {
 /// Response to an `elicitation/create` request.
 ///
 /// Three-action model per the RFD. `Decline` and `Cancel` both
-/// collapse to `Ok(None)` at the `Channel::request_choice` layer
-/// in Phase 1 — see the design spec's "Open Questions" for the
-/// rationale on deferring the distinction.
+/// collapse to `Ok(None)` at the `Channel::request_choice` layer;
+/// callers that need the distinction can read the response directly.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "lowercase")]
 pub enum ElicitationResponse {
@@ -100,8 +99,8 @@ pub enum ElicitationResponse {
 /// Property names we refuse to put into a form-mode elicitation schema.
 ///
 /// Per the ACP RFD and MCP's parent spec, form-mode elicitation MUST NOT
-/// be used for sensitive data (credentials, API keys, etc.). All Phase 1
-/// in-tree callers ship a fixed `"choice"` / `"choices"` property name,
+/// be used for sensitive data (credentials, API keys, etc.). All in-tree
+/// callers ship a fixed `"choice"` / `"choices"` property name,
 /// so a match against this list is a contract violation by an in-tree
 /// caller, not user-controlled input. We `debug_assert!` rather than
 /// `bail!` so production builds aren't degraded by a string scan.
@@ -118,6 +117,140 @@ pub const SENSITIVE_PROPERTY_NAMES: &[&str] = &[
     "private_key",
     "privateKey",
 ];
+
+/// Property used by the "select an option or type your own" form.
+pub const CUSTOM_CHOICE_PROPERTY: &str = "custom";
+
+/// Property used by free-form-only elicitation.
+pub const FREE_FORM_PROPERTY: &str = "answer";
+
+/// Build the restricted schema for a single-select question that also accepts
+/// a typed answer. The choice and `custom` properties are both optional; the
+/// receiver requires at least one to be present in an accepted response.
+pub fn single_select_or_custom_schema(choices: &[String]) -> Value {
+    let mut schema = single_select_schema(choices);
+    add_optional_custom_property(&mut schema, CUSTOM_CHOICE_PROPERTY, "Type your own");
+    schema
+}
+
+/// Build the restricted schema for a multi-select question that also accepts
+/// a typed answer. Unlike [`multi_select_schema`], the array is optional and
+/// may be empty because `custom` can satisfy the question alone.
+pub fn multi_select_or_custom_schema(choices: &[String], max_items: usize) -> Value {
+    let mut schema =
+        multi_select_schema_with_property_name("choices", choices, 0, max_items.max(1));
+    add_optional_custom_property(&mut schema, CUSTOM_CHOICE_PROPERTY, "Type your own");
+    schema
+}
+
+/// Build the restricted schema for a free-form answer. Used when `ask_user`
+/// is called without `choices` on a transport that only has form-mode
+/// elicitation (gateway WebSocket, ACP form clients).
+pub fn free_form_schema(property: &str, title: &str) -> Value {
+    debug_assert!(
+        !SENSITIVE_PROPERTY_NAMES.contains(&property),
+        "sensitive property name '{property}' in form-mode elicitation schema"
+    );
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            property: {
+                "type": "string",
+                "title": title,
+                "minLength": 1,
+            }
+        },
+        "required": [property],
+    })
+}
+
+fn add_optional_custom_property(schema: &mut Value, property: &str, title: &str) {
+    debug_assert!(
+        !SENSITIVE_PROPERTY_NAMES.contains(&property),
+        "sensitive property name '{property}' in form-mode elicitation schema"
+    );
+    if let Some(object) = schema.as_object_mut() {
+        // The choice is no longer mandatory: `custom` can answer instead.
+        object.remove("required");
+        if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+            properties.insert(
+                property.to_string(),
+                serde_json::json!({ "type": "string", "title": title }),
+            );
+        }
+    }
+}
+
+/// Decode a single-select-or-custom `accept` payload. A non-empty `custom`
+/// answer overrides the selected choice, matching the app's "Other" field.
+pub fn decode_single_select_or_custom_accept(
+    content: &Value,
+    choices: &[String],
+) -> anyhow::Result<String> {
+    if let Some(text) = custom_answer(content) {
+        return Ok(text);
+    }
+    decode_single_select_accept(content, choices)
+}
+
+/// Decode a multi-select-or-custom `accept` payload. Selected indices are
+/// validated against `choices`; a typed answer is appended when present.
+pub fn decode_multi_select_or_custom_accept(
+    content: &Value,
+    choices: &[String],
+    min_items: usize,
+    max_items: usize,
+) -> anyhow::Result<Vec<String>> {
+    let mut answers = match content.get("choices") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(_)) => decode_multi_select_accept(content, choices)?,
+        Some(_) => anyhow::bail!("elicitation accept content.choices must be an array"),
+    };
+    if let Some(text) = custom_answer(content)
+        && !answers.iter().any(|answer| answer == &text)
+    {
+        answers.push(text);
+    }
+    let min_items = min_items.max(1);
+    if answers.len() < min_items {
+        anyhow::bail!(
+            "elicitation accept returned {} choice(s); at least {min_items} required",
+            answers.len()
+        );
+    }
+    if answers.len() > max_items.max(1) {
+        anyhow::bail!(
+            "elicitation accept returned {} choice(s); at most {} allowed",
+            answers.len(),
+            max_items.max(1)
+        );
+    }
+    Ok(answers)
+}
+
+/// Decode a free-form `accept` payload for `property`.
+pub fn decode_free_form_accept(content: &Value, property: &str) -> anyhow::Result<String> {
+    content
+        .get(property)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "elicitation accept missing non-empty content.{property} string"
+            ))
+        })
+}
+
+fn custom_answer(content: &Value) -> Option<String> {
+    content
+        .get(CUSTOM_CHOICE_PROPERTY)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
 
 /// Build the restricted JSON Schema for a single-select enum elicitation.
 ///
@@ -450,5 +583,67 @@ mod tests {
         let content = json!({ "choices": ["choice-99"] });
         let choices = vec!["A".to_string()];
         assert!(decode_multi_select_accept(&content, &choices).is_err());
+    }
+
+    #[test]
+    fn select_or_custom_schemas_are_not_required() {
+        let single = single_select_or_custom_schema(&["A".to_string(), "B".to_string()]);
+        assert!(single.get("required").is_none());
+        assert_eq!(single["properties"]["custom"]["type"], "string");
+        assert_eq!(
+            single["properties"]["choice"]["oneOf"][1]["const"],
+            "choice-1"
+        );
+
+        let multi = multi_select_or_custom_schema(&["A".to_string(), "B".to_string()], 3);
+        assert!(multi.get("required").is_none());
+        assert_eq!(multi["properties"]["choices"]["minItems"], 0);
+        assert_eq!(multi["properties"]["choices"]["maxItems"], 3);
+        assert_eq!(multi["properties"]["custom"]["type"], "string");
+    }
+
+    #[test]
+    fn decode_single_select_or_custom_prefers_typed_answer() {
+        let choices = vec!["A".to_string(), "B".to_string()];
+        let content = json!({ "choice": "choice-0", "custom": "  Typed  " });
+        assert_eq!(
+            decode_single_select_or_custom_accept(&content, &choices).unwrap(),
+            "Typed"
+        );
+        let selected = json!({ "choice": "choice-1" });
+        assert_eq!(
+            decode_single_select_or_custom_accept(&selected, &choices).unwrap(),
+            "B"
+        );
+    }
+
+    #[test]
+    fn decode_multi_select_or_custom_appends_typed_answer() {
+        let choices = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let content = json!({ "choices": ["choice-0", "choice-2"], "custom": "D" });
+        let answers = decode_multi_select_or_custom_accept(&content, &choices, 1, 4).unwrap();
+        assert_eq!(answers, ["A", "C", "D"]);
+
+        let custom_only = json!({ "custom": "D" });
+        let answers = decode_multi_select_or_custom_accept(&custom_only, &choices, 1, 4).unwrap();
+        assert_eq!(answers, ["D"]);
+
+        let empty = json!({});
+        assert!(
+            decode_multi_select_or_custom_accept(&empty, &choices, 1, 4).is_err(),
+            "an accept with no choices and no typed answer must be rejected"
+        );
+    }
+
+    #[test]
+    fn free_form_schema_and_decoder_round_trip() {
+        let schema = free_form_schema(FREE_FORM_PROPERTY, "Your answer");
+        assert_eq!(schema["required"], json!([FREE_FORM_PROPERTY]));
+        assert_eq!(schema["properties"][FREE_FORM_PROPERTY]["type"], "string");
+        assert_eq!(
+            decode_free_form_accept(&json!({ "answer": "  hello  " }), FREE_FORM_PROPERTY).unwrap(),
+            "hello"
+        );
+        assert!(decode_free_form_accept(&json!({}), FREE_FORM_PROPERTY).is_err());
     }
 }

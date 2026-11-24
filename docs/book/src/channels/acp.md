@@ -210,7 +210,7 @@ Response shape:
 
 If the client never replies (crash, network drop, user closes IDE), the request times out after `sessionTimeoutSecs` and the tool call is denied.
 
-`ask_user` uses the same `session/request_permission` mechanism, mapping the question's `choices` to permission options. Free-form (no-choices) `ask_user` is not supported until the [ACP elicitation RFD](https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx) lands. Calling `ask_user` without `choices` on an ACP session fast-fails with a clear error.
+`ask_user` uses `elicitation/create` form mode when the client advertises `clientCapabilities.elicitation.form`. Choices map to the restricted enum schema; free-form questions use a single string `answer` field. Clients that only support the older `session/request_permission` shape still get single-choice questions through that fallback. Multi-select and free-form questions fast-fail on clients without form support.
 
 ### `session/cancel` _(ZeroClaw extension)_
 

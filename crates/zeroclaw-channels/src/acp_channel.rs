@@ -1,7 +1,7 @@
 //! ACP (Agent Client Protocol) back-channel.
 
 use async_trait::async_trait;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{
@@ -9,7 +9,8 @@ use zeroclaw_api::channel::{
 };
 use zeroclaw_api::elicitation::{
     ElicitationCapabilities, ElicitationMode, ElicitationRequest, ElicitationResponse,
-    multi_select_schema, single_select_schema,
+    FREE_FORM_PROPERTY, decode_free_form_accept, free_form_schema, multi_select_schema,
+    single_select_schema,
 };
 use zeroclaw_runtime::i18n;
 
@@ -44,6 +45,44 @@ impl AcpChannel {
             approval_timeout,
             client_caps,
         }
+    }
+
+    /// Send one form-mode `elicitation/create` and parse the ACP response.
+    /// Returns `Ok(None)` when the client did not advertise `elicitation.form`;
+    /// callers then use their non-form fallback.
+    async fn request_elicitation_form(
+        &self,
+        question: &str,
+        requested_schema: Value,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<ElicitationResponse>> {
+        if !self.client_caps.form {
+            return Ok(None);
+        }
+        let req = ElicitationRequest {
+            session_id: self.session_id.clone(),
+            mode: ElicitationMode::Form,
+            message: question.to_string(),
+            requested_schema,
+        };
+        debug_assert!(
+            matches!(req.mode, ElicitationMode::Form),
+            "In-tree callers must not emit URL-mode elicitation"
+        );
+
+        let params = serde_json::to_value(&req)?;
+        let call = self.rpc.request("elicitation/create", params);
+        let response_value = match tokio::time::timeout(timeout, call).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(e)) => {
+                anyhow::bail!("ACP elicitation/create failed: {} ({})", e.message, e.code)
+            }
+            Err(_) => anyhow::bail!("ACP elicitation/create timed out after {timeout:?}"),
+        };
+
+        let parsed: ElicitationResponse = serde_json::from_value(response_value)
+            .map_err(|e| anyhow::Error::msg(format!("malformed elicitation response: {e}")))?;
+        Ok(Some(parsed))
     }
 
     /// Legacy multiple-choice path — overloads `session/request_permission`
@@ -131,30 +170,13 @@ impl AcpChannel {
         choices: &[String],
         timeout: Duration,
     ) -> anyhow::Result<Option<String>> {
-        let req = ElicitationRequest {
-            session_id: self.session_id.clone(),
-            mode: ElicitationMode::Form,
-            message: question.to_string(),
-            requested_schema: single_select_schema(choices),
+        let Some(response) = self
+            .request_elicitation_form(question, single_select_schema(choices), timeout)
+            .await?
+        else {
+            return Ok(None);
         };
-        debug_assert!(
-            matches!(req.mode, ElicitationMode::Form),
-            "Phase 1 must not emit URL-mode elicitation"
-        );
-
-        let params = serde_json::to_value(&req)?;
-        let call = self.rpc.request("elicitation/create", params);
-        let response_value = match tokio::time::timeout(timeout, call).await {
-            Ok(Ok(value)) => value,
-            Ok(Err(e)) => {
-                anyhow::bail!("ACP elicitation/create failed: {} ({})", e.message, e.code)
-            }
-            Err(_) => anyhow::bail!("ACP elicitation/create timed out after {timeout:?}"),
-        };
-
-        let parsed: ElicitationResponse = serde_json::from_value(response_value)
-            .map_err(|e| anyhow::Error::msg(format!("malformed elicitation response: {e}")))?;
-        match parsed {
+        match response {
             ElicitationResponse::Accept { content } => {
                 let text =
                     zeroclaw_api::elicitation::decode_single_select_accept(&content, choices)?;
@@ -306,7 +328,7 @@ impl Channel for AcpChannel {
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         anyhow::bail!(
-            "AcpChannel.listen is not supported (free-form ask_user awaits ACP elicitation Phase 2)"
+            "AcpChannel.listen is not supported; free-form ask_user uses elicitation/create"
         )
     }
 
@@ -375,33 +397,44 @@ impl Channel for AcpChannel {
             return Ok(None);
         }
 
-        let req = ElicitationRequest {
-            session_id: self.session_id.clone(),
-            mode: ElicitationMode::Form,
-            message: question.to_string(),
-            requested_schema: multi_select_schema(choices, min_items, max_items),
+        let Some(response) = self
+            .request_elicitation_form(
+                question,
+                multi_select_schema(choices, min_items, max_items),
+                timeout,
+            )
+            .await?
+        else {
+            return Ok(None);
         };
-        let params = serde_json::to_value(&req)?;
-        let call = self.rpc.request("elicitation/create", params);
-        let response_value = match tokio::time::timeout(timeout, call).await {
-            Ok(Ok(value)) => value,
-            Ok(Err(e)) => anyhow::bail!(
-                "ACP elicitation/create (multi) failed: {} ({})",
-                e.message,
-                e.code
-            ),
-            Err(_) => {
-                anyhow::bail!("ACP elicitation/create (multi) timed out after {timeout:?}")
-            }
-        };
-
-        let parsed: ElicitationResponse = serde_json::from_value(response_value)
-            .map_err(|e| anyhow::Error::msg(format!("malformed elicitation response: {e}")))?;
-        match parsed {
+        match response {
             ElicitationResponse::Accept { content } => {
                 let texts =
                     zeroclaw_api::elicitation::decode_multi_select_accept(&content, choices)?;
                 Ok(Some(texts))
+            }
+            ElicitationResponse::Decline | ElicitationResponse::Cancel => Ok(None),
+        }
+    }
+
+    async fn request_free_form(
+        &self,
+        question: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(response) = self
+            .request_elicitation_form(
+                question,
+                free_form_schema(FREE_FORM_PROPERTY, "Your answer"),
+                timeout,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        match response {
+            ElicitationResponse::Accept { content } => {
+                decode_free_form_accept(&content, FREE_FORM_PROPERTY).map(Some)
             }
             ElicitationResponse::Decline | ElicitationResponse::Cancel => Ok(None),
         }
@@ -807,6 +840,60 @@ mod tests {
 
         let result = task.await.unwrap().unwrap();
         assert_eq!(result, Some("Beta".to_string()));
+    }
+
+    #[tokio::test]
+    async fn request_free_form_uses_form_elicitation_when_capability_present() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            Arc::clone(&rpc),
+            Duration::from_secs(30),
+            form_caps(),
+        );
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_free_form("What name?", Duration::from_secs(5))
+                .await
+        });
+
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "elicitation/create");
+        assert_eq!(req["params"]["mode"], "form");
+        assert_eq!(req["params"]["message"], "What name?");
+        let schema = &req["params"]["requestedSchema"];
+        assert_eq!(schema["required"][0], "answer");
+        assert_eq!(schema["properties"]["answer"]["type"], "string");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc_for_resp.dispatch_response(
+            &id,
+            Some(json!({"action": "accept", "content": {"answer": "Zero"}})),
+            None,
+        );
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result, Some("Zero".to_string()));
+    }
+
+    #[tokio::test]
+    async fn request_free_form_without_form_capability_returns_none() {
+        let (rpc, _rx) = make_rpc();
+        let ch = AcpChannel::new(
+            "acp",
+            "sess-1",
+            rpc,
+            Duration::from_secs(30),
+            ElicitationCapabilities::default(),
+        );
+        let result = ch
+            .request_free_form("What name?", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(result, None);
     }
 
     #[tokio::test]

@@ -1495,9 +1495,10 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Default impl returns `None`.
     ///
     /// Free-form (no-choices) questions are not modeled by this method.
-    /// Multiple-choice support landed via ACP `elicitation/create` (see
+    /// Multiple-choice support uses ACP `elicitation/create` (see
     /// the ACP elicitation RFD: <https://agentclientprotocol.com/rfds/elicitation>);
-    /// free-form text is tracked under that spec's Phase 2.
+    /// channels that only expose form-mode elicitation implement
+    /// [`Channel::request_free_form`] instead of the `send` + `listen` flow.
     async fn request_choice(
         &self,
         _question: &str,
@@ -1518,10 +1519,22 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
+    /// Ask a free-form (no-choices) question on a channel that only has
+    /// structured form elicitation. Returns `Ok(None)` when this channel has
+    /// no form-mode surface; callers then fall back to `send` + `listen` when
+    /// [`Channel::supports_free_form_ask`] allows it, or fail.
+    async fn request_free_form(
+        &self,
+        _question: &str,
+        _timeout: std::time::Duration,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Whether this channel can answer free-form (no-choices) `ask_user`
     /// questions via the standard `send` + `listen` flow. Channels that only
-    /// handle structured choices return `false` so callers fail fast with a
-    /// useful error instead of timing out on `listen`.
+    /// expose form-mode elicitation return `false`; callers then use
+    /// [`Channel::request_free_form`] instead of timing out on `listen`.
     fn supports_free_form_ask(&self) -> bool {
         true
     }
