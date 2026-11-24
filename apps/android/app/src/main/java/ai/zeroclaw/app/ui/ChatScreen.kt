@@ -80,7 +80,7 @@ fun ChatScreen(
             if (state.messages.isEmpty()) {
                 EmptyChat(agent = state.agent)
             } else {
-                MessageList(state.messages)
+                MessageList(state.messages, state.deviceId)
             }
         }
 
@@ -106,6 +106,7 @@ fun ChatScreen(
             onApprove = { viewModel.answerApproval(true) },
             onAlways = { viewModel.answerApproval(true, always = true) },
             onDeny = { viewModel.answerApproval(false) },
+            localNodeId = state.deviceId,
         )
     }
 }
@@ -196,7 +197,7 @@ private fun ChatTopBar(
 }
 
 @Composable
-private fun MessageList(messages: List<ChatMessage>) {
+private fun MessageList(messages: List<ChatMessage>, localNodeId: String) {
     val listState = rememberLazyListState()
     val last = messages.lastOrNull()
 
@@ -213,7 +214,7 @@ private fun MessageList(messages: List<ChatMessage>) {
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         items(messages, key = { it.id }) { message ->
-            MessageItem(message)
+            MessageItem(message, localNodeId)
         }
     }
 }
@@ -246,6 +247,7 @@ private fun ApprovalDialog(
     onApprove: () -> Unit,
     onAlways: () -> Unit,
     onDeny: () -> Unit,
+    localNodeId: String,
 ) {
     AlertDialog(
         onDismissRequest = onDeny,
@@ -275,7 +277,11 @@ private fun ApprovalDialog(
                 Spacer(Modifier.height(4.dp))
                 Text(
                     text = if (display.isNode) {
-                        "This action runs on your phone."
+                        if (display.nodeId == localNodeId) {
+                            "This action runs on this phone."
+                        } else {
+                            "This action runs on another phone (${display.nodeId ?: "unknown"})."
+                        }
                     } else {
                         "This action runs on the gateway."
                     },

@@ -117,7 +117,7 @@ fun BrandMark(size: Int = 32) {
 
 
 @Composable
-fun MessageItem(message: ChatMessage) {
+fun MessageItem(message: ChatMessage, localNodeId: String) {
     when (message.role) {
         MessageRole.User -> Row(
             Modifier
@@ -190,7 +190,7 @@ fun MessageItem(message: ChatMessage) {
 
             message.tools.forEach { card ->
                 Spacer(Modifier.height(8.dp))
-                ToolCallRow(card)
+                ToolCallRow(card, localNodeId)
             }
         }
     }
@@ -270,6 +270,7 @@ internal data class ToolDisplay(
     val name: String,
     val label: String,
     val isNode: Boolean,
+    val nodeId: String? = null,
 )
 
 /** Gateway node tools are `node_<node_id>__<capability>`; everything else runs on the gateway. */
@@ -281,6 +282,7 @@ internal fun toolDisplay(name: String): ToolDisplay {
                 name = name.substring(separator + 2).ifBlank { name },
                 label = "phone",
                 isNode = true,
+                nodeId = name.substring("node_".length, separator),
             )
         }
     }
@@ -303,9 +305,12 @@ internal fun ToolOriginBadge(display: ToolDisplay) {
 }
 
 @Composable
-fun ToolCallRow(card: ToolCallCard) {
+fun ToolCallRow(card: ToolCallCard, localNodeId: String) {
     var expanded by remember(card.id) { mutableStateOf(false) }
     val display = remember(card.name) { toolDisplay(card.name) }
+    val nodeNote = display.nodeId?.let { node ->
+        if (node == localNodeId) "this phone" else "phone $node"
+    }
     Surface(
         color = Zc.SurfaceRaised,
         shape = RoundedCornerShape(10.dp),
@@ -346,6 +351,13 @@ fun ToolCallRow(card: ToolCallCard) {
                     text = if (expanded) "Hide" else "Show",
                     style = MaterialTheme.typography.labelSmall,
                     color = Zc.Accent,
+                )
+            }
+            if (nodeNote != null) {
+                Text(
+                    text = nodeNote,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (display.nodeId == localNodeId) Zc.Success else Zc.TextSubtle,
                 )
             }
             if (expanded) {
