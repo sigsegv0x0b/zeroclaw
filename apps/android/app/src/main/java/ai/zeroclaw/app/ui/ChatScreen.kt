@@ -218,7 +218,12 @@ private fun MessageList(messages: List<ChatMessage>, localNodeId: String) {
     val listState = rememberLazyListState()
     val last = messages.lastOrNull()
 
-    LaunchedEffect(messages.size, last?.text?.length, last?.tools?.size) {
+    LaunchedEffect(
+        messages.size,
+        last?.contentLength,
+        last?.contentBlocks?.size,
+        last?.toolCards?.count { it.finished },
+    ) {
         if (messages.isNotEmpty()) {
             listState.animateScrollToItem(messages.lastIndex)
         }

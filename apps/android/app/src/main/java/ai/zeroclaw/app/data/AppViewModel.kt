@@ -1102,10 +1102,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             is ChatEvent.Done -> {
                 _ui.update { state ->
                     val messages = state.messages.map { message ->
-                        if (message.streaming && message.text.isBlank() && !event.fullResponse.isNullOrBlank()) {
-                            message.copy(text = event.fullResponse, streaming = false)
+                        if (message.streaming) {
+                            message.finishStreaming(event.fullResponse)
                         } else {
-                            message.copy(streaming = false)
+                            message
                         }
                     }
                     state.copy(messages = messages, busy = false, elicitation = null)
@@ -1155,18 +1155,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val messages = state.messages.toMutableList()
             val index = messages.indexOfLast { it.role == MessageRole.Assistant }
             if (index >= 0) {
-                val message = messages[index]
-                messages[index] = message.copy(
-                    text = message.text + chunk,
-                    streaming = true,
-                )
+                messages[index] = messages[index].appendText(chunk)
             } else {
                 messages += ChatMessage(
                     id = newId(),
                     role = MessageRole.Assistant,
-                    text = chunk,
                     streaming = true,
-                )
+                ).appendText(chunk)
             }
             state.copy(messages = messages, busy = true)
         }
@@ -1178,18 +1173,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val messages = state.messages.toMutableList()
             val index = messages.indexOfLast { it.role == MessageRole.Assistant }
             if (index >= 0) {
-                val message = messages[index]
-                messages[index] = message.copy(
-                    thinking = (message.thinking ?: "") + chunk,
-                    streaming = true,
-                )
+                messages[index] = messages[index].appendThinking(chunk)
             } else {
                 messages += ChatMessage(
                     id = newId(),
                     role = MessageRole.Assistant,
-                    thinking = chunk,
                     streaming = true,
-                )
+                ).appendThinking(chunk)
             }
             state.copy(messages = messages, busy = true)
         }
@@ -1214,13 +1204,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 messages += ChatMessage(id = newId(), role = MessageRole.Assistant, streaming = true)
                 index = messages.lastIndex
             }
-            val message = messages[index]
             val card = ToolCallCard(
                 id = event.id ?: newId(),
                 name = event.name,
                 args = event.args?.shortJson(),
             )
-            messages[index] = message.copy(tools = message.tools + card)
+            messages[index] = messages[index].appendTool(card)
             state.copy(messages = messages, busy = true)
         }
     }
@@ -1228,17 +1217,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun completeToolCall(event: ChatEvent.ToolResult) {
         _ui.update { state ->
             val messages = state.messages.toMutableList()
-            val index = messages.indexOfLast { it.role == MessageRole.Assistant }
-            if (index < 0) return@update state
-            val message = messages[index]
-            val tools = message.tools.toMutableList()
-            val target = tools.indexOfLast { !it.finished && (event.name == null || it.name == event.name) }
-                .takeIf { it >= 0 }
-                ?: tools.indexOfLast { !it.finished }
-            if (target >= 0) {
-                tools[target] = tools[target].copy(output = event.output, finished = true)
+            for (index in messages.indices.reversed()) {
+                val updated = messages[index].completeTool(event.id, event.name, event.output)
+                if (updated != messages[index]) {
+                    messages[index] = updated
+                    break
+                }
             }
-            messages[index] = message.copy(tools = tools)
             state.copy(messages = messages)
         }
     }
@@ -1248,19 +1233,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val messages = state.messages.toMutableList()
             val index = messages.indexOfLast { it.role == MessageRole.Assistant }
             if (index >= 0) {
-                val message = messages[index]
-                messages[index] = message.copy(
-                    text = if (message.text.isBlank()) reason else message.text,
-                    streaming = false,
-                    isError = isError,
-                )
+                messages[index] = messages[index].finishWith(reason, isError)
             } else {
                 messages += ChatMessage(
                     id = newId(),
                     role = MessageRole.Assistant,
-                    text = reason,
-                    isError = isError,
-                )
+                    streaming = false,
+                ).finishWith(reason, isError)
             }
             state.copy(messages = messages, busy = false)
         }
