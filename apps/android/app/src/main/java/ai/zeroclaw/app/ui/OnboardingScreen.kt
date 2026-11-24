@@ -26,6 +26,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import com.google.zxing.client.android.Intents
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import androidx.compose.runtime.Composable
@@ -269,7 +270,12 @@ fun OnboardingScreen(
             OutlinedButton(
                 onClick = {
                     scanLauncher.launch(
-                        ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE),
+                        ScanOptions()
+                            .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                            // A terminal QR is light-on-dark in a dark theme.
+                            // Mixed mode alternates normal/inverted frames
+                            // instead of only decoding dark-on-light.
+                            .addExtra(Intents.Scan.SCAN_TYPE, Intents.Scan.MIXED_SCAN),
                     )
                 },
                 shape = RoundedCornerShape(12.dp),
