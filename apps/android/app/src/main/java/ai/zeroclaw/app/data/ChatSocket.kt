@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.OkHttpClient
@@ -84,6 +85,25 @@ class ChatSocket(
         val frame = zcJson.encodeToString(
             ApprovalFrame.serializer(),
             ApprovalFrame(requestId = requestId, decision = decision),
+        )
+        return ws.send(frame)
+    }
+
+    fun sendChoice(
+        requestId: String,
+        selected: List<String>,
+        freeForm: String?,
+        cancelled: Boolean = false,
+    ): Boolean {
+        val ws = socket ?: return false
+        val frame = zcJson.encodeToString(
+            ChoiceFrame.serializer(),
+            ChoiceFrame(
+                requestId = requestId,
+                selected = selected,
+                freeForm = freeForm,
+                cancelled = cancelled,
+            ),
         )
         return ws.send(frame)
     }
@@ -194,6 +214,14 @@ class ChatSocket(
                 argumentsSummary = root.str("arguments_summary").orEmpty(),
                 timeoutSecs = root.str("timeout_secs")?.toIntOrNull(),
             )
+            "choice_request" -> ChatEvent.ChoiceRequest(
+                requestId = root.str("request_id").orEmpty(),
+                question = root.str("question") ?: "Question",
+                choices = root.stringList("choices"),
+                multiSelect = root.bool("multi_select") ?: false,
+                allowFreeForm = root.bool("allow_free_form") ?: true,
+                timeoutSecs = root.str("timeout_secs")?.toIntOrNull(),
+            )
             "session_start" -> ChatEvent.SessionStart(
                 sessionId = root.str("session_id"),
                 resumed = root.str("resumed") == "true",
@@ -216,6 +244,14 @@ class ChatSocket(
         return value.content
     }
 
+    private fun JsonObject.bool(key: String): Boolean? =
+        (this[key] as? JsonPrimitive)?.content?.toBooleanStrictOrNull()
+
+    private fun JsonObject.stringList(key: String): List<String> =
+        (this[key] as? JsonArray)
+            ?.mapNotNull { (it as? JsonPrimitive)?.takeIf { primitive -> primitive.isString }?.content }
+            .orEmpty()
+
     private fun encode(value: String): String =
         java.net.URLEncoder.encode(value, "UTF-8").replace("+", "%20")
 
@@ -230,5 +266,14 @@ class ChatSocket(
         val type: String = "approval_response",
         @SerialName("request_id") val requestId: String,
         val decision: String,
+    )
+
+    @Serializable
+    private data class ChoiceFrame(
+        val type: String = "choice_response",
+        @SerialName("request_id") val requestId: String,
+        val selected: List<String> = emptyList(),
+        @SerialName("free_form") val freeForm: String? = null,
+        val cancelled: Boolean = false,
     )
 }
