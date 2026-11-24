@@ -96,6 +96,20 @@ async fn handle_enroll(
         }
     };
 
+    // Persist the bearer token before issuing material. Without this the token
+    // only lives in the pairing guard's memory and every enrolled device is
+    // unpaired by the next gateway restart.
+    if let Err(error) = state.persist_pairing_tokens().await {
+        state.pairing.revoke_token(&token);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("could not persist the pairing token: {error}")
+            })),
+        )
+            .into_response();
+    }
+
     let device_id = format!("dev-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     let issued = match zeroclaw_tls::sign_csr(
         &state.ca_cert_pem,

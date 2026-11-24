@@ -7,8 +7,10 @@
 //! their peer certificate fingerprint.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +24,10 @@ use zeroclaw_config::pairing::PairingGuard;
 /// Peer certificate fingerprint attached to requests served on the mTLS listener.
 #[derive(Clone, Debug)]
 pub struct PeerCertFingerprint(pub String);
+
+/// Persists the pairing-token set through the gateway's live-config authority.
+pub type PairingPersister =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 
 /// One client certificate issued by the gateway mTLS CA.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +52,7 @@ pub struct MtlsState {
     acceptor: RwLock<Option<Arc<tokio_rustls::TlsAcceptor>>>,
     active: Mutex<HashMap<String, Vec<CancellationToken>>>,
     enroll_attempts: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    pairing_persister: Mutex<Option<PairingPersister>>,
 }
 
 impl MtlsState {
@@ -82,7 +89,24 @@ impl MtlsState {
             acceptor: RwLock::new(None),
             active: Mutex::new(HashMap::new()),
             enroll_attempts: Mutex::new(HashMap::new()),
+            pairing_persister: Mutex::new(None),
         }))
+    }
+
+    /// Install the callback that writes the pairing-token set to config.
+    /// Enrollment is the only mTLS path that mints a token, and the plain
+    /// `/pair` handler is not on this listener, so the token would otherwise
+    /// live only in memory until the next gateway restart.
+    pub fn set_pairing_persister(&self, persister: PairingPersister) {
+        *self.pairing_persister.lock() = Some(persister);
+    }
+
+    pub async fn persist_pairing_tokens(&self) -> Result<()> {
+        let persister = { self.pairing_persister.lock().clone() };
+        match persister {
+            Some(persister) => persister().await,
+            None => Ok(()),
+        }
     }
 
     pub fn ledger_path(&self) -> PathBuf {
@@ -337,4 +361,42 @@ pub fn build_acceptor(
 pub fn enrollment_sas_for_code(code: &str, ca_cert_pem: &str) -> Result<String> {
     let fingerprint = zeroclaw_tls::single_cert_pem_sha256_fingerprint(ca_cert_pem)?;
     Ok(zeroclaw_tls::enrollment_sas(code, &fingerprint))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn pairing_persister_runs_for_enrollment_tokens() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pairing = Arc::new(PairingGuard::new(
+            false,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+        let state = MtlsState::load(
+            dir.path().to_path_buf(),
+            "gw_test".to_string(),
+            "ca".to_string(),
+            zeroize::Zeroizing::new("key".to_string()),
+            pairing,
+            Vec::new(),
+        )
+        .expect("state");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        state.set_pairing_persister(Arc::new(move || {
+            let counter = Arc::clone(&counter);
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }));
+
+        state.persist_pairing_tokens().await.expect("persist");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }
