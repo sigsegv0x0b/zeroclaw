@@ -12,6 +12,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 
 /** A press shorter than this is a tap: let silence detection finish the turn. */
 private const val VOICE_QUICK_TAP_MS = 400L
@@ -47,6 +52,7 @@ data class UiState(
     val notice: String? = null,
     val insecurePrompt: InsecureConnectionPrompt? = null,
     val settingsOpen: Boolean = false,
+    val toolPolicy: ToolPolicyUi = ToolPolicyUi(),
     val drawerOpen: Boolean = false,
 ) {
     val paired: Boolean get() = gatewayUrl.isNotBlank() && token.isNotBlank()
@@ -745,6 +751,147 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun openSettings(open: Boolean) = _ui.update { it.copy(settingsOpen = open) }
 
     fun openDrawer(open: Boolean) = _ui.update { it.copy(drawerOpen = open) }
+
+    // ── Tool approval policy ───────────────────────────────────────────────
+
+    /**
+     * Read the selected agent's tool catalog and the approval lists on its
+     * risk profile. The gateway owns both; the app only projects them.
+     */
+    fun refreshToolPolicies() {
+        val snapshot = _ui.value
+        if (snapshot.gatewayUrl.isBlank() || snapshot.token.isBlank()) return
+        val agent = snapshot.agent
+        if (agent.isBlank()) {
+            _ui.update {
+                it.copy(toolPolicy = it.toolPolicy.copy(error = "Pick an agent first."))
+            }
+            return
+        }
+        viewModelScope.launch {
+            _ui.update { it.copy(toolPolicy = it.toolPolicy.copy(loading = true, error = null)) }
+            val base = snapshot.gatewayUrl
+            val token = snapshot.token
+            runCatching {
+                val tools = gateway.tools(base, token, agent)
+                val profile = configString(
+                    gateway.configProp(base, token, "agents.$agent.risk_profile"),
+                ).ifBlank { "default" }
+                val prefix = "risk_profiles.$profile"
+                ToolPolicyUi(
+                    loading = false,
+                    loaded = true,
+                    entries = tools.sortedBy { it.name },
+                    riskProfile = profile,
+                    level = configString(gateway.configProp(base, token, "$prefix.level")),
+                    autoApprove = configArray(
+                        gateway.configProp(base, token, "$prefix.auto_approve"),
+                    ),
+                    alwaysAsk = configArray(
+                        gateway.configProp(base, token, "$prefix.always_ask"),
+                    ),
+                    excluded = configArray(
+                        gateway.configProp(base, token, "$prefix.excluded_tools"),
+                    ),
+                )
+            }.onSuccess { policy ->
+                _ui.update { it.copy(toolPolicy = policy) }
+            }.onFailure { error ->
+                _ui.update {
+                    it.copy(
+                        toolPolicy = it.toolPolicy.copy(
+                            loading = false,
+                            error = error.userMessage(),
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    fun setToolPolicy(tool: String, policy: ToolPolicy) {
+        val snapshot = _ui.value
+        val current = snapshot.toolPolicy
+        if (current.riskProfile.isBlank()) return
+        val auto = current.autoApprove.toMutableSet()
+        val ask = current.alwaysAsk.toMutableSet()
+        val excluded = current.excluded.toMutableSet()
+        when (policy) {
+            ToolPolicy.Default -> {
+                auto.remove(tool); ask.remove(tool); excluded.remove(tool)
+            }
+            ToolPolicy.Ask -> {
+                auto.remove(tool); excluded.remove(tool); ask.add(tool)
+            }
+            ToolPolicy.Always -> {
+                ask.remove(tool); excluded.remove(tool); auto.add(tool)
+            }
+            ToolPolicy.Blocked -> {
+                auto.remove(tool); ask.remove(tool); excluded.add(tool)
+            }
+        }
+        val prefix = "risk_profiles.${current.riskProfile}"
+        val ops = listOf(
+            configPatchOp("$prefix.auto_approve", auto),
+            configPatchOp("$prefix.always_ask", ask),
+            configPatchOp("$prefix.excluded_tools", excluded),
+        )
+        viewModelScope.launch {
+            _ui.update { it.copy(toolPolicy = it.toolPolicy.copy(updating = tool, error = null)) }
+            runCatching {
+                gateway.patchConfig(snapshot.gatewayUrl, snapshot.token, ops)
+            }.onSuccess {
+                _ui.update {
+                    it.copy(
+                        toolPolicy = it.toolPolicy.copy(
+                            autoApprove = auto.toSet(),
+                            alwaysAsk = ask.toSet(),
+                            excluded = excluded.toSet(),
+                            updating = null,
+                        ),
+                    )
+                }
+            }.onFailure { error ->
+                _ui.update {
+                    it.copy(
+                        toolPolicy = it.toolPolicy.copy(
+                            updating = null,
+                            error = error.userMessage(),
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    private fun configString(value: JsonElement?): String =
+        (value as? JsonPrimitive)?.content
+            ?.takeUnless { it == "<unset>" || it == "null" }
+            .orEmpty()
+
+    private fun configArray(value: JsonElement?): Set<String> {
+        val text = configString(value)
+        if (text.isBlank()) return emptySet()
+        val parsed = runCatching { zcJson.parseToJsonElement(text) }.getOrNull()
+        if (parsed is JsonArray) {
+            return parsed.mapNotNull { (it as? JsonPrimitive)?.content }.toSet()
+        }
+        return text.removeSurrounding("[", "]")
+            .split(',')
+            .map { it.trim().trim('"') }
+            .filter { it.isNotEmpty() }
+            .toSet()
+    }
+
+    private fun configPatchOp(path: String, values: Set<String>): JsonObject =
+        buildJsonObject {
+            put("op", JsonPrimitive("replace"))
+            put("path", JsonPrimitive(path))
+            put(
+                "value",
+                JsonArray(values.sorted().map { JsonPrimitive(it) }),
+            )
+        }
 
     // ── Conversations ──────────────────────────────────────────────────────
 

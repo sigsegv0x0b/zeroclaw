@@ -56,6 +56,8 @@ fun ZeroClawRoot(viewModel: AppViewModel = viewModel()) {
                     onMtlsGatewayId = viewModel::setMtlsGatewayId,
                     onMtlsImport = viewModel::importMtlsMaterial,
                     onRenewCertificate = viewModel::renewCertificate,
+                    onRefreshTools = viewModel::refreshToolPolicies,
+                    onToolPolicy = viewModel::setToolPolicy,
                 )
                 !state.paired -> OnboardingScreen(
                     booting = state.booting,
