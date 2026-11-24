@@ -124,7 +124,7 @@ sealed interface ChatEvent {
     data class Chunk(val content: String) : ChatEvent
     data class Thinking(val content: String) : ChatEvent
     data class ToolCall(val id: String?, val name: String, val args: JsonElement?) : ChatEvent
-    data class ToolResult(val name: String?, val output: String) : ChatEvent
+    data class ToolResult(val id: String?, val name: String?, val output: String) : ChatEvent
     data class Done(val fullResponse: String?) : ChatEvent
     data class Failure(val message: String, val code: String?) : ChatEvent
     data object Aborted : ChatEvent
@@ -148,6 +148,13 @@ data class ToolCallCard(
     val finished: Boolean = false,
 )
 
+/** One ordered piece of an assistant turn. */
+sealed interface MessageBlock {
+    data class Text(val text: String) : MessageBlock
+    data class Thinking(val text: String) : MessageBlock
+    data class Tool(val card: ToolCallCard) : MessageBlock
+}
+
 enum class MessageRole { User, Assistant, System }
 
 data class ChatMessage(
@@ -155,10 +162,91 @@ data class ChatMessage(
     val role: MessageRole,
     val text: String = "",
     val streaming: Boolean = false,
-    val tools: List<ToolCallCard> = emptyList(),
-    val thinking: String? = null,
+    /**
+     * Ordered assistant content. Text, reasoning, and tool cards share one
+     * list so a tool call cannot jump below a later text block.
+     */
+    val blocks: List<MessageBlock> = emptyList(),
     val isError: Boolean = false,
-)
+) {
+    /** Ordered blocks, with legacy plain text treated as one text block. */
+    val contentBlocks: List<MessageBlock>
+        get() = when {
+            blocks.isNotEmpty() -> blocks
+            text.isNotBlank() -> listOf(MessageBlock.Text(text))
+            else -> emptyList()
+        }
+
+    val contentLength: Int
+        get() = contentBlocks.sumOf { block ->
+            when (block) {
+                is MessageBlock.Text -> block.text.length
+                is MessageBlock.Thinking -> block.text.length
+                is MessageBlock.Tool -> 1
+            }
+        }
+
+    val toolCards: List<ToolCallCard>
+        get() = contentBlocks.filterIsInstance<MessageBlock.Tool>().map { it.card }
+}
+
+fun ChatMessage.appendText(chunk: String): ChatMessage {
+    val next = contentBlocks.toMutableList()
+    val last = next.lastOrNull()
+    if (last is MessageBlock.Text) {
+        next[next.lastIndex] = last.copy(text = last.text + chunk)
+    } else if (chunk.isNotEmpty()) {
+        next += MessageBlock.Text(chunk)
+    }
+    return copy(blocks = next, text = "", streaming = true)
+}
+
+fun ChatMessage.appendThinking(chunk: String): ChatMessage {
+    if (chunk.isEmpty()) return this
+    val next = contentBlocks.toMutableList()
+    val last = next.lastOrNull()
+    if (last is MessageBlock.Thinking) {
+        next[next.lastIndex] = last.copy(text = last.text + chunk)
+    } else {
+        next += MessageBlock.Thinking(chunk)
+    }
+    return copy(blocks = next, text = "", streaming = true)
+}
+
+fun ChatMessage.appendTool(card: ToolCallCard): ChatMessage =
+    copy(blocks = contentBlocks + MessageBlock.Tool(card), text = "", streaming = true)
+
+fun ChatMessage.completeTool(id: String?, name: String?, output: String): ChatMessage {
+    val next = contentBlocks.toMutableList()
+    val byId = id?.let { wanted ->
+        next.indexOfFirst { it is MessageBlock.Tool && it.card.id == wanted }
+    }?.takeIf { it >= 0 }
+    val byName = next.indexOfFirst {
+        it is MessageBlock.Tool && !it.card.finished && (name == null || it.card.name == name)
+    }.takeIf { it >= 0 }
+    val target = byId ?: byName
+        ?: next.indexOfFirst { it is MessageBlock.Tool && !it.card.finished }
+    if (target < 0) return this
+    val tool = next[target] as MessageBlock.Tool
+    next[target] = MessageBlock.Tool(tool.card.copy(output = output, finished = true))
+    return copy(blocks = next, text = "")
+}
+
+fun ChatMessage.finishStreaming(fullResponse: String?): ChatMessage {
+    val next = contentBlocks.toMutableList()
+    if (next.none { it is MessageBlock.Text } && !fullResponse.isNullOrBlank()) {
+        next += MessageBlock.Text(fullResponse)
+    }
+    return copy(blocks = next, text = "", streaming = false)
+}
+
+fun ChatMessage.finishWith(reason: String, isError: Boolean): ChatMessage {
+    val next = contentBlocks.toMutableList()
+    if (reason.isNotBlank() && (next.lastOrNull() as? MessageBlock.Text)?.text != reason) {
+        next += MessageBlock.Text(reason)
+    }
+    return copy(blocks = next, text = "", streaming = false, isError = isError)
+}
 
 data class ApprovalPrompt(
     val requestId: String,

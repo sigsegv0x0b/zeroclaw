@@ -196,6 +196,7 @@ class ChatSocket(
                 args = root["args"],
             )
             "tool_result" -> ChatEvent.ToolResult(
+                id = root.str("id"),
                 name = root.str("name"),
                 output = root.str("output").orEmpty(),
             )

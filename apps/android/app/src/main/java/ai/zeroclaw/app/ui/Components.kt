@@ -55,6 +55,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ai.zeroclaw.app.data.ChatMessage
+import ai.zeroclaw.app.data.MessageBlock
 import ai.zeroclaw.app.data.MessageRole
 import ai.zeroclaw.app.data.SocketState
 import ai.zeroclaw.app.data.ToolCallCard
@@ -154,43 +155,43 @@ fun MessageItem(message: ChatMessage, localNodeId: String) {
                 .fillMaxWidth()
                 .padding(vertical = 6.dp),
         ) {
-            val thinking = message.thinking
-            if (!thinking.isNullOrBlank()) {
-                ThinkingBlock(
-                    text = thinking,
-                    streaming = message.streaming && message.text.isBlank(),
-                )
-                Spacer(Modifier.height(6.dp))
-            }
-
-            if (message.text.isNotBlank()) {
-                if (message.isError) {
-                    Surface(
-                        color = Zc.DangerSoft,
-                        shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text(
-                            text = message.text,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Zc.Danger,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            val blocks = message.contentBlocks
+            blocks.forEachIndexed { index, block ->
+                when (block) {
+                    is MessageBlock.Thinking -> {
+                        ThinkingBlock(
+                            text = block.text,
+                            streaming = message.streaming && index == blocks.lastIndex,
                         )
                     }
-                } else {
-                    MarkdownBlocks(parseMarkdown(message.text))
+
+                    is MessageBlock.Text -> {
+                        if (message.isError) {
+                            Surface(
+                                color = Zc.DangerSoft,
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text(
+                                    text = block.text,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = Zc.Danger,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                )
+                            }
+                        } else {
+                            MarkdownBlocks(parseMarkdown(block.text))
+                        }
+                    }
+
+                    is MessageBlock.Tool -> ToolCallRow(block.card, localNodeId)
+                }
+                if (index != blocks.lastIndex) {
+                    Spacer(Modifier.height(8.dp))
                 }
             }
-
-            if (message.streaming && message.text.isBlank() && message.tools.isEmpty() &&
-                thinking.isNullOrBlank()
-            ) {
+            if (message.streaming && blocks.isEmpty()) {
                 ThinkingDots()
-            }
-
-            message.tools.forEach { card ->
-                Spacer(Modifier.height(8.dp))
-                ToolCallRow(card, localNodeId)
             }
         }
     }
