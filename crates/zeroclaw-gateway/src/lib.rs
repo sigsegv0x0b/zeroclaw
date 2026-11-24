@@ -2724,6 +2724,25 @@ pub async fn run_gateway_with_plugin_webhooks(
         },
     };
 
+    // The mTLS enrollment listener mints a bearer token with its pairing
+    // code, but it does not share AppState. Give it the config-persistence
+    // callback so that token is written to config.toml before enrollment
+    // returns; otherwise a gateway restart silently unpairs every device
+    // that enrolled over mTLS.
+    if let Some(mtls) = state.mtls.as_ref() {
+        let pairing = Arc::clone(&state.pairing);
+        let authority = state.config_authority.clone();
+        let persister: mtls_state::PairingPersister = Arc::new(move || {
+            let pairing = Arc::clone(&pairing);
+            let authority = authority.clone();
+            let future: std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>,
+            > = Box::pin(async move { persist_pairing_tokens_for(&pairing, &authority).await });
+            future
+        });
+        mtls.set_pairing_persister(persister);
+    }
+
     let dashboard_layer_state = state.clone();
     // On every route that issues or redeems a pairing code: refused through a
     // relay-served dashboard, where the relay would see the code.
@@ -3698,8 +3717,20 @@ async fn handle_pair(
 pub(crate) async fn persist_pairing_tokens(state: &AppState) -> Result<()> {
     // Self-contained: no caller pre-reads config for modify, so this
     // admits its own commit rather than taking one as a param.
-    let commit = state.begin_config_commit().await?;
-    persist_pairing_tokens_under(state, commit).await.map(drop)
+    persist_pairing_tokens_for(&state.pairing, &state.config_authority).await
+}
+
+/// Persist the pairing-token set without borrowing the whole [`AppState`].
+/// The mTLS enrollment listener holds only its own state and installs this as
+/// a callback so an enrolled device's token survives a gateway restart.
+pub(crate) async fn persist_pairing_tokens_for(
+    pairing: &zeroclaw_config::pairing::PairingGuard,
+    authority: &zeroclaw_runtime::LiveConfigAuthority,
+) -> Result<()> {
+    let commit = authority.begin_config_commit().await?;
+    persist_pairing_tokens_under_pairing(pairing, commit)
+        .await
+        .map(drop)
 }
 
 /// [`persist_pairing_tokens`] for a caller that already holds an admitted
@@ -3717,7 +3748,14 @@ pub(crate) async fn persist_pairing_tokens_under(
     state: &AppState,
     commit: ConfigWriteGuard,
 ) -> Result<ConfigWriteGuard> {
-    let paired_tokens = state.pairing.tokens();
+    persist_pairing_tokens_under_pairing(&state.pairing, commit).await
+}
+
+async fn persist_pairing_tokens_under_pairing(
+    pairing: &zeroclaw_config::pairing::PairingGuard,
+    commit: ConfigWriteGuard,
+) -> Result<ConfigWriteGuard> {
+    let paired_tokens = pairing.tokens();
     let mut updated_cfg = commit.current_config();
     updated_cfg.gateway.paired_tokens = paired_tokens;
     updated_cfg.mark_dirty("gateway.paired_tokens");
@@ -6546,6 +6584,7 @@ mod tests {
                 &[],
                 PairingCodePolicy::default(),
             )),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -9712,6 +9751,7 @@ path = "{trigger_path}"
             )),
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -9800,6 +9840,7 @@ path = "{trigger_path}"
             )),
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -10551,6 +10592,7 @@ path = "{trigger_path}"
             )),
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -12138,6 +12180,7 @@ data: [DONE]\n\n";
             )),
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -13059,6 +13102,7 @@ data: [DONE]\n\n";
             )),
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -13182,6 +13226,7 @@ data: [DONE]\n\n";
             )),
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -13284,6 +13329,7 @@ data: [DONE]\n\n";
             )),
             auto_save: true,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -13492,6 +13538,7 @@ data: [DONE]\n\n";
             )),
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -13581,6 +13628,7 @@ data: [DONE]\n\n";
             )),
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -13675,6 +13723,7 @@ data: [DONE]\n\n";
             )),
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -13774,6 +13823,7 @@ data: [DONE]\n\n";
             )),
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -13870,6 +13920,7 @@ data: [DONE]\n\n";
             )),
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -13972,6 +14023,7 @@ data: [DONE]\n\n";
             )),
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -14114,6 +14166,7 @@ data: [DONE]\n\n";
             )),
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -15010,6 +15063,7 @@ data: [DONE]\n\n";
             )),
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -15097,6 +15151,7 @@ data: [DONE]\n\n";
             )),
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -15711,6 +15766,7 @@ data: [DONE]\n\n";
             )),
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),

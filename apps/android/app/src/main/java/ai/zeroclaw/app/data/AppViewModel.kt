@@ -190,16 +190,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 gateway.agents(snapshot.gatewayUrl, snapshot.token)
             }.getOrElse { error ->
                 if (error is GatewayException && error.status == 401) {
-                    // The stored token was revoked or rotated: drop it so the
-                    // shell returns to pairing instead of showing an empty app.
-                    runCatching { store.clear() }
-                    CertificateRenewalScheduler.cancel(getApplication())
-                    appliedClientCertPem = ""
+                    // Do not erase the pairing on one 401. A gateway that is
+                    // still starting, or a token that was temporarily
+                    // unavailable, would otherwise force a re-pair. Keep the
+                    // material and point the operator at the recovery path.
                     _ui.update {
-                        UiState(
-                            booting = false,
-                            deviceName = it.deviceName,
-                            error = "This device is no longer paired. Enter a pairing code again.",
+                        it.copy(
+                            error = "The gateway rejected this device's token. It may have " +
+                                "been revoked or replaced. Open Settings and forget the " +
+                                "gateway, then pair again if this persists.",
                         )
                     }
                 } else {

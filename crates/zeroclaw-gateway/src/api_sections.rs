@@ -1585,6 +1585,7 @@ mod tests {
                 &[],
                 zeroclaw_config::pairing::PairingCodePolicy::default(),
             )),
+            mtls: None,
             trust_forwarded_headers: false,
             rate_limiter: std::sync::Arc::new(crate::GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: std::sync::Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
