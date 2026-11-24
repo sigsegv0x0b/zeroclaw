@@ -274,8 +274,7 @@ impl Tool for AskUserTool {
                             error: Some(format!(
                                 "Channel '{channel_name}' did not complete the structured choice \
                                  (user cancelled/declined, or the channel has no free-form fallback). \
-                                 Retry ask_user; free-form questions on this channel await ACP \
-                                 elicitation Phase 2."
+                                 Retry ask_user, or ask a free-form question instead."
                             )),
                         });
                     }
@@ -291,14 +290,37 @@ impl Tool for AskUserTool {
                 }
             }
         } else if !channel.supports_free_form_ask() {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "Channel '{channel_name}' requires `choices` for ask_user \
-                     (free-form questions await ACP elicitation Phase 2)"
-                )),
-            });
+            // Channels whose only input surface is form-mode elicitation
+            // (gateway WebSocket, ACP form clients) cannot use send + listen.
+            // Ask through the structured free-form path instead.
+            match channel.request_free_form(&question, timeout).await {
+                Ok(Some(answer)) => {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: answer.into(),
+                        error: None,
+                    });
+                }
+                Ok(None) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "Channel '{channel_name}' did not complete the free-form question \
+                             (user cancelled/declined, or the channel has no form input)."
+                        )),
+                    });
+                }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "Failed to ask question on channel '{channel_name}': {e}"
+                        )),
+                    });
+                }
+            }
         }
 
         // Format and send the question
@@ -686,6 +708,67 @@ mod tests {
         ) -> anyhow::Result<Option<Vec<String>>> {
             Ok(Some(self.answers.clone()))
         }
+    }
+
+    struct FreeFormChannel;
+
+    impl ::zeroclaw_api::attribution::Attributable for FreeFormChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "form"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for FreeFormChannel {
+        fn name(&self) -> &str {
+            "form"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_free_form_ask(&self) -> bool {
+            false
+        }
+
+        async fn request_free_form(
+            &self,
+            _question: &str,
+            _timeout: std::time::Duration,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(Some("typed answer".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn free_form_question_uses_form_elicitation() {
+        let tool = make_tool_with_channels(vec![(
+            "form",
+            Arc::new(FreeFormChannel) as Arc<dyn Channel>,
+        )]);
+        let result = tool
+            .execute(json!({
+                "question": "What name?",
+                "channel": "form",
+                "timeout_secs": 5
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "error: {:?}", result.error);
+        assert_eq!(result.output, "typed answer");
     }
 
     #[tokio::test]

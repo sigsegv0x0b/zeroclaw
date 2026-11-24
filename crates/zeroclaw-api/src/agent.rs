@@ -136,18 +136,16 @@ pub enum TurnEvent {
         /// How long the channel will wait before auto-denying.
         timeout_secs: u64,
     },
-    /// A structured question for the operator (`ask_user` / `poll`). The
-    /// transport renders the choices as radio buttons or checkboxes and may
-    /// offer a free-form "type your own" answer when `allow_free_form` is set.
-    ChoiceRequest {
-        /// Correlation ID. The matching `choice_response` must echo it.
+    /// A form-mode elicitation request for the operator (`ask_user` / `poll`).
+    /// The transport renders `requested_schema` with the same restricted JSON
+    /// Schema subset ACP uses, so choices, free-form answers, and future field
+    /// types share one source of truth.
+    ElicitationRequest {
+        /// Correlation ID. The matching `elicitation_response` must echo it.
         request_id: String,
-        question: String,
-        choices: Vec<String>,
-        /// `false` = radio buttons / one answer, `true` = checkboxes / many.
-        multi_select: bool,
-        /// Whether the client should offer a typed answer alongside the choices.
-        allow_free_form: bool,
+        message: String,
+        /// ACP form-mode `requestedSchema` (object with primitive properties).
+        requested_schema: serde_json::Value,
         /// How long the channel will wait before treating the question as
         /// cancelled.
         timeout_secs: u64,

@@ -14,6 +14,11 @@ use zeroclaw_api::channel::{
     ApprovalSource, AttributedApprovalResponse, Channel, ChannelApprovalRequest,
     ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
+use zeroclaw_api::elicitation::{
+    ElicitationResponse, FREE_FORM_PROPERTY, decode_free_form_accept, decode_multi_select_accept,
+    decode_multi_select_or_custom_accept, decode_single_select_or_custom_accept, free_form_schema,
+    multi_select_or_custom_schema, multi_select_schema, single_select_or_custom_schema,
+};
 
 /// Shared map keyed by `request_id`. Consumed by the receive loop to resolve
 /// the oneshot when an `approval_response` frame arrives.
@@ -24,57 +29,25 @@ pub fn new_pending_approvals() -> PendingApprovals {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// One answer to a structured `ask_user` / `poll` question.
-#[derive(Debug, Clone, Default)]
-pub struct ChoiceReply {
-    /// Selected option texts. Empty when the operator typed a free-form answer
-    /// or cancelled.
-    pub selected: Vec<String>,
-    /// Typed answer, when the client offered and the operator used one.
-    pub free_form: Option<String>,
-    /// The operator dismissed the prompt without answering.
-    pub cancelled: bool,
-}
+/// Shared map keyed by `request_id` for form elicitations. The receive loop
+/// resolves the oneshot when an `elicitation_response` frame arrives.
+///
+/// The reply is the ACP [`ElicitationResponse`] type itself, so the gateway
+/// WebSocket transport and ACP share one accept/decline/cancel model.
+pub type PendingElicitations = Arc<Mutex<HashMap<String, oneshot::Sender<ElicitationResponse>>>>;
 
-impl ChoiceReply {
-    /// Fold the selected options and a typed answer into the list shape the
-    /// `Channel::request_multi_choice` contract expects. Typed text is an
-    /// additional answer, deduplicated against the selected options.
-    fn into_multi(self, max_items: usize) -> Option<Vec<String>> {
-        let mut answers = self.selected;
-        if let Some(text) = self
-            .free_form
-            .map(|text| text.trim().to_string())
-            .filter(|text| !text.is_empty())
-            && !answers.iter().any(|answer| answer == &text)
-        {
-            answers.push(text);
-        }
-        answers.truncate(max_items.max(1));
-        if answers.is_empty() || self.cancelled {
-            None
-        } else {
-            Some(answers)
-        }
-    }
-}
-
-/// Shared map keyed by `request_id` for structured questions. The receive loop
-/// resolves the oneshot when a `choice_response` frame arrives.
-pub type PendingChoices = Arc<Mutex<HashMap<String, oneshot::Sender<ChoiceReply>>>>;
-
-/// Construct an empty pending-choices registry for a fresh connection.
-pub fn new_pending_choices() -> PendingChoices {
+/// Construct an empty pending-elicitations registry for a fresh connection.
+pub fn new_pending_elicitations() -> PendingElicitations {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// `Channel` implementation that emits approval frames over a connection's
-/// existing `event_tx` and parks on a oneshot until the matching response
-/// arrives or `timeout` elapses.
+/// `Channel` implementation that emits approval and elicitation frames over a
+/// connection's existing `event_tx` and parks on a oneshot until the matching
+/// response arrives or `timeout` elapses.
 pub struct WsApprovalChannel {
     event_tx: mpsc::Sender<TurnEvent>,
     pending: PendingApprovals,
-    pending_choices: PendingChoices,
+    pending_elicitations: PendingElicitations,
     timeout: Duration,
 }
 
@@ -82,53 +55,47 @@ impl WsApprovalChannel {
     pub fn new(
         event_tx: mpsc::Sender<TurnEvent>,
         pending: PendingApprovals,
-        pending_choices: PendingChoices,
+        pending_elicitations: PendingElicitations,
         timeout: Duration,
     ) -> Self {
         Self {
             event_tx,
             pending,
-            pending_choices,
+            pending_elicitations,
             timeout,
         }
     }
 
-    /// Emit one choice frame and park until the operator answers, dismisses it,
-    /// or the timeout expires. `Ok(None)` means no usable answer was produced;
-    /// callers treat that as cancelled/unsupported.
-    async fn request_choice_inner(
+    /// Emit one form-mode elicitation and park until the operator answers,
+    /// declines, cancels, or the timeout expires. `Ok(None)` means no usable
+    /// response was produced; callers treat that as cancelled/unsupported.
+    async fn request_elicitation(
         &self,
-        question: &str,
-        choices: &[String],
-        multi_select: bool,
-        allow_free_form: bool,
+        message: &str,
+        requested_schema: serde_json::Value,
         timeout: Duration,
-    ) -> anyhow::Result<Option<ChoiceReply>> {
+    ) -> anyhow::Result<Option<ElicitationResponse>> {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
-        self.pending_choices.lock().insert(request_id.clone(), tx);
+        self.pending_elicitations
+            .lock()
+            .insert(request_id.clone(), tx);
 
-        let event = TurnEvent::ChoiceRequest {
+        let event = TurnEvent::ElicitationRequest {
             request_id: request_id.clone(),
-            question: question.to_string(),
-            choices: choices.to_vec(),
-            multi_select,
-            allow_free_form,
+            message: message.to_string(),
+            requested_schema,
             timeout_secs: timeout.as_secs(),
         };
         if self.event_tx.send(event).await.is_err() {
-            self.pending_choices.lock().remove(&request_id);
+            self.pending_elicitations.lock().remove(&request_id);
             return Ok(None);
         }
 
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(reply)) if !reply.cancelled => Ok(Some(reply)),
-            Ok(Ok(_)) | Ok(Err(_)) => {
-                self.pending_choices.lock().remove(&request_id);
-                Ok(None)
-            }
-            Err(_) => {
-                self.pending_choices.lock().remove(&request_id);
+            Ok(Ok(response)) => Ok(Some(response)),
+            Ok(Err(_)) | Err(_) => {
+                self.pending_elicitations.lock().remove(&request_id);
                 Ok(None)
             }
         }
@@ -188,20 +155,16 @@ impl Channel for WsApprovalChannel {
         if choices.is_empty() {
             return Ok(None);
         }
-        let Some(reply) = self
-            .request_choice_inner(question, choices, false, true, timeout)
-            .await?
-        else {
+        let schema = single_select_or_custom_schema(choices);
+        let Some(response) = self.request_elicitation(question, schema, timeout).await? else {
             return Ok(None);
         };
-        if let Some(text) = reply
-            .free_form
-            .map(|text| text.trim().to_string())
-            .filter(|text| !text.is_empty())
-        {
-            return Ok(Some(text));
+        match response {
+            ElicitationResponse::Accept { content } => {
+                decode_single_select_or_custom_accept(&content, choices).map(Some)
+            }
+            ElicitationResponse::Decline | ElicitationResponse::Cancel => Ok(None),
         }
-        Ok(reply.selected.into_iter().next())
     }
 
     async fn request_multi_choice(
@@ -218,20 +181,49 @@ impl Channel for WsApprovalChannel {
         // A free-form slot rides along only when the caller left room for one:
         // ask_user passes `choices.len() + 1`, while poll passes
         // `choices.len()` and keeps its write-in surface closed.
-        let allow_free_form = max_items > choices.len();
-        let Some(reply) = self
-            .request_choice_inner(question, choices, true, allow_free_form, timeout)
-            .await?
-        else {
+        let allow_custom = max_items > choices.len();
+        let schema = if allow_custom {
+            multi_select_or_custom_schema(choices, max_items)
+        } else {
+            multi_select_schema(choices, min_items, max_items)
+        };
+        let Some(response) = self.request_elicitation(question, schema, timeout).await? else {
             return Ok(None);
         };
-        let Some(answers) = reply.into_multi(max_items) else {
-            return Ok(None);
-        };
-        if answers.len() < min_items.max(1) {
-            return Ok(None);
+        match response {
+            ElicitationResponse::Accept { content } if allow_custom => {
+                decode_multi_select_or_custom_accept(&content, choices, min_items, max_items)
+                    .map(Some)
+            }
+            ElicitationResponse::Accept { content } => {
+                let answers = decode_multi_select_accept(&content, choices)?;
+                if answers.len() < min_items.max(1) || answers.len() > max_items.max(1) {
+                    anyhow::bail!(
+                        "elicitation accept returned {} choice(s); expected {min_items}..={max_items}",
+                        answers.len()
+                    );
+                }
+                Ok(Some(answers))
+            }
+            ElicitationResponse::Decline | ElicitationResponse::Cancel => Ok(None),
         }
-        Ok(Some(answers))
+    }
+
+    async fn request_free_form(
+        &self,
+        question: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<String>> {
+        let schema = free_form_schema(FREE_FORM_PROPERTY, "Your answer");
+        let Some(response) = self.request_elicitation(question, schema, timeout).await? else {
+            return Ok(None);
+        };
+        match response {
+            ElicitationResponse::Accept { content } => {
+                decode_free_form_accept(&content, FREE_FORM_PROPERTY).map(Some)
+            }
+            ElicitationResponse::Decline | ElicitationResponse::Cancel => Ok(None),
+        }
     }
 
     /// Delegates to [`Self::request_approval_attributed`] and drops the
@@ -304,15 +296,18 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn ws_approval_channel_declines_free_form_ask() {
+    fn ws_approval_channel_declines_send_listen_free_form() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let pending = new_pending_approvals();
-        let channel =
-            WsApprovalChannel::new(tx, pending, new_pending_choices(), Duration::from_secs(30));
+        let channel = WsApprovalChannel::new(
+            tx,
+            pending,
+            new_pending_elicitations(),
+            Duration::from_secs(30),
+        );
         assert!(
             !channel.supports_free_form_ask(),
-            "WsApprovalChannel must refuse free-form ask_user; \
-             its send() is a no-op and listen() drops immediately"
+            "WsApprovalChannel must not use send+listen; request_free_form handles form input"
         );
     }
 
@@ -340,7 +335,7 @@ mod tests {
         let channel = WsApprovalChannel::new(
             tx,
             pending,
-            new_pending_choices(),
+            new_pending_elicitations(),
             Duration::from_millis(50),
         );
 
@@ -368,7 +363,7 @@ mod tests {
         let channel = WsApprovalChannel::new(
             tx,
             Arc::clone(&pending),
-            new_pending_choices(),
+            new_pending_elicitations(),
             Duration::from_secs(30),
         );
 
@@ -413,7 +408,7 @@ mod tests {
         let channel = WsApprovalChannel::new(
             tx,
             pending,
-            new_pending_choices(),
+            new_pending_elicitations(),
             Duration::from_millis(50),
         );
 
@@ -425,13 +420,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn choice_request_emits_frame_and_resolves_free_form_answer() {
+    async fn single_choice_emits_form_schema_and_resolves_typed_answer() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let pending_choices = new_pending_choices();
+        let pending_elicitations = new_pending_elicitations();
         let channel = Arc::new(WsApprovalChannel::new(
             tx,
             new_pending_approvals(),
-            Arc::clone(&pending_choices),
+            Arc::clone(&pending_elicitations),
             Duration::from_secs(5),
         ));
 
@@ -448,32 +443,38 @@ mod tests {
             })
         };
 
-        let event = rx.recv().await.expect("choice frame");
-        let zeroclaw_api::agent::TurnEvent::ChoiceRequest {
+        let event = rx.recv().await.expect("elicitation frame");
+        let zeroclaw_api::agent::TurnEvent::ElicitationRequest {
             request_id,
-            question,
-            choices,
-            multi_select,
-            allow_free_form,
+            message,
+            requested_schema,
             timeout_secs,
         } = event
         else {
-            panic!("expected ChoiceRequest");
+            panic!("expected ElicitationRequest");
         };
-        assert_eq!(question, "Which layout?");
-        assert_eq!(choices, ["Compact", "Comfortable"]);
-        assert!(!multi_select);
-        assert!(allow_free_form);
+        assert_eq!(message, "Which layout?");
         assert_eq!(timeout_secs, 5);
+        assert_eq!(requested_schema["type"], "object");
+        assert!(
+            requested_schema.get("required").is_none(),
+            "the choice and custom properties are alternatives, not both required"
+        );
+        assert_eq!(
+            requested_schema["properties"]["choice"]["oneOf"][1]["const"],
+            "choice-1"
+        );
+        assert_eq!(requested_schema["properties"]["custom"]["type"], "string");
 
-        pending_choices
+        pending_elicitations
             .lock()
             .remove(&request_id)
             .unwrap()
-            .send(ChoiceReply {
-                selected: vec!["Compact".to_string()],
-                free_form: Some("  Compact but larger  ".to_string()),
-                cancelled: false,
+            .send(ElicitationResponse::Accept {
+                content: serde_json::json!({
+                    "choice": "choice-0",
+                    "custom": "  Compact but larger  "
+                }),
             })
             .unwrap();
 
@@ -485,13 +486,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_choice_returns_selected_options_plus_free_form() {
+    async fn multi_choice_emits_form_schema_and_appends_typed_answer() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let pending_choices = new_pending_choices();
+        let pending_elicitations = new_pending_elicitations();
         let channel = WsApprovalChannel::new(
             tx,
             new_pending_approvals(),
-            Arc::clone(&pending_choices),
+            Arc::clone(&pending_elicitations),
             Duration::from_secs(5),
         );
 
@@ -507,30 +508,29 @@ mod tests {
                 .await
         });
 
-        let event = rx.recv().await.expect("choice frame");
-        let zeroclaw_api::agent::TurnEvent::ChoiceRequest {
+        let event = rx.recv().await.expect("elicitation frame");
+        let zeroclaw_api::agent::TurnEvent::ElicitationRequest {
             request_id,
-            multi_select,
-            allow_free_form,
+            requested_schema,
             ..
         } = event
         else {
-            panic!("expected ChoiceRequest");
+            panic!("expected ElicitationRequest");
         };
-        assert!(multi_select);
-        assert!(
-            allow_free_form,
-            "max_items > choices.len() reserves a write-in slot"
-        );
+        assert_eq!(requested_schema["properties"]["choices"]["type"], "array");
+        assert_eq!(requested_schema["properties"]["choices"]["minItems"], 0);
+        assert_eq!(requested_schema["properties"]["choices"]["maxItems"], 3);
+        assert_eq!(requested_schema["properties"]["custom"]["type"], "string");
 
-        pending_choices
+        pending_elicitations
             .lock()
             .remove(&request_id)
             .unwrap()
-            .send(ChoiceReply {
-                selected: vec!["Camera".to_string()],
-                free_form: Some("Calendar".to_string()),
-                cancelled: false,
+            .send(ElicitationResponse::Accept {
+                content: serde_json::json!({
+                    "choices": ["choice-0"],
+                    "custom": "Calendar"
+                }),
             })
             .unwrap();
 
@@ -539,13 +539,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_choice_returns_none_and_clears_pending_entry() {
+    async fn cancelled_elicitation_returns_none_and_clears_pending_entry() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let pending_choices = new_pending_choices();
+        let pending_elicitations = new_pending_elicitations();
         let channel = WsApprovalChannel::new(
             tx,
             new_pending_approvals(),
-            Arc::clone(&pending_choices),
+            Arc::clone(&pending_elicitations),
             Duration::from_secs(5),
         );
 
@@ -555,31 +555,69 @@ mod tests {
                 .await
         });
 
-        let event = rx.recv().await.expect("choice frame");
-        let zeroclaw_api::agent::TurnEvent::ChoiceRequest { request_id, .. } = event else {
-            panic!("expected ChoiceRequest");
+        let event = rx.recv().await.expect("elicitation frame");
+        let zeroclaw_api::agent::TurnEvent::ElicitationRequest { request_id, .. } = event else {
+            panic!("expected ElicitationRequest");
         };
-        pending_choices
+        pending_elicitations
             .lock()
             .remove(&request_id)
             .unwrap()
-            .send(ChoiceReply {
-                cancelled: true,
-                ..Default::default()
-            })
+            .send(ElicitationResponse::Cancel)
             .unwrap();
 
         assert_eq!(ask.await.unwrap().unwrap(), None);
-        assert!(pending_choices.lock().is_empty());
+        assert!(pending_elicitations.lock().is_empty());
     }
 
     #[tokio::test]
-    async fn choice_timeout_returns_none() {
+    async fn free_form_elicitation_returns_typed_answer() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let pending_elicitations = new_pending_elicitations();
+        let channel = WsApprovalChannel::new(
+            tx,
+            new_pending_approvals(),
+            Arc::clone(&pending_elicitations),
+            Duration::from_secs(5),
+        );
+
+        let ask = zeroclaw_spawn::spawn!(async move {
+            channel
+                .request_free_form("What name?", Duration::from_secs(5))
+                .await
+        });
+
+        let event = rx.recv().await.expect("elicitation frame");
+        let zeroclaw_api::agent::TurnEvent::ElicitationRequest {
+            request_id,
+            requested_schema,
+            ..
+        } = event
+        else {
+            panic!("expected ElicitationRequest");
+        };
+        assert_eq!(requested_schema["properties"]["answer"]["type"], "string");
+        assert_eq!(requested_schema["required"], serde_json::json!(["answer"]));
+
+        pending_elicitations
+            .lock()
+            .remove(&request_id)
+            .unwrap()
+            .send(ElicitationResponse::Accept {
+                content: serde_json::json!({ "answer": "  Zero  " }),
+            })
+            .unwrap();
+
+        assert_eq!(ask.await.unwrap().unwrap(), Some("Zero".to_string()));
+    }
+
+    #[tokio::test]
+    async fn elicitation_timeout_returns_none() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let channel = WsApprovalChannel::new(
             tx,
             new_pending_approvals(),
-            new_pending_choices(),
+            new_pending_elicitations(),
             Duration::from_secs(5),
         );
 

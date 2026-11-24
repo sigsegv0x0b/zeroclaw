@@ -52,7 +52,7 @@ import androidx.compose.ui.unit.dp
 import ai.zeroclaw.app.data.AppViewModel
 import ai.zeroclaw.app.data.ApprovalPrompt
 import ai.zeroclaw.app.data.ChatMessage
-import ai.zeroclaw.app.data.ChoicePrompt
+import ai.zeroclaw.app.data.ElicitationPrompt
 import ai.zeroclaw.app.data.NodeStatus
 import ai.zeroclaw.app.data.UiState
 import ai.zeroclaw.app.ui.theme.Zc
@@ -119,11 +119,11 @@ fun ChatScreen(
         )
     }
 
-    state.choice?.let { prompt ->
-        ChoiceDialog(
+    state.elicitation?.let { prompt ->
+        ElicitationDialog(
             prompt = prompt,
-            onSend = viewModel::answerChoice,
-            onCancel = viewModel::cancelChoice,
+            onSend = viewModel::answerElicitation,
+            onCancel = viewModel::cancelElicitation,
         )
     }
 }
@@ -259,8 +259,8 @@ private fun NoticeBar(text: String, onDismiss: () -> Unit) {
 }
 
 @Composable
-private fun ChoiceDialog(
-    prompt: ChoicePrompt,
+private fun ElicitationDialog(
+    prompt: ElicitationPrompt,
     onSend: (List<String>, String?) -> Unit,
     onCancel: () -> Unit,
 ) {
@@ -276,7 +276,11 @@ private fun ChoiceDialog(
         shape = RoundedCornerShape(18.dp),
         title = {
             Text(
-                text = if (prompt.multiSelect) "Choose one or more" else "Choose an option",
+                text = when {
+                    prompt.options.isEmpty() -> "Your answer"
+                    prompt.multiSelect -> "Choose one or more"
+                    else -> "Choose an option"
+                },
                 style = MaterialTheme.typography.titleLarge,
             )
         },
@@ -287,25 +291,25 @@ private fun ChoiceDialog(
                     .verticalScroll(rememberScrollState()),
             ) {
                 Text(
-                    text = prompt.question,
+                    text = prompt.message,
                     style = MaterialTheme.typography.bodyMedium,
                     color = Zc.Text,
                 )
-                if (prompt.choices.isNotEmpty()) {
+                if (prompt.options.isNotEmpty()) {
                     Spacer(Modifier.height(8.dp))
-                    prompt.choices.forEach { choice ->
+                    prompt.options.forEach { option ->
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clickable {
                                     if (prompt.multiSelect) {
-                                        selected = if (choice in selected) {
-                                            selected - choice
+                                        selected = if (option.value in selected) {
+                                            selected - option.value
                                         } else {
-                                            selected + choice
+                                            selected + option.value
                                         }
                                     } else {
-                                        selected = setOf(choice)
+                                        selected = setOf(option.value)
                                         freeForm = ""
                                     }
                                 }
@@ -314,17 +318,17 @@ private fun ChoiceDialog(
                         ) {
                             if (prompt.multiSelect) {
                                 Checkbox(
-                                    checked = choice in selected,
+                                    checked = option.value in selected,
                                     onCheckedChange = null,
                                 )
                             } else {
                                 RadioButton(
-                                    selected = choice in selected,
+                                    selected = option.value in selected,
                                     onClick = null,
                                 )
                             }
                             Text(
-                                text = choice,
+                                text = option.label,
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = Zc.Text,
                                 modifier = Modifier.padding(start = 4.dp),
@@ -332,7 +336,7 @@ private fun ChoiceDialog(
                         }
                     }
                 }
-                if (prompt.allowFreeForm) {
+                if (prompt.freeFormProperty != null) {
                     Spacer(Modifier.height(10.dp))
                     OutlinedTextField(
                         value = freeForm,
@@ -342,7 +346,7 @@ private fun ChoiceDialog(
                                 selected = emptySet()
                             }
                         },
-                        label = { Text("Type your own") },
+                        label = { Text(prompt.freeFormLabel) },
                         modifier = Modifier.fillMaxWidth(),
                         maxLines = 3,
                     )

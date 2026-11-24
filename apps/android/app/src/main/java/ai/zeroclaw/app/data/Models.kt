@@ -134,14 +134,7 @@ sealed interface ChatEvent {
         val argumentsSummary: String,
         val timeoutSecs: Int?,
     ) : ChatEvent
-    data class ChoiceRequest(
-        val requestId: String,
-        val question: String,
-        val choices: List<String>,
-        val multiSelect: Boolean,
-        val allowFreeForm: Boolean,
-        val timeoutSecs: Int?,
-    ) : ChatEvent
+    data class ElicitationRequest(val prompt: ElicitationPrompt) : ChatEvent
     data class HistoryTrimmed(val droppedMessages: Int?) : ChatEvent
     data class SafeguardFallback(val requested: String?, val served: String?) : ChatEvent
     data class Other(val type: String) : ChatEvent
@@ -171,16 +164,6 @@ data class ApprovalPrompt(
     val requestId: String,
     val tool: String,
     val argumentsSummary: String,
-    val timeoutSecs: Int?,
-)
-
-/** A structured `ask_user` / `poll` question waiting for an answer. */
-data class ChoicePrompt(
-    val requestId: String,
-    val question: String,
-    val choices: List<String>,
-    val multiSelect: Boolean,
-    val allowFreeForm: Boolean,
     val timeoutSecs: Int?,
 )
 

@@ -317,18 +317,22 @@ and `?token=` fallback.
 
 Client → server frames: `{"type":"message","content":…}`,
 `{"type":"approval_response","request_id":…,"decision":"approve|deny|always"}`,
-and `{"type":"choice_response","request_id":…,"selected":[…],
-"free_form":"…","cancelled":false}`. Omit `free_form`/`selected` when unused,
-or set `cancelled: true` to dismiss the question.
+and `{"type":"elicitation_response","request_id":…,"action":"accept",
+"content":{…}}`. Use `action: "decline"` or `"cancel"` with no content to
+dismiss a form.
 
 Server → client frames handled: `session_start`, `chunk`, `message`,
 `thinking`, `tool_call`, `tool_result`, `done`, `error`, `aborted`,
-`approval_request`, `choice_request`, `history_trimmed`, `safeguard_fallback`.
-Unknown frames are ignored so a newer gateway does not break the app.
+`approval_request`, `elicitation_request`, `history_trimmed`,
+`safeguard_fallback`. Unknown frames are ignored so a newer gateway does not
+break the app.
 
-A `choice_request` comes from `ask_user` or `poll` with choices. The app renders
-radio buttons for a single choice and checkboxes when `multi_select` is true,
-plus a "type your own" field when `allow_free_form` is set.
+An `elicitation_request` comes from `ask_user` or `poll`. Its `requested_schema`
+is the same restricted ACP form schema the editor clients receive: an enum
+`choice`/`choices` property, an optional string `custom` field, or a free-form
+`answer` field. The app renders radio buttons for a single choice, checkboxes
+for `choices`, and a text field for `custom`/`answer`. Responses send the
+schema's index-based `choice-<n>` values, never the display labels.
 
 The client owns the session id (a UUID) exactly as the web dashboard does, so
 history written on the phone is visible on the dashboard and vice versa.
