@@ -1599,6 +1599,12 @@ impl Agent {
         &self.history
     }
 
+    /// Number of recent user turns whose tool calls/results remain in the
+    /// provider-facing history.
+    pub fn keep_tool_context_turns(&self) -> usize {
+        self.config.resolved.keep_tool_context_turns
+    }
+
     /// Return the owner-maintained structured history for native persistence.
     /// The Agent history is already replayed from the provider buffer with
     /// positional memory provenance applied; callers must not reconstruct it

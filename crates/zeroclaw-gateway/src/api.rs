@@ -1918,7 +1918,12 @@ fn gateway_display_session_id(session_key: &str) -> &str {
     session_key.strip_prefix("gw_").unwrap_or(session_key)
 }
 
-/// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
+/// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript.
+///
+/// The durable transcript may include the last few turns of tool call/result
+/// rows so a resumed model keeps that context. Those rows are protocol state,
+/// not chat bubbles: tool results are omitted here and assistant tool-call
+/// rows contribute only their visible text.
 pub async fn handle_api_session_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1941,12 +1946,16 @@ pub async fn handle_api_session_messages(
     let msgs = backend.load_with_timestamps(&session_key);
     let messages: Vec<serde_json::Value> = msgs
         .into_iter()
-        .map(|m| {
-            serde_json::json!({
-                "role": m.message.role,
-                "content": m.message.content,
+        .filter_map(|m| {
+            // Tool context is durable for the model, not a chat bubble. Drop
+            // tool result rows and keep only the visible narration text from
+            // assistant tool-call carriers.
+            let visible = zeroclaw_providers::visible_chat_message(&m.message)?;
+            Some(serde_json::json!({
+                "role": visible.role,
+                "content": visible.content,
                 "created_at": m.created_at.map(|dt| dt.to_rfc3339()),
-            })
+            }))
         })
         .collect();
 

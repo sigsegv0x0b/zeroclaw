@@ -142,10 +142,14 @@ for one prior turn as well, and the `unbounded` preset uses `8`.
 
 This is a request-time bound, not a transcript edit. The tool loop builds each
 provider request from a collapsed copy; the working history and every store an
-owner persists from it (channel sender cache, ACP transcript, CLI session file)
-keep all their rows, so raising the value later shows older tool rows again. The
-summary row is the pruning marker the providers already recognise, and it only
-ever follows a user prompt, so no route sees two assistant rows in a row.
+owner persists from it (channel sender cache, ACP transcript, gateway WebSocket
+transcript, CLI session file) keep all their rows, so raising the value later
+shows older tool rows again. The gateway WebSocket history API hides those
+protocol rows from clients: tool results are omitted and an assistant tool-call
+row contributes only its visible narration text, so a reloaded phone keeps the
+conversation text without live tool cards. The summary row is the pruning marker
+the providers already recognise, and it only ever follows a user prompt, so no
+route sees two assistant rows in a row.
 
 A turn collapses as a unit, in both native (`role=tool`) and prompt-mode
 (`[Tool results]` carrier) shapes, so no orphan call or result is created. A

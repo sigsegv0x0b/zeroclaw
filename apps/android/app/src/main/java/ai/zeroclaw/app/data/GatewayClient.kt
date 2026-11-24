@@ -194,6 +194,8 @@ class GatewayClient(
 
 /** Small helper used by the view model to keep call sites tidy. */
 fun List<MessageRow>.toChatMessages(): List<ChatMessage> = mapNotNull { row ->
+    // Tool protocol rows are model context, not chat bubbles.
+    if (row.role.equals("tool", ignoreCase = true)) return@mapNotNull null
     val role = when (row.role.lowercase()) {
         "user" -> MessageRole.User
         "assistant" -> MessageRole.Assistant
