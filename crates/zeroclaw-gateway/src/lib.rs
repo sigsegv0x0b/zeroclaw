@@ -1337,7 +1337,6 @@ async fn gateway_stop_requested(stopping: &mut tokio::sync::watch::Receiver<bool
 struct PreparedMtls {
     listener: tokio::net::TcpListener,
     state: Arc<mtls_state::MtlsState>,
-    materials: zeroclaw_tls::GatewayMaterials,
 }
 
 async fn prepare_gateway_mtls(
@@ -1365,6 +1364,10 @@ async fn prepare_gateway_mtls(
         ca_key_pem,
         pairing,
         mtls.pinned_client_certs.clone(),
+        mtls.enroll_bind.clone(),
+        mtls.enroll_port,
+        materials.server_cert_path.clone(),
+        materials.server_key_path.clone(),
     )?;
     let acceptor = mtls_state::build_acceptor(
         &materials.server_cert_path,
@@ -1387,11 +1390,7 @@ async fn prepare_gateway_mtls(
         ),
         "Gateway mTLS listener up with identity-based certificates"
     );
-    Ok(Some(PreparedMtls {
-        listener,
-        state,
-        materials,
-    }))
+    Ok(Some(PreparedMtls { listener, state }))
 }
 /// Serve the same gateway app on the additional mTLS listener.
 ///
@@ -2781,6 +2780,9 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/admin/sop/deny", post(api_sop::handle_sop_deny))
         .route("/admin/paircode", get(handle_admin_paircode))
         .route("/admin/paircode/new", post(handle_admin_paircode_new))
+        .route("/admin/enroll/open", post(handle_admin_enroll_open))
+        .route("/admin/enroll/close", post(handle_admin_enroll_close))
+        .route("/admin/enroll/status", get(handle_admin_enroll_status))
         // ── Existing routes ──
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
@@ -3218,15 +3220,12 @@ pub async fn run_gateway_with_plugin_webhooks(
         tasks: tasks.clone(),
     };
     if let (Some(router), Some(prepared)) = (mtls_router, mtls_prepared) {
-        if let Some(mtls_config) = config.gateway.mtls.as_ref().filter(|mtls| mtls.enroll) {
-            mtls_enroll::spawn(
-                Arc::clone(&prepared.state),
-                mtls_config,
-                &prepared.materials,
-                shutdown_rx.clone(),
-                tasks.clone(),
-            )
-            .await?;
+        prepared
+            .state
+            .enrollment
+            .attach_runtime(tasks.clone(), shutdown_rx.clone());
+        if config.gateway.mtls.as_ref().is_some_and(|mtls| mtls.enroll) {
+            Arc::clone(&prepared.state.enrollment).open(None).await?;
         }
         spawn_gateway_mtls_listener(
             router,
@@ -6007,6 +6006,88 @@ fn admin_revocation_not_admitted(
         "message": format!("Revocation refused without any change: {error}"),
     });
     (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct AdminEnrollOpenBody {
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+/// POST /admin/enroll/open — bind the enrollment listener on demand.
+async fn handle_admin_enroll_open(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<AdminEnrollOpenBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+    require_gateway_admin_token(&state, &headers)?;
+    let Some(mtls) = state.mtls.as_ref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "[gateway.mtls] is not enabled"})),
+        ));
+    };
+    let timeout = body
+        .timeout_secs
+        .map(|secs| Duration::from_secs(secs.clamp(1, 600)));
+    let info = Arc::clone(&mtls.enrollment)
+        .open(timeout)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{error}")})),
+            )
+        })?;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "active": true,
+        "auto_close": info.auto_close,
+        "timeout_secs": info.expires_in_secs,
+    })))
+}
+
+/// POST /admin/enroll/close — stop accepting enrollment connections.
+async fn handle_admin_enroll_close(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+    require_gateway_admin_token(&state, &headers)?;
+    let Some(mtls) = state.mtls.as_ref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "[gateway.mtls] is not enabled"})),
+        ));
+    };
+    mtls.enrollment.close();
+    Ok(Json(serde_json::json!({"success": true, "active": false})))
+}
+
+/// GET /admin/enroll/status — report whether the enrollment listener is open.
+async fn handle_admin_enroll_status(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+    require_gateway_admin_token(&state, &headers)?;
+    let Some(mtls) = state.mtls.as_ref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "[gateway.mtls] is not enabled"})),
+        ));
+    };
+    let status = mtls.enrollment.status();
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "active": status.is_some(),
+        "auto_close": status.map(|value| value.auto_close).unwrap_or(false),
+        "expires_in_secs": status.and_then(|value| value.expires_in_secs),
+    })))
 }
 
 #[derive(Debug, serde::Deserialize, Default)]

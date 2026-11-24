@@ -11,7 +11,8 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -41,6 +42,163 @@ pub struct IssuedCert {
     pub revoked: bool,
 }
 
+/// What the operator asked the enrollment window to do.
+#[derive(Debug, Clone, Copy)]
+pub struct EnrollmentInfo {
+    pub auto_close: bool,
+    pub expires_in_secs: Option<u64>,
+}
+
+#[derive(Clone)]
+struct EnrollmentRuntime {
+    tasks: crate::ServeTasks,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+}
+
+struct EnrollmentWindow {
+    id: u64,
+    token: CancellationToken,
+    expires_at: Option<Instant>,
+    auto_close: bool,
+}
+
+/// Owns the on-demand enrollment listener. The gateway starts it only when
+/// `gateway.mtls.enroll` is true or `zeroclaw pair --pair-timeout` asks for it;
+/// a successful enrollment or the deadline cancels the accept loop.
+pub struct EnrollmentControl {
+    state: Weak<MtlsState>,
+    bind: String,
+    port: u16,
+    server_cert_path: PathBuf,
+    server_key_path: PathBuf,
+    runtime: Mutex<Option<EnrollmentRuntime>>,
+    window: Mutex<Option<EnrollmentWindow>>,
+    next_id: AtomicU64,
+}
+
+impl EnrollmentControl {
+    fn new(
+        state: Weak<MtlsState>,
+        bind: String,
+        port: u16,
+        server_cert_path: PathBuf,
+        server_key_path: PathBuf,
+    ) -> Self {
+        Self {
+            state,
+            bind,
+            port,
+            server_cert_path,
+            server_key_path,
+            runtime: Mutex::new(None),
+            window: Mutex::new(None),
+            next_id: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn attach_runtime(
+        &self,
+        tasks: crate::ServeTasks,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        *self.runtime.lock() = Some(EnrollmentRuntime { tasks, shutdown });
+    }
+
+    pub async fn open(self: &Arc<Self>, timeout: Option<Duration>) -> Result<EnrollmentInfo> {
+        let runtime = {
+            self.runtime
+                .lock()
+                .clone()
+                .context("enrollment listener runtime is not attached")?
+        };
+        let state = self
+            .state
+            .upgrade()
+            .context("mTLS state is no longer available")?;
+
+        // Replacing a window must release its port first.
+        self.close();
+
+        let listener = tokio::net::TcpListener::bind((self.bind.as_str(), self.port))
+            .await
+            .with_context(|| {
+                format!("binding enrollment listener on {}:{}", self.bind, self.port)
+            })?;
+        let acceptor = crate::mtls_enroll::build_enrollment_acceptor(
+            &self.server_cert_path,
+            &self.server_key_path,
+        )?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let token = CancellationToken::new();
+        crate::mtls_enroll::serve(
+            listener,
+            acceptor,
+            state,
+            token.clone(),
+            runtime.shutdown.clone(),
+            runtime.tasks.clone(),
+        );
+
+        *self.window.lock() = Some(EnrollmentWindow {
+            id,
+            token: token.clone(),
+            expires_at: timeout.map(|duration| Instant::now() + duration),
+            auto_close: timeout.is_some(),
+        });
+
+        if let Some(timeout) = timeout {
+            let weak = Arc::downgrade(self);
+            runtime.tasks.spawn(async move {
+                tokio::time::sleep(timeout).await;
+                if let Some(control) = weak.upgrade() {
+                    control.close_if(id);
+                }
+            });
+        }
+
+        Ok(EnrollmentInfo {
+            auto_close: timeout.is_some(),
+            expires_in_secs: timeout.map(|duration| duration.as_secs()),
+        })
+    }
+
+    pub fn close(&self) {
+        if let Some(window) = self.window.lock().take() {
+            window.token.cancel();
+        }
+    }
+
+    fn close_if(&self, id: u64) {
+        let mut guard = self.window.lock();
+        if guard.as_ref().is_some_and(|window| window.id == id) {
+            if let Some(window) = guard.take() {
+                window.token.cancel();
+            }
+        }
+    }
+
+    /// Called after a certificate was issued. A permanent startup window stays
+    /// open; a timed pairing window closes now that this device succeeded.
+    pub fn close_after_pairing(&self) {
+        let mut guard = self.window.lock();
+        if guard.as_ref().is_some_and(|window| window.auto_close) {
+            if let Some(window) = guard.take() {
+                window.token.cancel();
+            }
+        }
+    }
+
+    pub fn status(&self) -> Option<EnrollmentInfo> {
+        let guard = self.window.lock();
+        guard.as_ref().map(|window| EnrollmentInfo {
+            auto_close: window.auto_close,
+            expires_in_secs: window
+                .expires_at
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()).as_secs()),
+        })
+    }
+}
+
 pub struct MtlsState {
     pub dir: PathBuf,
     pub gateway_id: String,
@@ -48,6 +206,7 @@ pub struct MtlsState {
     pub ca_key_pem: zeroize::Zeroizing<String>,
     pub pairing: Arc<PairingGuard>,
     pub pinned_client_certs: Vec<String>,
+    pub enrollment: Arc<EnrollmentControl>,
     revoked: Arc<RwLock<HashSet<String>>>,
     acceptor: RwLock<Option<Arc<tokio_rustls::TlsAcceptor>>>,
     active: Mutex<HashMap<String, Vec<CancellationToken>>>,
@@ -63,6 +222,10 @@ impl MtlsState {
         ca_key_pem: zeroize::Zeroizing<String>,
         pairing: Arc<PairingGuard>,
         pinned_client_certs: Vec<String>,
+        enroll_bind: String,
+        enroll_port: u16,
+        server_cert_path: PathBuf,
+        server_key_path: PathBuf,
     ) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let mut revoked = HashSet::new();
@@ -78,13 +241,20 @@ impl MtlsState {
                 }
             }
         }
-        Ok(Arc::new(Self {
+        Ok(Arc::new_cyclic(|weak| Self {
             dir,
             gateway_id,
             ca_cert_pem,
             ca_key_pem,
             pairing,
             pinned_client_certs,
+            enrollment: Arc::new(EnrollmentControl::new(
+                weak.clone(),
+                enroll_bind,
+                enroll_port,
+                server_cert_path,
+                server_key_path,
+            )),
             revoked: Arc::new(RwLock::new(revoked)),
             acceptor: RwLock::new(None),
             active: Mutex::new(HashMap::new()),
@@ -383,6 +553,10 @@ mod tests {
             zeroize::Zeroizing::new("key".to_string()),
             pairing,
             Vec::new(),
+            "127.0.0.1".to_string(),
+            42619,
+            dir.path().join("server.crt"),
+            dir.path().join("server.key"),
         )
         .expect("state");
 
