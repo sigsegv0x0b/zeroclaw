@@ -13,6 +13,7 @@ class ToolDisplayTest {
 
         assertEquals("timer_set", display.name)
         assertEquals("phone", display.label)
+        assertEquals("android-0c81d94a", display.nodeId)
         assertTrue(display.isNode)
     }
 
@@ -22,6 +23,7 @@ class ToolDisplayTest {
 
         assertEquals("cron_add", display.name)
         assertEquals("server", display.label)
+        assertEquals(null, display.nodeId)
         assertFalse(display.isNode)
     }
 
@@ -30,6 +32,7 @@ class ToolDisplayTest {
         val display = toolDisplay("node_without_separator")
 
         assertEquals("node_without_separator", display.name)
+        assertEquals(null, display.nodeId)
         assertFalse(display.isNode)
     }
 }

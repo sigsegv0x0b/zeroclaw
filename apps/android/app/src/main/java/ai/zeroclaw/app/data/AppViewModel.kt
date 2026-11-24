@@ -570,6 +570,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun onForeground() {
         viewModelScope.launch {
             if (_ui.value.booting || !_ui.value.paired) return@launch
+            // The chat socket and the device-node link are separate. A
+            // foregrounded app re-arms a link the OS stopped while the chat
+            // stayed connected; otherwise this phone silently disappears from
+            // the agent's tool list while another node answers in its place.
+            val saved = runCatching { store.current() }.getOrNull()
+            if (saved != null && saved.nodeEnabled && _ui.value.nodeStatus is NodeStatus.Stopped) {
+                NodeService.start(getApplication())
+            }
             maybeRenewBeforeConnect()
         }
     }
