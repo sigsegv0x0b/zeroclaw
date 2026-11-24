@@ -303,8 +303,9 @@ pub enum ConversationMessage {
 /// shape durable session backends store: user/assistant chat turns only,
 /// system prompt excluded (the backend restores against the caller's own
 /// system prompt, not a persisted one). `AssistantToolCalls` and
-/// `ToolResults` are tool-loop plumbing that durable session transcripts have
-/// never persisted; only the visible chat turns are kept.
+/// `ToolResults` are dropped here; use
+/// [`durable_chat_messages_with_tool_context`] when the resumed model must
+/// retain tool context.
 ///
 /// Callers that own the agent's authoritative post-turn history (after
 /// budget-enforcement trimming) should use this to replace a durable
@@ -318,6 +319,181 @@ pub fn durable_chat_messages(history: &[ConversationMessage]) -> Vec<ChatMessage
             _ => None,
         })
         .collect()
+}
+
+/// Project a history into the durable flat transcript, optionally including
+/// tool calls and results.
+///
+/// Tool variants are encoded in the native provider carrier shape:
+/// assistant messages contain `{"content":…,"tool_calls":[…]}` and tool
+/// messages contain `{"tool_call_id":…,"content":…,"attachments":[]}`. That is
+/// the same shape the native tool dispatcher sends to a provider, and
+/// [`decode_durable_transcript`] turns it back into structured variants on
+/// restore. This keeps resumed conversations aware of the tools they used
+/// without making the visible transcript display raw tool protocol rows.
+///
+/// `keep_tool_context_turns` is a gate here, not a store-time pruning bound:
+/// when it is nonzero every retained tool variant is stored, and the tool loop
+/// applies the configured per-request retention bound. Raising the value
+/// later therefore exposes older persisted tool context, matching the channel
+/// session stores.
+pub fn durable_chat_messages_with_tool_context(
+    history: &[ConversationMessage],
+    keep_tool_context_turns: usize,
+) -> Vec<ChatMessage> {
+    let include_tools = keep_tool_context_turns > 0;
+    let mut durable = Vec::new();
+    for message in history {
+        match message {
+            ConversationMessage::Chat(chat) if chat.role != "system" => {
+                durable.push(chat.clone());
+            }
+            ConversationMessage::Chat(_) => {}
+            ConversationMessage::AssistantToolCalls {
+                text,
+                tool_calls,
+                reasoning_content,
+            } if include_tools => {
+                durable.push(assistant_tool_call_message(
+                    text.as_deref(),
+                    tool_calls,
+                    reasoning_content.as_deref(),
+                ));
+            }
+            ConversationMessage::ToolResults(results) if include_tools => {
+                durable.extend(results.iter().map(tool_result_message));
+            }
+            _ => {}
+        }
+    }
+    durable
+}
+
+fn assistant_tool_call_message(
+    text: Option<&str>,
+    tool_calls: &[ToolCall],
+    reasoning_content: Option<&str>,
+) -> ChatMessage {
+    let mut payload = serde_json::json!({
+        "content": text,
+        "tool_calls": tool_calls,
+    });
+    if let Some(reasoning_content) = reasoning_content {
+        payload["reasoning_content"] = serde_json::json!(reasoning_content);
+    }
+    ChatMessage::assistant(payload.to_string())
+}
+
+fn tool_result_message(result: &ToolResultMessage) -> ChatMessage {
+    ChatMessage::tool(
+        serde_json::json!({
+            "tool_call_id": result.tool_call_id,
+            "content": result.content,
+            "attachments": [],
+        })
+        .to_string(),
+    )
+}
+
+/// Parse a durable flat transcript back into structured conversation
+/// variants. Assistant tool-call carriers and `tool` result carriers are
+/// recognized by their native JSON shape; unparseable rows stay plain chat.
+pub fn decode_durable_transcript(messages: &[ChatMessage]) -> Vec<ConversationMessage> {
+    let mut history = Vec::new();
+    let mut pending_results: Vec<ToolResultMessage> = Vec::new();
+    for message in messages {
+        if message.role == "assistant"
+            && let Some((text, tool_calls, reasoning_content)) =
+                decode_assistant_tool_call(&message.content)
+        {
+            flush_tool_results(&mut history, &mut pending_results);
+            history.push(ConversationMessage::AssistantToolCalls {
+                text,
+                tool_calls,
+                reasoning_content,
+            });
+            continue;
+        }
+        if message.role == "tool"
+            && let Some(result) = decode_tool_result(&message.content)
+        {
+            pending_results.push(result);
+            continue;
+        }
+        flush_tool_results(&mut history, &mut pending_results);
+        history.push(ConversationMessage::Chat(message.clone()));
+    }
+    flush_tool_results(&mut history, &mut pending_results);
+    history
+}
+
+/// The displayable form of one durable row: tool protocol rows disappear, and
+/// an assistant tool-call row keeps only its visible text (if any).
+pub fn visible_chat_message(message: &ChatMessage) -> Option<ChatMessage> {
+    if message.role == "tool" {
+        return None;
+    }
+    if message.role == "assistant"
+        && let Some((text, _, _)) = decode_assistant_tool_call(&message.content)
+    {
+        return text
+            .filter(|text| !text.trim().is_empty())
+            .map(ChatMessage::assistant);
+    }
+    Some(message.clone())
+}
+
+fn flush_tool_results(
+    history: &mut Vec<ConversationMessage>,
+    pending: &mut Vec<ToolResultMessage>,
+) {
+    if !pending.is_empty() {
+        history.push(ConversationMessage::ToolResults(std::mem::take(pending)));
+    }
+}
+
+fn decode_assistant_tool_call(
+    content: &str,
+) -> Option<(Option<String>, Vec<ToolCall>, Option<String>)> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let calls = value.get("tool_calls")?.as_array()?;
+    if calls.is_empty() {
+        return None;
+    }
+    let tool_calls: Vec<ToolCall> =
+        serde_json::from_value(value.get("tool_calls")?.clone()).ok()?;
+    let text = value
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let reasoning_content = value
+        .get("reasoning_content")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    Some((text, tool_calls, reasoning_content))
+}
+
+fn decode_tool_result(content: &str) -> Option<ToolResultMessage> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let tool_call_id = value
+        .get("tool_call_id")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let body = value
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(content)
+        .to_string();
+    let tool_name = value
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some(ToolResultMessage {
+        tool_call_id,
+        content: body,
+        tool_name,
+    })
 }
 
 /// Count the conversation entries a transcript projects into, without
@@ -1516,6 +1692,134 @@ mod thinking_display_tests {
         assert!(
             !json.contains("display"),
             "expected display field to be omitted, got: {json}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod durable_tool_context_tests {
+    use super::{
+        ChatMessage, ConversationMessage, ToolCall, ToolResultMessage, decode_durable_transcript,
+        durable_chat_messages_with_tool_context, visible_chat_message,
+    };
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: "{\"q\":1}".into(),
+            extra_content: None,
+        }
+    }
+
+    fn result(id: &str) -> ToolResultMessage {
+        ToolResultMessage {
+            tool_call_id: id.into(),
+            content: format!("result-{id}"),
+            tool_name: "shell".into(),
+        }
+    }
+
+    fn turn(user: &str, id: &str, final_text: &str) -> Vec<ConversationMessage> {
+        vec![
+            ConversationMessage::Chat(ChatMessage::user(user)),
+            ConversationMessage::AssistantToolCalls {
+                text: Some(format!("working-{id}")),
+                tool_calls: vec![call(id, "shell")],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![result(id)]),
+            ConversationMessage::Chat(ChatMessage::assistant(final_text)),
+        ]
+    }
+
+    #[test]
+    fn round_trip_preserves_structured_tool_context() {
+        let mut history = turn("one", "a", "done one");
+        history.extend(turn("two", "b", "done two"));
+        let durable = durable_chat_messages_with_tool_context(&history, 2);
+        let restored = decode_durable_transcript(&durable);
+
+        assert_eq!(restored.len(), history.len());
+        assert!(matches!(restored[0], ConversationMessage::Chat(_)));
+        match &restored[1] {
+            ConversationMessage::AssistantToolCalls {
+                text, tool_calls, ..
+            } => {
+                assert_eq!(text.as_deref(), Some("working-a"));
+                assert_eq!(tool_calls[0].id, "a");
+                assert_eq!(tool_calls[0].name, "shell");
+            }
+            other => panic!("expected AssistantToolCalls, got {other:?}"),
+        }
+        match &restored[2] {
+            ConversationMessage::ToolResults(results) => {
+                assert_eq!(results[0].tool_call_id, "a");
+                assert_eq!(results[0].content, "result-a");
+            }
+            other => panic!("expected ToolResults, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stores_all_tool_context_when_enabled_and_none_when_disabled() {
+        let mut history = turn("one", "a", "done one");
+        history.extend(turn("two", "b", "done two"));
+        history.extend(turn("three", "c", "done three"));
+
+        let durable = durable_chat_messages_with_tool_context(&history, 2);
+        let has_call = |id: &str| {
+            durable.iter().any(|message| {
+                message.role == "assistant" && message.content.contains(&format!("\"id\":\"{id}\""))
+            })
+        };
+        assert!(has_call("a"), "store keeps all retained tool rows");
+        assert!(has_call("b"));
+        assert!(has_call("c"));
+
+        let no_tools = durable_chat_messages_with_tool_context(&history, 0);
+        assert!(no_tools.iter().all(|message| message.role != "tool"));
+        assert_eq!(
+            no_tools
+                .iter()
+                .filter(
+                    |message| message.role == "assistant" && message.content.contains("tool_calls")
+                )
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn visible_rows_hide_tool_protocol_and_keep_narration() {
+        let tool_call = ChatMessage::assistant(
+            serde_json::json!({
+                "content": "checking",
+                "tool_calls": [call("a", "shell")],
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            visible_chat_message(&tool_call).map(|m| m.content),
+            Some("checking".to_string())
+        );
+
+        let silent_call = ChatMessage::assistant(
+            serde_json::json!({
+                "content": null,
+                "tool_calls": [call("a", "shell")],
+            })
+            .to_string(),
+        );
+        assert!(visible_chat_message(&silent_call).is_none());
+
+        let tool = ChatMessage::tool(
+            serde_json::json!({"tool_call_id": "a", "content": "ok"}).to_string(),
+        );
+        assert!(visible_chat_message(&tool).is_none());
+        assert_eq!(
+            visible_chat_message(&ChatMessage::assistant("hello")).map(|m| m.content),
+            Some("hello".to_string())
         );
     }
 }

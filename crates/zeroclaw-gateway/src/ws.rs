@@ -1502,7 +1502,10 @@ fn persist_agent_conversation_state(
     session_key: &str,
     agent: &zeroclaw_runtime::agent::Agent,
 ) -> bool {
-    let durable = zeroclaw_providers::durable_chat_messages(agent.history());
+    let durable = zeroclaw_providers::durable_chat_messages_with_tool_context(
+        agent.history(),
+        agent.keep_tool_context_turns(),
+    );
     replace_conversation_state_unless_deleted(
         backend,
         session_key,
@@ -1528,7 +1531,11 @@ fn note_own_transcript_write(
 ) -> PersistedWatermark {
     PersistedWatermark {
         generation: queue.advance_generation(session_key),
-        len: zeroclaw_providers::durable_chat_messages(agent.history()).len(),
+        len: zeroclaw_providers::durable_chat_messages_with_tool_context(
+            agent.history(),
+            agent.keep_tool_context_turns(),
+        )
+        .len(),
     }
 }
 
@@ -1565,7 +1572,9 @@ fn restore_agent_history(
     // immediately if the restored transcript is over the structured cap, and
     // that seed-time trim reads the agent's current breadcrumb flag to decide
     // whether a leading synthetic marker counts as a real turn.
-    let trim_event = match backend.map(|backend| backend.get_session_trim_breadcrumb(session_key)) {
+    let has_breadcrumb = match backend
+        .map(|backend| backend.get_session_trim_breadcrumb(session_key))
+    {
         Some(Err(e)) => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1579,15 +1588,17 @@ fn restore_agent_history(
             );
             return Err(());
         }
-        Some(Ok(opt)) => {
-            agent.set_history_has_trim_breadcrumb(opt.unwrap_or(false));
-            agent.seed_history_with_event(messages)
-        }
-        None => {
-            agent.set_history_has_trim_breadcrumb(false);
-            agent.seed_history_with_event(messages)
-        }
+        Some(Ok(opt)) => opt.unwrap_or(false),
+        None => false,
     };
+    agent.set_history_has_trim_breadcrumb(has_breadcrumb);
+    // The durable transcript stores the last few turns of tool calls/results
+    // in the native provider carrier shape. Decode them back into structured
+    // variants so restored turns keep the same tool context the live agent
+    // had; plain chat rows pass through unchanged.
+    let trim_event = agent.seed_conversation_history_with_event(
+        zeroclaw_providers::decode_durable_transcript(messages),
+    );
     // Seed-time trim only fires when the restored history exceeded the
     // structured cap, so it dropped rows, not just relabeled them. Mirror the
     // ACP restore contract: persist the retained projection and corrected
@@ -2735,11 +2746,17 @@ async fn process_chat_message(
                 } else {
                     format!("{accumulated_text}\n\n{marker}")
                 };
-                let mut d = zeroclaw_providers::durable_chat_messages(agent.history());
+                let mut d = zeroclaw_providers::durable_chat_messages_with_tool_context(
+                    agent.history(),
+                    agent.keep_tool_context_turns(),
+                );
                 d.push(zeroclaw_providers::ChatMessage::assistant(&truncated));
                 d
             } else {
-                zeroclaw_providers::durable_chat_messages(agent.history())
+                zeroclaw_providers::durable_chat_messages_with_tool_context(
+                    agent.history(),
+                    agent.keep_tool_context_turns(),
+                )
             };
             let crumb = agent.history_has_trim_breadcrumb();
             replace_conversation_state_unless_deleted(

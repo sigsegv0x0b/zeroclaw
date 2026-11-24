@@ -80,7 +80,7 @@ class ProtocolTest {
     }
 
     @Test
-    fun `history rows map roles and drop empty content`() {
+    fun `history rows map visible roles and drop empty or tool protocol rows`() {
         val messages = listOf(
             MessageRow(role = "user", content = "hi"),
             MessageRow(role = "assistant", content = "hello"),
@@ -88,10 +88,9 @@ class ProtocolTest {
             MessageRow(role = "tool", content = "raw"),
         ).toChatMessages()
 
-        assertEquals(3, messages.size)
+        assertEquals(2, messages.size)
         assertEquals(MessageRole.User, messages[0].role)
         assertEquals(MessageRole.Assistant, messages[1].role)
-        assertEquals(MessageRole.System, messages.last().role)
         assertTrue(messages.none { it.text.isBlank() })
     }
 }
