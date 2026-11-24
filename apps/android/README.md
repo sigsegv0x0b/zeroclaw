@@ -93,11 +93,15 @@ acceptance is remembered for that host and port. Use `https://` or Secure setup
 ## Identity-based mTLS transport
 
 For remote use without a public CA, enable the gateway's `[gateway.mtls]`
-listener with `enroll = true`. On the gateway run:
+listener. Keep `enroll = false` and open the enrollment port only for a pairing
+window. On the gateway run:
 
 ```sh
-zeroclaw pair --host <public-host-or-ddns> --qr
+zeroclaw pair --host <public-host-or-ddns> --qr --pair-timeout 120
 ```
+
+The enrollment listener closes when the timeout expires or after the first
+successful pairing. The timeout is capped at 600 seconds.
 
 In the app's onboarding **Secure setup (mTLS)** section, scan that QR (or enter
 the host and pairing code). The app fetches the gateway CA, shows the SAS to

@@ -18,8 +18,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio_rustls::TlsAcceptor;
-use zeroclaw_config::schema::GatewayMtlsConfig;
-use zeroclaw_tls::{GatewayMaterials, ServerConfigParams, build_tls_acceptor};
+use tokio_util::sync::CancellationToken;
+use zeroclaw_tls::{ServerConfigParams, build_tls_acceptor};
 
 use crate::ServeTasks;
 use crate::mtls_state::{IssuedCert, MtlsState};
@@ -144,6 +144,8 @@ async fn handle_enroll(
             .into_response();
     }
 
+    state.enrollment.close_after_pairing();
+
     Json(EnrollResponse {
         cert_pem: issued.cert_pem,
         ca_chain_pem: state.ca_cert_pem.clone(),
@@ -155,33 +157,37 @@ async fn handle_enroll(
     .into_response()
 }
 
-/// Spawn the enrollment listener beside the mTLS listener.
-pub async fn spawn(
+/// Build the server-authenticated TLS acceptor for enrollment.
+pub(crate) fn build_enrollment_acceptor(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> anyhow::Result<TlsAcceptor> {
+    build_tls_acceptor(&ServerConfigParams {
+        cert_path: cert_path.to_string_lossy().to_string(),
+        key_path: key_path.to_string_lossy().to_string(),
+        client_auth: None,
+    })
+}
+
+/// Serve an already-bound enrollment listener until the window or gateway stops.
+pub(crate) fn serve(
+    listener: tokio::net::TcpListener,
+    acceptor: TlsAcceptor,
     state: Arc<MtlsState>,
-    config: &GatewayMtlsConfig,
-    materials: &GatewayMaterials,
+    window: CancellationToken,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     tasks: ServeTasks,
-) -> anyhow::Result<()> {
-    let acceptor: TlsAcceptor = build_tls_acceptor(&ServerConfigParams {
-        cert_path: materials.server_cert_path.to_string_lossy().to_string(),
-        key_path: materials.server_key_path.to_string_lossy().to_string(),
-        client_auth: None,
-    })?;
-    let listener =
-        tokio::net::TcpListener::bind((config.enroll_bind.as_str(), config.enroll_port)).await?;
+) {
     let app = Router::new()
         .route("/enroll/ca", get(handle_ca))
         .route("/enroll", post(handle_enroll))
-        .with_state(Arc::clone(&state));
+        .with_state(state);
     let mut service = app.into_make_service_with_connect_info::<SocketAddr>();
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
             serde_json::json!({
-                "bind": config.enroll_bind,
-                "port": config.enroll_port,
-                "gateway_id": state.gateway_id,
+                "bind": listener.local_addr().map(|addr| addr.to_string()).unwrap_or_default(),
             })
         ),
         "Gateway mTLS enrollment listener up"
@@ -189,6 +195,7 @@ pub async fn spawn(
     zeroclaw_spawn::spawn!(async move {
         loop {
             let accepted = tokio::select! {
+                _ = window.cancelled() => break,
                 _ = shutdown.changed() => break,
                 conn = listener.accept() => conn,
             };
@@ -227,5 +234,4 @@ pub async fn spawn(
             });
         }
     });
-    Ok(())
 }

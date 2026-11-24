@@ -56,11 +56,17 @@ plus `ca.crt`.
 
 ## One-screen enrollment in the Android app
 
-With `enroll = true`, the app can bootstrap itself from one pairing code:
+The app bootstraps itself from one pairing code. Keep `enroll = false` in the
+configuration and let the pairing command open the enrollment listener only for
+the pairing window:
 
-1. On the gateway: `zeroclaw pair --host <public-host-or-ddns> --qr`.
-   It prints the pairing code and SAS, the gateway id, the mTLS/enrollment
-   URLs, and a scannable QR payload.
+1. On the gateway: `zeroclaw pair --host <public-host-or-ddns> --qr
+   --pair-timeout 120`.
+   It asks the running gateway to bind the enrollment port, then prints the
+   pairing code, SAS, gateway id, mTLS/enrollment URLs, and a scannable QR
+   payload. The port closes when the timeout expires or after the first
+   successful enrollment. The timeout is capped at 600 seconds by the pairing
+   code lifetime.
 2. In the app's **Secure setup (mTLS)** section, scan the QR (or enter the
    host and pairing code).
 3. The app fetches `/enroll/ca` over provisional TLS, computes the SAS, and
@@ -72,6 +78,11 @@ With `enroll = true`, the app can bootstrap itself from one pairing code:
 
 The pairing code is single use. Enrollment and the bearer token come from the
 same exchange, so there is no second code to enter.
+
+`--pair-timeout` requires `[gateway.mtls]` enabled and a running gateway on the
+same host, because it uses the localhost-only admin token to open the window.
+Without the flag, `enroll = true` keeps the port open from gateway startup
+until a restart.
 
 ## Renewal
 

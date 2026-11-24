@@ -1315,6 +1315,10 @@ Examples:
         /// Print a scannable QR payload for the app
         #[arg(long)]
         qr: bool,
+        /// Keep the enrollment port open for this many seconds (max 600).
+        /// The gateway closes it on timeout or after a successful pairing.
+        #[arg(long, value_name = "SECONDS")]
+        pair_timeout: Option<u64>,
     },
 
     /// Manage the gateway mTLS certificate ledger
@@ -8268,7 +8272,28 @@ mod wss_client_auth_tests {
 }
 
 #[cfg(feature = "agent-runtime")]
-async fn run_pair_command(config: &Config, host: Option<String>, qr: bool) -> Result<()> {
+async fn run_pair_command(
+    config: &Config,
+    host: Option<String>,
+    qr: bool,
+    pair_timeout: Option<u64>,
+) -> Result<()> {
+    if let Some(seconds) = pair_timeout {
+        if !config
+            .gateway
+            .mtls
+            .as_ref()
+            .is_some_and(|mtls| mtls.enabled)
+        {
+            anyhow::bail!("--pair-timeout needs [gateway.mtls] enabled");
+        }
+        let max = zeroclaw_config::pairing::PAIRING_CODE_TTL_MAX_SECS;
+        if !(1..=max).contains(&seconds) {
+            anyhow::bail!("--pair-timeout must be between 1 and {max} seconds");
+        }
+        open_enrollment_window(config, seconds).await?;
+        println!("Enrollment:   open for {seconds}s; closes after pairing or timeout");
+    }
     let public_host = host.unwrap_or_else(|| config.gateway.host.clone());
     let fetched = fetch_paircode(
         &config.gateway.host,
@@ -10592,7 +10617,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             }
         }
 
-        Commands::Pair { host, qr } => run_pair_command(&config, host, qr).await,
+        Commands::Pair {
+            host,
+            qr,
+            pair_timeout,
+        } => run_pair_command(&config, host, qr, pair_timeout).await,
 
         Commands::Mtls { command } => run_mtls_command(&config, command).await,
 
@@ -14892,6 +14921,45 @@ enum PaircodeResult {
 }
 
 #[cfg(feature = "agent-runtime")]
+async fn open_enrollment_window(config: &Config, timeout_secs: u64) -> Result<()> {
+    let admin_token =
+        zeroclaw_config::pairing::read_gateway_admin_token(&config.data_dir).ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "No gateway admin token at {}. Run this on the gateway host, as the user that                  runs the gateway, while the gateway is running.",
+                zeroclaw_config::pairing::gateway_admin_token_path(&config.data_dir).display()
+            ))
+        })?;
+    let url = gateway_admin_url(
+        admin_gateway_host(&config.gateway.host),
+        config.gateway.port,
+        config.gateway.path_prefix.as_deref(),
+        "/admin/enroll/open",
+    );
+    let response = reqwest::Client::new()
+        .post(&url)
+        .header(
+            zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+            &admin_token,
+        )
+        .json(&serde_json::json!({"timeout_secs": timeout_secs}))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|error| {
+            anyhow::Error::msg(format!("Failed to open enrollment window: {error}"))
+        })?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    if !status.is_success() {
+        let message = body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("gateway refused the enrollment window");
+        anyhow::bail!("{message}");
+    }
+    Ok(())
+}
+
 async fn fetch_paircode(
     host: &str,
     port: u16,
@@ -14911,8 +14979,9 @@ async fn fetch_paircode(
         })?;
     let client = reqwest::Client::new();
 
+    let admin_host = admin_gateway_host(host);
     let response = if action.mints_code() {
-        let mut url = gateway_admin_url(host, port, path_prefix, "/admin/paircode/new");
+        let mut url = gateway_admin_url(admin_host, port, path_prefix, "/admin/paircode/new");
         if let Some(rotate) = action.rotate_query() {
             url.push_str("?rotate=");
             url.push_str(&urlencoding::encode(&rotate));
@@ -14927,7 +14996,7 @@ async fn fetch_paircode(
             .send()
             .await
     } else {
-        let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode");
+        let url = gateway_admin_url(admin_host, port, path_prefix, "/admin/paircode");
         client
             .get(&url)
             .header(
@@ -14998,6 +15067,14 @@ async fn fetch_paircode(
 }
 
 #[cfg(feature = "agent-runtime")]
+fn admin_gateway_host(host: &str) -> &str {
+    if host == "localhost" {
+        host
+    } else {
+        "127.0.0.1"
+    }
+}
+
 fn gateway_admin_url(host: &str, port: u16, path_prefix: Option<&str>, admin_path: &str) -> String {
     let prefix = path_prefix.unwrap_or("");
     format!("http://{host}:{port}{prefix}{admin_path}")
