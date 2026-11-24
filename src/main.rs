@@ -1317,8 +1317,13 @@ Examples:
         qr: bool,
         /// Keep the enrollment port open for this many seconds (max 600).
         /// The gateway closes it on timeout or after a successful pairing.
+        /// On a terminal, show a live countdown; press q to stop early.
         #[arg(long, value_name = "SECONDS")]
         pair_timeout: Option<u64>,
+        /// Override the enrollment port for this pairing window.
+        /// Requires --pair-timeout.
+        #[arg(long, value_name = "PORT")]
+        enroll_port: Option<u16>,
     },
 
     /// Manage the gateway mTLS certificate ledger
@@ -8277,7 +8282,14 @@ async fn run_pair_command(
     host: Option<String>,
     qr: bool,
     pair_timeout: Option<u64>,
+    enroll_port: Option<u16>,
 ) -> Result<()> {
+    if enroll_port.is_some() && pair_timeout.is_none() {
+        anyhow::bail!("--enroll-port requires --pair-timeout");
+    }
+    if enroll_port == Some(0) {
+        anyhow::bail!("--enroll-port must be between 1 and 65535");
+    }
     if let Some(seconds) = pair_timeout {
         if !config
             .gateway
@@ -8291,8 +8303,13 @@ async fn run_pair_command(
         if !(1..=max).contains(&seconds) {
             anyhow::bail!("--pair-timeout must be between 1 and {max} seconds");
         }
-        open_enrollment_window(config, seconds).await?;
-        println!("Enrollment:   open for {seconds}s; closes after pairing or timeout");
+        open_enrollment_window(config, seconds, enroll_port).await?;
+        let port = enroll_port
+            .or_else(|| config.gateway.mtls.as_ref().map(|mtls| mtls.enroll_port))
+            .unwrap_or(42619);
+        println!(
+            "Enrollment:   open for {seconds}s on port {port}; closes after pairing or timeout"
+        );
     }
     let public_host = host.unwrap_or_else(|| config.gateway.host.clone());
     let fetched = fetch_paircode(
@@ -8339,10 +8356,13 @@ async fn run_pair_command(
     if !gateway_id.is_empty() {
         println!("Gateway ID:   {gateway_id}");
     }
+    let effective_enroll_port = enroll_port
+        .or_else(|| mtls.map(|value| value.enroll_port))
+        .unwrap_or(42619);
     if let Some(mtls) = mtls {
         println!(
             "mTLS:         https://{public_host}:{}   enrollment: https://{public_host}:{}",
-            mtls.port, mtls.enroll_port
+            mtls.port, effective_enroll_port
         );
     } else {
         println!("mTLS:         [gateway.mtls] is not enabled");
@@ -8356,7 +8376,7 @@ async fn run_pair_command(
             "v": 1,
             "host": public_host,
             "mtls": mtls.port,
-            "enroll": mtls.enroll_port,
+            "enroll": effective_enroll_port,
             "gw": gateway_id,
             "code": code,
             "sas": sas,
@@ -8368,7 +8388,168 @@ async fn run_pair_command(
             .build();
         println!("\n{image}");
     }
+
+    if let Some(seconds) = pair_timeout {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            wait_for_pairing(config, seconds).await?;
+        }
+    }
     Ok(())
+}
+
+#[cfg(feature = "agent-runtime")]
+fn gateway_admin_token(config: &Config) -> Result<String> {
+    zeroclaw_config::pairing::read_gateway_admin_token(&config.data_dir).ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "No gateway admin token at {}. Run this on the gateway host, as the user that              runs the gateway, while the gateway is running.",
+            zeroclaw_config::pairing::gateway_admin_token_path(&config.data_dir).display()
+        ))
+    })
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn fetch_enrollment_status(config: &Config) -> Result<serde_json::Value> {
+    let admin_token = gateway_admin_token(config)?;
+    let url = gateway_admin_url(
+        admin_gateway_host(&config.gateway.host),
+        config.gateway.port,
+        config.gateway.path_prefix.as_deref(),
+        "/admin/enroll/status",
+    );
+    let response = reqwest::Client::new()
+        .get(&url)
+        .header(
+            zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+            &admin_token,
+        )
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|error| anyhow::Error::msg(format!("Enrollment status failed: {error}")))?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    if !status.is_success() {
+        let message = body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("gateway refused the enrollment status request");
+        anyhow::bail!("{message}");
+    }
+    Ok(body)
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn close_enrollment_window(config: &Config) -> Result<()> {
+    let admin_token = gateway_admin_token(config)?;
+    let url = gateway_admin_url(
+        admin_gateway_host(&config.gateway.host),
+        config.gateway.port,
+        config.gateway.path_prefix.as_deref(),
+        "/admin/enroll/close",
+    );
+    let response = reqwest::Client::new()
+        .post(&url)
+        .header(
+            zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+            &admin_token,
+        )
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|error| anyhow::Error::msg(format!("Closing enrollment failed: {error}")))?;
+    if !response.status().is_success() {
+        anyhow::bail!("gateway refused to close the enrollment window");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn wait_for_pairing(config: &Config, timeout_secs: u64) -> Result<()> {
+    use crossterm::event::{Event, KeyCode, KeyModifiers, poll, read};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+    use std::io::Write;
+
+    struct RawModeGuard;
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+        }
+    }
+
+    enable_raw_mode()?;
+    let _guard = RawModeGuard;
+    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        loop {
+            if !poll(std::time::Duration::from_millis(200)).unwrap_or(false) {
+                continue;
+            }
+            let Ok(Event::Key(key)) = read() else {
+                continue;
+            };
+            let stop = matches!(
+                key.code,
+                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc
+            ) || (key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL));
+            if stop {
+                let _ = stop_tx.send(());
+                return;
+            }
+        }
+    });
+
+    let mut last_remaining = timeout_secs;
+    loop {
+        let status = fetch_enrollment_status(config).await?;
+        if status.get("active").and_then(|value| value.as_bool()) != Some(true) {
+            let reason = status
+                .get("last_close")
+                .and_then(|value| value.as_str())
+                .unwrap_or("closed");
+            let message = match reason {
+                "paired" => "Device paired; enrollment port closed.",
+                "timeout" => "Pairing timed out; enrollment port closed.",
+                "closed" => "Pairing stopped; enrollment port closed.",
+                "replaced" => "Pairing window replaced.",
+                _ => "Enrollment port closed.",
+            };
+            let _ = disable_raw_mode();
+            println!("\n{message}");
+            return Ok(());
+        }
+        if let Some(remaining) = status
+            .get("expires_in_secs")
+            .and_then(|value| value.as_u64())
+        {
+            last_remaining = remaining;
+        }
+        let port = status
+            .get("port")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let port_text = if port > 0 {
+            format!(" · port {port}")
+        } else {
+            String::new()
+        };
+        print!(
+            "\r\x1b[2KEnrollment open{port_text} · {}s remaining · press q to stop",
+            last_remaining
+        );
+        std::io::stdout().flush().ok();
+
+        tokio::select! {
+            _ = stop_rx.recv() => {
+                close_enrollment_window(config).await?;
+                let _ = disable_raw_mode();
+                println!("\nPairing stopped; enrollment port closed.");
+                return Ok(());
+            }
+            () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+        }
+    }
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -10621,7 +10802,8 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             host,
             qr,
             pair_timeout,
-        } => run_pair_command(&config, host, qr, pair_timeout).await,
+            enroll_port,
+        } => run_pair_command(&config, host, qr, pair_timeout, enroll_port).await,
 
         Commands::Mtls { command } => run_mtls_command(&config, command).await,
 
@@ -14921,14 +15103,12 @@ enum PaircodeResult {
 }
 
 #[cfg(feature = "agent-runtime")]
-async fn open_enrollment_window(config: &Config, timeout_secs: u64) -> Result<()> {
-    let admin_token =
-        zeroclaw_config::pairing::read_gateway_admin_token(&config.data_dir).ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "No gateway admin token at {}. Run this on the gateway host, as the user that                  runs the gateway, while the gateway is running.",
-                zeroclaw_config::pairing::gateway_admin_token_path(&config.data_dir).display()
-            ))
-        })?;
+async fn open_enrollment_window(
+    config: &Config,
+    timeout_secs: u64,
+    port: Option<u16>,
+) -> Result<()> {
+    let admin_token = gateway_admin_token(config)?;
     let url = gateway_admin_url(
         admin_gateway_host(&config.gateway.host),
         config.gateway.port,
@@ -14941,7 +15121,10 @@ async fn open_enrollment_window(config: &Config, timeout_secs: u64) -> Result<()
             zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
             &admin_token,
         )
-        .json(&serde_json::json!({"timeout_secs": timeout_secs}))
+        .json(&serde_json::json!({
+            "timeout_secs": timeout_secs,
+            "port": port,
+        }))
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await

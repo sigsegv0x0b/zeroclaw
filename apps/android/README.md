@@ -100,8 +100,10 @@ window. On the gateway run:
 zeroclaw pair --host <public-host-or-ddns> --qr --pair-timeout 120
 ```
 
-The enrollment listener closes when the timeout expires or after the first
-successful pairing. The timeout is capped at 600 seconds.
+The enrollment listener closes when the timeout expires, after the first
+successful pairing, or when `q` is pressed at the pairing prompt. The timeout
+is capped at 600 seconds. Add `--enroll-port 42620` to use a different
+enrollment port for that window; the QR advertises it automatically.
 
 In the app's onboarding **Secure setup (mTLS)** section, scan that QR (or enter
 the host and pairing code). The app fetches the gateway CA, shows the SAS to
