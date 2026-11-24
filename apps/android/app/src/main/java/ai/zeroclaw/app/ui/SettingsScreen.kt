@@ -2,6 +2,7 @@ package ai.zeroclaw.app.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -11,15 +12,21 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -54,7 +61,11 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import ai.zeroclaw.app.data.DevicePermissions
 import ai.zeroclaw.app.data.NodeStatus
+import ai.zeroclaw.app.data.ToolEntry
+import ai.zeroclaw.app.data.ToolPolicy
+import ai.zeroclaw.app.data.ToolPolicyUi
 import ai.zeroclaw.app.data.UiState
+import ai.zeroclaw.app.ui.theme.MonoFamily
 import ai.zeroclaw.app.ui.theme.Zc
 
 @Composable
@@ -70,6 +81,8 @@ fun SettingsScreen(
     onMtlsGatewayId: (String) -> Unit,
     onMtlsImport: (kind: String, uri: android.net.Uri?) -> Unit,
     onRenewCertificate: () -> Unit,
+    onRefreshTools: () -> Unit,
+    onToolPolicy: (String, ToolPolicy) -> Unit,
 ) {
     var url by remember(state.gatewayUrl) { mutableStateOf(state.gatewayUrl) }
     var gwId by remember(state.mtlsGatewayId) { mutableStateOf(state.mtlsGatewayId) }
@@ -154,6 +167,7 @@ fun SettingsScreen(
     var token by remember(state.token) { mutableStateOf(state.token) }
     var reveal by remember { mutableStateOf(false) }
     var confirmForget by remember { mutableStateOf(false) }
+    var tab by remember { mutableStateOf(SettingsTab.General) }
     val colors = zcFieldColors()
 
     Column(
@@ -180,12 +194,38 @@ fun SettingsScreen(
             )
         }
 
-        Column(
+        Row(
             Modifier
                 .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp, vertical = 12.dp),
+                .padding(horizontal = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
+            SettingsTab.entries.forEach { entry ->
+                TextButton(
+                    onClick = {
+                        tab = entry
+                        if (entry == SettingsTab.Tools && !state.toolPolicy.loading) {
+                            onRefreshTools()
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text(
+                        text = entry.label,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = if (tab == entry) Zc.Accent else Zc.TextMuted,
+                    )
+                }
+            }
+        }
+
+        if (tab == SettingsTab.General) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp, vertical = 12.dp),
+            ) {
             SectionLabel("Connection")
             OutlinedTextField(
                 value = url,
@@ -606,8 +646,215 @@ fun SettingsScreen(
                 style = MaterialTheme.typography.labelSmall,
                 color = Zc.TextSubtle,
             )
+            }
+        } else {
+            ToolPolicyTab(
+                state = state,
+                onRefresh = onRefreshTools,
+                onPolicy = onToolPolicy,
+                modifier = Modifier.weight(1f),
+            )
         }
     }
+}
+
+private enum class SettingsTab(val label: String) {
+    General("General"),
+    Tools("Tools"),
+}
+
+@Composable
+private fun ToolPolicyTab(
+    state: UiState,
+    onRefresh: () -> Unit,
+    onPolicy: (String, ToolPolicy) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val policy = state.toolPolicy
+    var search by remember { mutableStateOf("") }
+    Column(
+        modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp),
+    ) {
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = search,
+                onValueChange = { search = it },
+                label = { Text("Search tools") },
+                singleLine = true,
+                colors = zcFieldColors(),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(8.dp))
+            TextButton(onClick = onRefresh, enabled = !policy.loading) {
+                Text("Refresh", color = Zc.Accent)
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = "Agent ${state.agent.ifBlank { "—" }} · risk profile " +
+                policy.riskProfile.ifBlank { "—" },
+            style = MaterialTheme.typography.labelSmall,
+            color = Zc.TextSubtle,
+        )
+        Text(
+            text = "Ask confirms every time · Always preapproves · Block hides the tool · " +
+                "Default uses the profile.",
+            style = MaterialTheme.typography.labelSmall,
+            color = Zc.TextSubtle,
+        )
+        if (policy.level.isNotBlank() && policy.level != "supervised") {
+            Text(
+                text = "Approval prompts are bypassed at autonomy level ${policy.level}; " +
+                    "stored policies still apply on delegated paths.",
+                style = MaterialTheme.typography.labelSmall,
+                color = Zc.Warning,
+            )
+        }
+        if (policy.autoApprove.contains("*") || policy.alwaysAsk.contains("*")) {
+            Text(
+                text = "A wildcard approval entry is active; individual overrides may not win.",
+                style = MaterialTheme.typography.labelSmall,
+                color = Zc.Warning,
+            )
+        }
+        policy.error?.let { message ->
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodySmall,
+                color = Zc.Danger,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Zc.DangerSoft, RoundedCornerShape(8.dp))
+                    .padding(8.dp),
+            )
+        }
+
+        if (policy.loading && !policy.loaded) {
+            Box(
+                Modifier.fillMaxWidth().padding(vertical = 32.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator(color = Zc.Accent, strokeWidth = 2.dp)
+            }
+        } else {
+            val query = search.trim()
+            val filtered = policy.entries.filter { entry ->
+                query.isBlank() ||
+                    entry.name.contains(query, ignoreCase = true) ||
+                    entry.description.contains(query, ignoreCase = true)
+            }
+            val phone = filtered.filter { toolDisplay(it.name).isNode }
+            val server = filtered.filterNot { toolDisplay(it.name).isNode }
+            LazyColumn(Modifier.fillMaxSize().padding(top = 6.dp)) {
+                if (phone.isNotEmpty()) {
+                    item { SectionLabel("Phone tools") }
+                    items(phone, key = { it.name }) { entry ->
+                        ToolPolicyRow(entry, policy, onPolicy)
+                    }
+                }
+                if (server.isNotEmpty()) {
+                    item { SectionLabel("Server tools") }
+                    items(server, key = { it.name }) { entry ->
+                        ToolPolicyRow(entry, policy, onPolicy)
+                    }
+                }
+                if (filtered.isEmpty()) {
+                    item {
+                        Text(
+                            text = if (policy.loaded) "No tools match." else "Loading tools…",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Zc.TextSubtle,
+                            modifier = Modifier.padding(vertical = 24.dp),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ToolPolicyRow(
+    entry: ToolEntry,
+    policy: ToolPolicyUi,
+    onPolicy: (String, ToolPolicy) -> Unit,
+) {
+    val display = remember(entry.name) { toolDisplay(entry.name) }
+    val current = policy.policyFor(entry.name)
+    val updating = policy.updating == entry.name
+    Column(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = display.name,
+                style = MaterialTheme.typography.bodyMedium.copy(fontFamily = MonoFamily),
+                color = Zc.Text,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(6.dp))
+            ToolOriginBadge(display)
+            if (updating) {
+                Spacer(Modifier.width(8.dp))
+                CircularProgressIndicator(
+                    modifier = Modifier.size(14.dp),
+                    strokeWidth = 2.dp,
+                    color = Zc.Accent,
+                )
+            }
+        }
+        if (entry.description.isNotBlank()) {
+            Text(
+                text = entry.description,
+                style = MaterialTheme.typography.labelSmall,
+                color = Zc.TextSubtle,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            ToolPolicyChip("Default", current == ToolPolicy.Default, !updating) {
+                onPolicy(entry.name, ToolPolicy.Default)
+            }
+            ToolPolicyChip("Ask", current == ToolPolicy.Ask, !updating) {
+                onPolicy(entry.name, ToolPolicy.Ask)
+            }
+            ToolPolicyChip("Always", current == ToolPolicy.Always, !updating) {
+                onPolicy(entry.name, ToolPolicy.Always)
+            }
+            ToolPolicyChip("Block", current == ToolPolicy.Blocked, !updating) {
+                onPolicy(entry.name, ToolPolicy.Blocked)
+            }
+        }
+    }
+    Box(Modifier.fillMaxWidth().height(1.dp).background(Zc.Border))
+}
+
+@Composable
+private fun ToolPolicyChip(
+    label: String,
+    selected: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        enabled = enabled,
+        label = {
+            Text(label, style = MaterialTheme.typography.labelSmall)
+        },
+        colors = FilterChipDefaults.filterChipColors(
+            selectedContainerColor = Zc.AccentSoft,
+            selectedLabelColor = Zc.Accent,
+        ),
+    )
 }
 
 private fun nodeStatusLabel(state: UiState): String = when (val status = state.nodeStatus) {

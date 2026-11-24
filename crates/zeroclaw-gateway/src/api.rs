@@ -442,7 +442,7 @@ pub async fn handle_api_tools(
         .and_then(|alias| state.tools_registry_by_agent.get(alias).cloned())
         .unwrap_or_else(|| std::sync::Arc::clone(&state.tools_registry));
 
-    let tools: Vec<serde_json::Value> = registry
+    let mut tools: Vec<serde_json::Value> = registry
         .iter()
         .map(|spec| {
             let mut tool = serde_json::json!({
@@ -459,6 +459,19 @@ pub async fn handle_api_tools(
             tool
         })
         .collect();
+
+    // Node capabilities are built against the live registry for each chat
+    // turn, so they are not in the startup `tools_registry` snapshot. Include
+    // them here too; Tools/approval UIs must be able to preapprove the phone's
+    // capabilities under the same prefixed names the model sees.
+    for (node_id, capability_name, capability) in state.node_registry.all_capabilities() {
+        tools.push(serde_json::json!({
+            "name": crate::node_tool::NodeTool::tool_name(&node_id, &capability_name),
+            "description": capability.description,
+            "parameters": capability.parameters,
+        }));
+    }
+    tools.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
 
     Json(serde_json::json!({"tools": tools})).into_response()
 }

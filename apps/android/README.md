@@ -151,6 +151,21 @@ the gateway turns each one into an agent tool. Both halves must be on:
    gateway's own native tools, so the agent can choose the phone or the host;
    the tool descriptions tell it to ask when the user has not said which.
 
+## Tool permissions
+
+**Settings → Tools** lists the selected agent's tools, grouped into phone and
+server tools. Each tool has four policy choices:
+
+- **Default** — let the risk profile decide.
+- **Ask** — require approval every time (`always_ask`).
+- **Always** — preapprove (`auto_approve`).
+- **Block** — hide it from the agent (`excluded_tools`).
+
+The app writes these lists on the agent's `risk_profiles.<alias>` through the
+gateway config API. Connected node capabilities appear under the same
+`node_<node_id>__<capability>` names the model sees, so phone tools can be
+preapproved from the same screen.
+
 Advertised capabilities:
 
 | Capability | Tool parameters | Device effect |

@@ -69,6 +69,47 @@ class GatewayClient(
             }
         }
 
+    suspend fun tools(baseUrl: String, token: String, agent: String): List<ToolEntry> =
+        withContext(Dispatchers.IO) {
+            val body = execute(
+                get("$baseUrl/api/tools?agent=${encodeQuery(agent)}", token),
+            )
+            val root = zcJson.parseToJsonElement(body) as? JsonObject
+                ?: return@withContext emptyList()
+            val tools = root["tools"] as? JsonArray ?: return@withContext emptyList()
+            tools.mapNotNull { element ->
+                val obj = element as? JsonObject ?: return@mapNotNull null
+                val name = obj["name"]?.jsonPrimitive?.contentOrNullSafe()
+                    ?: return@mapNotNull null
+                ToolEntry(
+                    name = name,
+                    description = obj["description"]?.jsonPrimitive?.contentOrNullSafe().orEmpty(),
+                )
+            }
+        }
+
+    /** Read one config property; the gateway returns its display string. */
+    suspend fun configProp(baseUrl: String, token: String, path: String): JsonElement? =
+        withContext(Dispatchers.IO) {
+            val body = execute(
+                get("$baseUrl/api/config/prop?path=${encodeQuery(path)}", token),
+            )
+            val root = zcJson.parseToJsonElement(body) as? JsonObject
+            root?.get("value")
+        }
+
+    /** Atomic JSON-Patch write, used for per-tool approval policy. */
+    suspend fun patchConfig(baseUrl: String, token: String, ops: List<JsonObject>) {
+        withContext(Dispatchers.IO) {
+            val request = Request.Builder()
+                .url("$baseUrl/api/config")
+                .patch(JsonArray(ops).toString().toRequestBody(jsonMedia))
+                .header("Authorization", "Bearer $token")
+                .build()
+            execute(request)
+        }
+    }
+
     suspend fun sessions(baseUrl: String, token: String): List<SessionEntry> =
         withContext(Dispatchers.IO) {
             val body = execute(get("$baseUrl/api/sessions", token))
@@ -133,6 +174,9 @@ class GatewayClient(
 
     private fun encodePath(value: String): String =
         java.net.URLEncoder.encode(value, "UTF-8").replace("+", "%20")
+
+    private fun encodeQuery(value: String): String =
+        java.net.URLEncoder.encode(value, "UTF-8")
 
     private fun JsonElement.objOrNull(): JsonObject? = this as? JsonObject
 

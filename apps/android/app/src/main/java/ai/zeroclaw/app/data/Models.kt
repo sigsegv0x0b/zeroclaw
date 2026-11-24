@@ -19,6 +19,42 @@ data class AgentEntry(
     val enabled: Boolean = true,
 )
 
+data class ToolEntry(
+    val name: String,
+    val description: String = "",
+)
+
+enum class ToolPolicy {
+    /** No explicit entry; the risk profile's autonomy level decides. */
+    Default,
+    /** Always ask before the tool runs. */
+    Ask,
+    /** Preapprove the tool. */
+    Always,
+    /** Make the tool unavailable to the agent. */
+    Blocked,
+}
+
+data class ToolPolicyUi(
+    val loading: Boolean = false,
+    val loaded: Boolean = false,
+    val entries: List<ToolEntry> = emptyList(),
+    val riskProfile: String = "",
+    val level: String = "",
+    val autoApprove: Set<String> = emptySet(),
+    val alwaysAsk: Set<String> = emptySet(),
+    val excluded: Set<String> = emptySet(),
+    val updating: String? = null,
+    val error: String? = null,
+) {
+    fun policyFor(name: String): ToolPolicy = when {
+        excluded.contains(name) -> ToolPolicy.Blocked
+        alwaysAsk.contains("*") || alwaysAsk.contains(name) -> ToolPolicy.Ask
+        autoApprove.contains("*") || autoApprove.contains(name) -> ToolPolicy.Always
+        else -> ToolPolicy.Default
+    }
+}
+
 @Serializable
 data class AgentsResponse(
     val agents: List<AgentEntry> = emptyList(),
