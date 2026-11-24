@@ -1605,6 +1605,72 @@ impl Agent {
         self.config.resolved.keep_tool_context_turns
     }
 
+    /// Append one history entry. Used by the gateway to close a failed turn
+    /// with an explicit marker before the transcript is persisted.
+    pub fn push_history_message(&mut self, message: ConversationMessage) {
+        self.history.push(message);
+    }
+
+    /// Recover from a provider-side context overflow: drop the failed current
+    /// turn, truncate long retained content, and keep only the most recent
+    /// `keep_turns` prior turns.
+    ///
+    /// The caller sends the operator a "compacted; resend" notice. This does
+    /// not add a breadcrumb because the failed turn is being discarded and the
+    /// operator is asked to resend it.
+    pub fn compact_history_for_context_overflow(
+        &mut self,
+        keep_turns: usize,
+        max_chars: usize,
+    ) -> bool {
+        let mut changed = false;
+        if let Some(last_user) = self.history.iter().rposition(|message| {
+            matches!(
+                message,
+                ConversationMessage::Chat(chat) if chat.role == "user"
+            )
+        }) && last_user > 0
+        {
+            self.history.truncate(last_user);
+            changed = true;
+        }
+
+        for message in &mut self.history {
+            match message {
+                ConversationMessage::Chat(chat) if chat.role != "system" => {
+                    changed |= truncate_history_text(&mut chat.content, max_chars);
+                }
+                ConversationMessage::AssistantToolCalls {
+                    text,
+                    reasoning_content,
+                    ..
+                } => {
+                    if let Some(text) = text.as_mut() {
+                        changed |= truncate_history_text(text, max_chars);
+                    }
+                    if let Some(reasoning) = reasoning_content.as_mut() {
+                        changed |= truncate_history_text(reasoning, max_chars);
+                    }
+                }
+                ConversationMessage::ToolResults(results) => {
+                    for result in results {
+                        changed |= truncate_history_text(&mut result.content, max_chars);
+                    }
+                }
+                ConversationMessage::Chat(_) => {}
+            }
+        }
+
+        let trimmed = crate::agent::history_trim::trim_conversation_to_recent_turns(
+            std::mem::take(&mut self.history),
+            keep_turns.max(1),
+            self.history_has_trim_breadcrumb,
+        );
+        changed |= trimmed.trimmed;
+        self.history = trimmed.history;
+        changed
+    }
+
     /// Return the owner-maintained structured history for native persistence.
     /// The Agent history is already replayed from the provider buffer with
     /// positional memory provenance applied; callers must not reconstruct it
@@ -5955,6 +6021,17 @@ mod parity;
 #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
 #[path = "plugin_live_config.rs"]
 mod plugin_live_config;
+
+fn truncate_history_text(text: &mut String, max_chars: usize) -> bool {
+    let max_chars = max_chars.max(1);
+    if text.chars().count() <= max_chars {
+        return false;
+    }
+    let mut truncated: String = text.chars().take(max_chars).collect();
+    truncated.push('…');
+    *text = truncated;
+    true
+}
 
 #[cfg(test)]
 mod tests {
@@ -15308,6 +15385,43 @@ mod tests {
             .structured_max_history_turns(max_history_turns)
             .build()
             .expect("agent builder should succeed with valid config")
+    }
+
+    #[test]
+    fn compact_history_drops_failed_turn_and_truncates_old_content() {
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_history_test_agent(32, observer);
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::system("sys")),
+            ConversationMessage::Chat(ChatMessage::user("old user")),
+            ConversationMessage::Chat(ChatMessage::assistant("x".repeat(20))),
+            ConversationMessage::Chat(ChatMessage::user("failed current")),
+            ConversationMessage::Chat(ChatMessage::assistant("partial failure output")),
+        ];
+
+        assert!(agent.compact_history_for_context_overflow(1, 5));
+        assert!(matches!(
+            agent.history.first(),
+            Some(ConversationMessage::Chat(chat)) if chat.role == "system"
+        ));
+        assert!(agent.history.iter().any(
+            |message| matches!(message, ConversationMessage::Chat(chat) if chat.content.starts_with("old"))
+        ));
+        assert!(!agent.history.iter().any(|message| {
+            matches!(message, ConversationMessage::Chat(chat) if chat.content == "failed current")
+        }));
+        let assistant = agent
+            .history
+            .iter()
+            .find_map(|message| match message {
+                ConversationMessage::Chat(chat) if chat.role == "assistant" => {
+                    Some(chat.content.as_str())
+                }
+                _ => None,
+            })
+            .expect("old assistant turn remains");
+        assert!(assistant.chars().count() <= 6);
+        assert!(assistant.ends_with('…'));
     }
 
     #[test]

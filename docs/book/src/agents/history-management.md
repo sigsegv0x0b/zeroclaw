@@ -147,9 +147,14 @@ transcript, CLI session file) keep all their rows, so raising the value later
 shows older tool rows again. The gateway WebSocket history API hides those
 protocol rows from clients: tool results are omitted and an assistant tool-call
 row contributes only its visible narration text, so a reloaded phone keeps the
-conversation text without live tool cards. The summary row is the pruning marker
-the providers already recognise, and it only ever follows a user prompt, so no
-route sees two assistant rows in a row.
+conversation text without live tool cards. A failed gateway WebSocket turn is
+closed with an internal `[Task failed — not continuing this request]` marker
+that the history API hides. A provider-side context overflow drops the failed
+turn, truncates retained content, keeps recent turns, and asks the operator to
+resend; a local preflight capacity rejection is not compacted because the fixed
+system prompt and tool schemas already exceed the window. The summary row is the
+pruning marker the providers already recognise, and it only ever follows a user
+prompt, so no route sees two assistant rows in a row.
 
 A turn collapses as a unit, in both native (`role=tool`) and prompt-mode
 (`[Tool results]` carrier) shapes, so no orphan call or result is created. A

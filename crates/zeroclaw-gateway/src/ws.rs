@@ -39,6 +39,14 @@ use zeroclaw_runtime::sop::approval::{
 /// channel-side default on `TelegramConfig::approval_timeout_secs`.
 const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
 
+/// Internal transcript marker used to close a failed turn so the next prompt
+/// does not inherit an orphaned user turn. It is hidden from history APIs.
+pub(crate) const TASK_FAILED_MARKER: &str = "[Task failed — not continuing this request]";
+
+/// Operator notice after a provider-side context overflow. The failed turn is
+/// discarded and recent history is compacted before the operator resends.
+const CONTEXT_COMPACTED_MESSAGE: &str = "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message.";
+
 /// Single ingress identity for gateway WebSocket turns.
 ///
 /// This name is used in three places that MUST agree:
@@ -2993,6 +3001,26 @@ async fn process_chat_message(
             );
         }
         Err(e) => {
+            let typed_capacity =
+                zeroclaw_runtime::agent::context_window_exceeded_from_error(&e.error).is_some();
+            let provider_overflow = !typed_capacity
+                && zeroclaw_providers::reliable::is_context_window_exceeded(&e.error);
+
+            // A provider-side overflow is a history problem: drop the failed
+            // turn, truncate long retained content, and keep recent turns so
+            // the operator's resend starts from a smaller context. The local
+            // preflight capacity error is not a history problem (system prompt
+            // and tool schemas already exceed the window), so keep the turn
+            // and close it with the same marker the channel orchestrator uses.
+            let history_compacted = if provider_overflow {
+                agent.compact_history_for_context_overflow(2, 600)
+            } else {
+                agent.push_history_message(zeroclaw_providers::ConversationMessage::Chat(
+                    zeroclaw_providers::ChatMessage::assistant(TASK_FAILED_MARKER),
+                ));
+                false
+            };
+
             if let Some(ref backend) = state.session_backend {
                 persist_agent_conversation_state(backend.as_ref(), session_key, agent);
                 *persisted_watermark =
@@ -3008,11 +3036,24 @@ async fn process_chat_message(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e.error)})),
+                    .with_attrs(::serde_json::json!({
+                        "error": format!("{}", e.error),
+                        "context_window_kind": if typed_capacity {
+                            "local_capacity"
+                        } else if provider_overflow {
+                            "provider_overflow"
+                        } else {
+                            "other"
+                        },
+                        "history_compacted": history_compacted,
+                    })),
                 "Agent turn failed"
             );
-            let user_message =
-                zeroclaw_runtime::agent::terminal_completion_error_message(&e.error, None);
+            let user_message = if provider_overflow {
+                Some(CONTEXT_COMPACTED_MESSAGE.to_string())
+            } else {
+                zeroclaw_runtime::agent::terminal_completion_error_message(&e.error, None)
+            };
             let err = send_ws_turn_failure(sender, &e.error, user_message.as_deref()).await;
 
             // Broadcast error event
