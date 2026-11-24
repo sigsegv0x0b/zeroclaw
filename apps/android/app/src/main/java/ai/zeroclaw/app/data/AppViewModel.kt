@@ -94,6 +94,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var pendingMtlsPort: Int = 42618
     private var pendingInsecure: PendingConnection? = null
     private var appliedClientCertPem: String = ""
+    private var recoveringInterruptedTurn = false
 
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui.asStateFlow()
@@ -105,8 +106,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             socket.events.collect(::handleEvent)
         }
         viewModelScope.launch {
+            var previous: SocketState = SocketState.Idle
             socket.state.collect { state ->
+                val reconnected = previous !is SocketState.Open && state is SocketState.Open
                 _ui.update { it.copy(socket = state) }
+                if (reconnected && _ui.value.busy && !recoveringInterruptedTurn) {
+                    recoveringInterruptedTurn = true
+                    viewModelScope.launch {
+                        try {
+                            recoverInterruptedTurn()
+                        } finally {
+                            recoveringInterruptedTurn = false
+                        }
+                    }
+                }
+                previous = state
             }
         }
         // A background worker may rotate the certificate while the process is
@@ -975,6 +989,35 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 nodeId = snapshot.deviceId,
             ),
         )
+    }
+
+    /**
+     * A turn belongs to the socket that started it. When that socket drops,
+     * the gateway keeps the turn running unattended, but the reconnected
+     * socket cannot receive its events — including approval or elicitation
+     * prompts. Cancel the orphaned turn and reload the transcript so the UI
+     * does not sit on "working" forever.
+     */
+    private suspend fun recoverInterruptedTurn() {
+        val snapshot = _ui.value
+        if (snapshot.sessionId.isBlank()) return
+        runCatching { gateway.abort(snapshot.gatewayUrl, snapshot.token, snapshot.sessionId) }
+        // Let the abort settle before reading the transcript it may append to.
+        kotlinx.coroutines.delay(750)
+        val history = runCatching {
+            gateway.messages(snapshot.gatewayUrl, snapshot.token, snapshot.sessionId)
+        }.getOrNull()?.messages.orEmpty().toChatMessages()
+        _ui.update { state ->
+            state.copy(
+                messages = history.ifEmpty { state.messages }
+                    .map { it.copy(streaming = false) },
+                busy = false,
+                approval = null,
+                elicitation = null,
+                error = null,
+                notice = "Connection dropped. The interrupted turn was stopped; you can send again.",
+            )
+        }
     }
 
     // ── Turns ──────────────────────────────────────────────────────────────
