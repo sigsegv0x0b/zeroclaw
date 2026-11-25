@@ -1,8 +1,10 @@
 package ai.zeroclaw.app.data
 
 import android.app.Application
+import android.content.ContentResolver
 import android.content.Intent
 import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -10,17 +12,22 @@ import ai.zeroclaw.app.service.NodeService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 
 /** A press shorter than this is a tap: let silence detection finish the turn. */
 private const val VOICE_QUICK_TAP_MS = 400L
+private const val MAX_ATTACHMENT_BYTES = 20L * 1024 * 1024
 
 data class UiState(
     val booting: Boolean = true,
@@ -50,6 +57,7 @@ data class UiState(
     val busy: Boolean = false,
     val approval: ApprovalPrompt? = null,
     val elicitation: ElicitationPrompt? = null,
+    val pendingAttachments: List<PendingAttachment> = emptyList(),
     val error: String? = null,
     val notice: String? = null,
     val insecurePrompt: InsecureConnectionPrompt? = null,
@@ -952,6 +960,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 busy = false,
                 approval = null,
                 elicitation = null,
+                pendingAttachments = emptyList(),
                 error = null,
                 drawerOpen = false,
             )
@@ -1014,6 +1023,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 busy = false,
                 approval = null,
                 elicitation = null,
+                pendingAttachments = emptyList(),
                 error = null,
                 notice = "Connection dropped. The interrupted turn was stopped; you can send again.",
             )
@@ -1022,10 +1032,100 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ── Turns ──────────────────────────────────────────────────────────────
 
+    fun attach(uri: Uri) {
+        val snapshot = _ui.value
+        if (snapshot.agent.isBlank() || !snapshot.connected) {
+            _ui.update { it.copy(error = "Connect to the gateway before attaching files.") }
+            return
+        }
+        val resolver = getApplication<Application>().contentResolver
+        val name = queryDisplayName(resolver, uri) ?: "attachment"
+        val size = querySize(resolver, uri)
+        if (size != null && size > MAX_ATTACHMENT_BYTES) {
+            _ui.update { it.copy(error = "Attachment exceeds the 20 MB upload limit.") }
+            return
+        }
+        val mime = resolver.getType(uri).orEmpty()
+        val id = newId()
+        _ui.update {
+            it.copy(
+                pendingAttachments = it.pendingAttachments + PendingAttachment(
+                    id = id,
+                    name = name,
+                    kind = if (mime.startsWith("image/")) AttachmentKind.Image else AttachmentKind.File,
+                    localUri = uri.toString(),
+                    uploading = true,
+                    size = size ?: 0,
+                ),
+                error = null,
+            )
+        }
+        viewModelScope.launch {
+            val bytes = withContext(Dispatchers.IO) {
+                runCatching {
+                    resolver.openInputStream(uri)?.use { input -> readCapped(input, MAX_ATTACHMENT_BYTES) }
+                }.getOrNull()
+            }
+            if (bytes == null || bytes.isEmpty()) {
+                failAttachment(id, "Could not read the selected attachment.")
+                return@launch
+            }
+            runCatching {
+                gateway.uploadAttachment(
+                    baseUrl = snapshot.gatewayUrl,
+                    token = snapshot.token,
+                    agent = snapshot.agent,
+                    filename = name,
+                    bytes = bytes,
+                )
+            }.onSuccess { uploaded ->
+                _ui.update { state ->
+                    state.copy(
+                        pendingAttachments = state.pendingAttachments.map { attachment ->
+                            if (attachment.id != id) {
+                                attachment
+                            } else {
+                                attachment.copy(
+                                    name = uploaded.name.ifBlank { name },
+                                    marker = uploaded.marker,
+                                    path = uploaded.path,
+                                    kind = if (uploaded.kind == "image") {
+                                        AttachmentKind.Image
+                                    } else {
+                                        AttachmentKind.File
+                                    },
+                                    uploading = false,
+                                    size = uploaded.size.takeIf { it > 0 } ?: bytes.size.toLong(),
+                                )
+                            }
+                        },
+                    )
+                }
+            }.onFailure { error ->
+                failAttachment(id, error.message ?: "Attachment upload failed.")
+            }
+        }
+    }
+
+    fun removeAttachment(id: String) {
+        _ui.update { state ->
+            state.copy(pendingAttachments = state.pendingAttachments.filterNot { it.id == id })
+        }
+    }
+
     fun send(text: String) {
         val content = text.trim()
-        if (content.isEmpty()) return
         val snapshot = _ui.value
+        val attachments = snapshot.pendingAttachments
+        if (attachments.any { it.uploading }) {
+            _ui.update { it.copy(error = "Wait for attachments to finish uploading.") }
+            return
+        }
+        if (attachments.any { it.marker.isBlank() }) {
+            _ui.update { it.copy(error = "Attachment upload is incomplete.") }
+            return
+        }
+        if (content.isEmpty() && attachments.isEmpty()) return
         if (snapshot.agent.isBlank()) {
             _ui.update { it.copy(error = "Pick an agent first.") }
             return
@@ -1034,14 +1134,68 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _ui.update { it.copy(error = "Not connected to the gateway yet.") }
             return
         }
-        val userMessage = ChatMessage(id = newId(), role = MessageRole.User, text = content)
+        val markers = attachments.joinToString("\n") { it.marker }.trim()
+        val outgoing = listOf(content, markers)
+            .filter { it.isNotBlank() }
+            .joinToString("\n\n")
+        val userMessage = ChatMessage(
+            id = newId(),
+            role = MessageRole.User,
+            text = content,
+            attachments = attachments.map { attachment ->
+                MessageAttachment(
+                    name = attachment.name,
+                    path = attachment.path,
+                    kind = attachment.kind,
+                    localUri = attachment.localUri,
+                )
+            },
+        )
         val assistant = ChatMessage(id = newId(), role = MessageRole.Assistant, streaming = true)
         _ui.update {
-            it.copy(messages = it.messages + userMessage + assistant, busy = true, error = null)
+            it.copy(
+                messages = it.messages + userMessage + assistant,
+                busy = true,
+                error = null,
+                pendingAttachments = emptyList(),
+            )
         }
-        if (!socket.sendMessage(content)) {
+        if (!socket.sendMessage(outgoing)) {
             finishAssistant("The message could not be sent.")
         }
+    }
+
+    private fun failAttachment(id: String, message: String) {
+        _ui.update { state ->
+            state.copy(
+                pendingAttachments = state.pendingAttachments.filterNot { it.id == id },
+                error = message,
+            )
+        }
+    }
+
+    private fun queryDisplayName(resolver: ContentResolver, uri: Uri): String? =
+        resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getString(0) else null
+        }
+
+    private fun querySize(resolver: ContentResolver, uri: Uri): Long? =
+        resolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else null
+        }
+
+    private fun readCapped(input: InputStream, maxBytes: Long): ByteArray? {
+        val output = ByteArrayOutputStream()
+        val buffer = ByteArray(16 * 1024)
+        var total = 0L
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            total += read
+            if (total > maxBytes) return null
+            output.write(buffer, 0, read)
+        }
+        return output.toByteArray()
     }
 
     fun stop() {

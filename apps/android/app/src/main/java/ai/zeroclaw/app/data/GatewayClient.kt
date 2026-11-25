@@ -124,6 +124,30 @@ class GatewayClient(
             zcJson.decodeFromString(MessagesResponse.serializer(), body)
         }
 
+    /** Upload one user-selected picture or file; returns the marker to send. */
+    suspend fun uploadAttachment(
+        baseUrl: String,
+        token: String,
+        agent: String,
+        filename: String,
+        bytes: ByteArray,
+    ): UploadResponse = withContext(Dispatchers.IO) {
+        val url = buildString {
+            append(baseUrl)
+            append("/api/upload?agent=")
+            append(encodeQuery(agent))
+            append("&filename=")
+            append(encodeQuery(filename))
+        }
+        val request = Request.Builder()
+            .url(url)
+            .post(bytes.toRequestBody("application/octet-stream".toMediaType()))
+            .header("Authorization", "Bearer $token")
+            .build()
+        val body = execute(request)
+        zcJson.decodeFromString(UploadResponse.serializer(), body)
+    }
+
     suspend fun abort(baseUrl: String, token: String, sessionId: String) {
         withContext(Dispatchers.IO) {
             runCatching {
@@ -201,13 +225,19 @@ fun List<MessageRow>.toChatMessages(): List<ChatMessage> = mapNotNull { row ->
         "assistant" -> MessageRole.Assistant
         else -> MessageRole.System
     }
-    if (row.content.isBlank()) {
+    val (displayText, attachments) = if (role == MessageRole.User) {
+        parseAttachmentMarkers(row.content)
+    } else {
+        row.content to emptyList()
+    }
+    if (displayText.isBlank() && attachments.isEmpty()) {
         null
     } else {
         ChatMessage(
             id = java.util.UUID.randomUUID().toString(),
             role = role,
-            text = row.content,
+            text = displayText,
+            attachments = attachments,
         )
     }
 }

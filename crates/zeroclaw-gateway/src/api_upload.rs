@@ -1,18 +1,19 @@
-//! `POST /api/upload?agent=<alias>` — web dashboard image upload.
+//! `POST /api/upload?agent=<alias>&filename=<name>` — dashboard and app
+//! attachment upload.
 //!
-//! Accepts raw image bytes in the request body, types them by magic bytes
-//! (never the client-declared Content-Type or filename), and writes them to
-//! `<agent workspace>/webui_uploads/`. The response carries the saved path and
-//! the `[IMAGE:<path>]` marker the dashboard embeds in the next chat message,
-//! which the multimodal provider path resolves into image content at
-//! request time (`zeroclaw_providers::multimodal`).
+//! Accepts raw bytes (pictures or files) and writes them to
+//! `<agent workspace>/webui_uploads/`. Images are typed by magic bytes, never
+//! the client-declared Content-Type; the response carries `[IMAGE:<path>]` so
+//! the multimodal provider path resolves them into vision content. Other
+//! payloads are saved as files and returned with `[FILE:<path>]`, which the
+//! agent can pass to its file tools.
 //!
-//! Acceptance is decided by [`zeroclaw_api::media::image_mime_from_magic`]
-//! filtered through [`zeroclaw_api::media::is_provider_image_mime`] — the same
-//! canonical contract channels consult — so this endpoint can never save an
-//! image the provider loader would then drop. The saved filename's extension
-//! is derived from the sniffed MIME, so name and payload agree by
-//! construction.
+//! The saved filename is server-generated; a client filename contributes only
+//! a sanitized display name and a non-image extension. Image acceptance uses
+//! [`zeroclaw_api::media::image_mime_from_magic`] filtered through
+//! [`zeroclaw_api::media::is_provider_image_mime`], the same contract channels
+//! consult, so the endpoint cannot save an image the provider loader would
+//! drop.
 
 use axum::{
     Json,
@@ -21,9 +22,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
-use zeroclaw_api::media::{
-    PROVIDER_IMAGE_MIME_TYPES, image_mime_from_magic, is_provider_image_mime,
-};
+use zeroclaw_api::media::{image_mime_from_magic, is_provider_image_mime};
 
 use super::AppState;
 use super::api::require_auth;
@@ -40,14 +39,31 @@ pub struct UploadQuery {
     /// mirrors the WebSocket chat contract (`/ws/chat?agent=`): no default
     /// agent exists.
     pub agent: Option<String>,
+    /// Original display name. Used only for the extension of a non-image
+    /// attachment and for the response's display name; never for the path.
+    pub filename: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct UploadResponse {
     /// Absolute path of the saved file inside the agent workspace.
     pub path: String,
-    /// `[IMAGE:<path>]` marker ready to embed in a chat message.
+    /// `[IMAGE:<path>]` or `[FILE:<path>]` marker ready to embed in a chat
+    /// message.
     pub marker: String,
+    /// `image` when the provider can load the payload as vision input,
+    /// otherwise `file`.
+    pub kind: String,
+    /// Sanitized display name for the app.
+    pub name: String,
+    /// Saved byte length.
+    pub size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentKind {
+    Image,
+    File,
 }
 
 /// Why an upload payload was refused. Carries everything the HTTP layer needs
@@ -80,6 +96,72 @@ pub fn classify_upload(data: &[u8], max_bytes: usize) -> Result<&'static str, Up
         // A sniffable-but-unsendable format (e.g. BMP) is refused the same as
         // an unknown one: the provider loader would drop the marker anyway.
         _ => Err(UploadReject::NotAProviderImage),
+    }
+}
+
+/// Classify an attachment for the app's general file/picture upload. Images
+/// the provider can load keep the `[IMAGE:]` marker; every other non-empty
+/// payload is a file. The caller enforces the image-specific size limit after
+/// this returns.
+pub fn classify_attachment(data: &[u8]) -> AttachmentKind {
+    match image_mime_from_magic(data).filter(|mime| is_provider_image_mime(mime)) {
+        Some(_) => AttachmentKind::Image,
+        None => AttachmentKind::File,
+    }
+}
+
+/// Display name from a client-supplied filename. Path separators and control
+/// characters are stripped; the saved path never uses this value.
+pub fn display_attachment_name(filename: Option<&str>) -> String {
+    let Some(raw) = filename else {
+        return "attachment".to_string();
+    };
+    let name = raw
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("attachment")
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(120)
+        .collect::<String>();
+    let name = name.trim();
+    if name.is_empty() {
+        "attachment".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Extension for a non-image attachment. Only ASCII alphanumerics survive;
+/// an absent extension becomes `bin`.
+pub fn safe_attachment_stem(filename: Option<&str>) -> String {
+    let name = display_attachment_name(filename);
+    let stem = name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(&name);
+    let cleaned = stem
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+        .take(40)
+        .collect::<String>();
+    if cleaned.is_empty() {
+        "attachment".to_string()
+    } else {
+        cleaned
+    }
+}
+
+pub fn safe_attachment_extension(filename: Option<&str>) -> String {
+    let extension = filename
+        .and_then(|name| name.rsplit_once('.').map(|(_, extension)| extension))
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(10)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if extension.is_empty() {
+        "bin".to_string()
+    } else {
+        extension
     }
 }
 
@@ -124,24 +206,51 @@ pub async fn handle_upload(
         )
     };
 
-    let ext = classify_upload(&body, max_bytes).map_err(|reject| match reject {
-        UploadReject::Empty => err(StatusCode::BAD_REQUEST, "empty_body", "Empty request body."),
-        UploadReject::TooLarge { limit_bytes } => err(
+    if body.is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "empty_body",
+            "Empty request body.",
+        ));
+    }
+    if body.len() > UPLOAD_BODY_CEILING_BYTES {
+        return Err(err(
             StatusCode::PAYLOAD_TOO_LARGE,
             "payload_too_large",
             &format!(
-                "Image exceeds the configured multimodal.max_image_size_mb limit ({limit_bytes} bytes)."
+                "Attachment exceeds the upload ceiling ({} bytes).",
+                UPLOAD_BODY_CEILING_BYTES
             ),
-        ),
-        UploadReject::NotAProviderImage => err(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_media_type",
-            &format!(
-                "Not a supported image — accepted formats: {}.",
-                PROVIDER_IMAGE_MIME_TYPES.join(", ")
-            ),
-        ),
-    })?;
+        ));
+    }
+
+    let display_name = display_attachment_name(query.filename.as_deref());
+    let attachment_kind = classify_attachment(&body);
+    let (ext, marker_kind) = match attachment_kind {
+        AttachmentKind::Image => {
+            if body.len() > max_bytes {
+                return Err(err(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "payload_too_large",
+                    &format!(
+                        "Image exceeds the configured multimodal.max_image_size_mb limit ({max_bytes} bytes)."
+                    ),
+                ));
+            }
+            let ext = image_mime_from_magic(&body)
+                .filter(|mime| is_provider_image_mime(mime))
+                .and_then(|mime| match mime {
+                    "image/png" => Some("png"),
+                    "image/jpeg" => Some("jpg"),
+                    "image/gif" => Some("gif"),
+                    "image/webp" => Some("webp"),
+                    _ => None,
+                })
+                .unwrap_or("png");
+            (ext.to_string(), "IMAGE")
+        }
+        AttachmentKind::File => (safe_attachment_extension(query.filename.as_deref()), "FILE"),
+    };
 
     let save_dir = workspace.join("webui_uploads");
     if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
@@ -161,7 +270,11 @@ pub async fn handle_upload(
 
     // Server-generated name; the sniffed extension keeps name and payload in
     // agreement, and nothing from the client reaches the filesystem path.
-    let file_name = format!("webui_{}.{ext}", uuid::Uuid::new_v4().simple());
+    let file_name = format!(
+        "upload_{}_{}.{ext}",
+        uuid::Uuid::new_v4().simple(),
+        safe_attachment_stem(query.filename.as_deref())
+    );
     let local_path = save_dir.join(&file_name);
     if let Err(e) = tokio::fs::write(&local_path, &body).await {
         ::zeroclaw_log::record!(
@@ -179,8 +292,17 @@ pub async fn handle_upload(
     }
 
     let path = local_path.display().to_string();
-    let marker = format!("[IMAGE:{path}]");
-    Ok(Json(UploadResponse { path, marker }))
+    let marker = format!("[{marker_kind}:{path}]");
+    Ok(Json(UploadResponse {
+        path,
+        marker,
+        kind: match attachment_kind {
+            AttachmentKind::Image => "image".to_string(),
+            AttachmentKind::File => "file".to_string(),
+        },
+        name: display_name,
+        size: body.len(),
+    }))
 }
 
 /// `{code, message}` mirrors the structured error envelope the dashboard's
@@ -234,6 +356,26 @@ mod tests {
             classify_upload(BMP, 1024),
             Err(UploadReject::NotAProviderImage)
         );
+    }
+
+    #[test]
+    fn classifies_images_and_other_files() {
+        assert_eq!(classify_attachment(PNG), AttachmentKind::Image);
+        assert_eq!(classify_attachment(JPEG), AttachmentKind::Image);
+        assert_eq!(classify_attachment(b"plain text"), AttachmentKind::File);
+        assert_eq!(classify_attachment(b"%PDF-1.7"), AttachmentKind::File);
+    }
+
+    #[test]
+    fn sanitizes_display_names_and_extensions() {
+        assert_eq!(display_attachment_name(Some("../../evil.txt")), "evil.txt");
+        assert_eq!(display_attachment_name(Some("   ")), "attachment");
+        assert_eq!(safe_attachment_extension(Some("report.pdf")), "pdf");
+        assert_eq!(safe_attachment_extension(Some("noext")), "bin");
+        assert_eq!(safe_attachment_extension(Some("x.weird!")), "weird");
+        assert_eq!(safe_attachment_stem(Some("note.txt")), "note");
+        assert_eq!(safe_attachment_stem(Some("../../evil.txt")), "evil");
+        assert_eq!(safe_attachment_stem(Some("   ")), "attachment");
     }
 
     #[test]

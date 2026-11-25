@@ -92,6 +92,67 @@ data class MessagesResponse(
 )
 
 @Serializable
+data class UploadResponse(
+    val path: String = "",
+    val marker: String = "",
+    val kind: String = "file",
+    val name: String = "attachment",
+    val size: Long = 0,
+)
+
+enum class AttachmentKind { Image, File }
+
+/** One attachment on a chat message. */
+data class MessageAttachment(
+    val name: String,
+    val path: String,
+    val kind: AttachmentKind,
+    /** Local content URI while this process still has read access. */
+    val localUri: String? = null,
+)
+
+/** One attachment being uploaded from the composer. */
+data class PendingAttachment(
+    val id: String,
+    val name: String,
+    val kind: AttachmentKind,
+    val localUri: String?,
+    val marker: String = "",
+    val path: String = "",
+    val uploading: Boolean = false,
+    val size: Long = 0,
+)
+
+private val AttachmentMarker = Regex(
+    """\[(IMAGE|PHOTO|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):([^\]]+)]""",
+    RegexOption.IGNORE_CASE,
+)
+
+/** Split attachment markers out of a persisted user message. */
+fun parseAttachmentMarkers(content: String): Pair<String, List<MessageAttachment>> {
+    val attachments = mutableListOf<MessageAttachment>()
+    val text = AttachmentMarker.replace(content) { match ->
+        val kindName = match.groupValues[1].uppercase()
+        val path = match.groupValues[2]
+        val file = path.substringAfterLast('/').substringAfterLast('\\')
+        val name = file
+            .replace(Regex("^upload_[0-9a-fA-F]{32}_"), "")
+            .ifBlank { "attachment" }
+        attachments += MessageAttachment(
+            name = name,
+            path = path,
+            kind = if (kindName == "IMAGE" || kindName == "PHOTO") {
+                AttachmentKind.Image
+            } else {
+                AttachmentKind.File
+            },
+        )
+        ""
+    }.trim()
+    return text to attachments
+}
+
+@Serializable
 data class PairRequest(
     val code: String,
     @SerialName("device_name") val deviceName: String,
@@ -167,6 +228,7 @@ data class ChatMessage(
      * list so a tool call cannot jump below a later text block.
      */
     val blocks: List<MessageBlock> = emptyList(),
+    val attachments: List<MessageAttachment> = emptyList(),
     val isError: Boolean = false,
 ) {
     /** Ordered blocks, with legacy plain text treated as one text block. */
