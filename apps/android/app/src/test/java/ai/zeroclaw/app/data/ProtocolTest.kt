@@ -80,6 +80,39 @@ class ProtocolTest {
     }
 
     @Test
+    fun `attachment markers become message attachments`() {
+        val (text, attachments) = parseAttachmentMarkers(
+            "Look at these\n[IMAGE:/tmp/photo.png]\n[FILE:/tmp/report.pdf]",
+        )
+        assertEquals("Look at these", text)
+        assertEquals(2, attachments.size)
+        assertEquals("photo.png", attachments[0].name)
+        assertEquals(AttachmentKind.Image, attachments[0].kind)
+        assertEquals("report.pdf", attachments[1].name)
+        assertEquals(AttachmentKind.File, attachments[1].kind)
+    }
+
+    @Test
+    fun `attachment names strip the server upload prefix`() {
+        val (_, attachments) = parseAttachmentMarkers(
+            "[FILE:/tmp/webui_uploads/upload_68c2efff3582447c8c0acfa27c79374c_zc-note.txt]",
+        )
+        assertEquals("zc-note.txt", attachments.single().name)
+    }
+
+    @Test
+    fun `history maps user attachment markers and keeps the message`() {
+        val messages = listOf(
+            MessageRow(role = "user", content = "See [IMAGE:/tmp/a.png]"),
+        ).toChatMessages()
+
+        assertEquals(1, messages.size)
+        assertEquals("See", messages[0].text)
+        assertEquals(1, messages[0].attachments.size)
+        assertEquals(AttachmentKind.Image, messages[0].attachments[0].kind)
+    }
+
+    @Test
     fun `history rows map visible roles and drop empty or tool protocol rows`() {
         val messages = listOf(
             MessageRow(role = "user", content = "hi"),

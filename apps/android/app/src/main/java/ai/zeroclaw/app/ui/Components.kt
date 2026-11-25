@@ -3,15 +3,21 @@ package ai.zeroclaw.app.ui
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -23,6 +29,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
@@ -43,6 +50,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -53,7 +61,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -69,11 +80,16 @@ import ai.zeroclaw.app.data.ChatMessage
 import ai.zeroclaw.app.data.MessageBlock
 import ai.zeroclaw.app.data.MessageRole
 import ai.zeroclaw.app.data.SocketState
+import ai.zeroclaw.app.data.AttachmentKind
+import ai.zeroclaw.app.data.MessageAttachment
+import ai.zeroclaw.app.data.PendingAttachment
 import ai.zeroclaw.app.data.ToolCallCard
 import ai.zeroclaw.app.data.TtsController
 import ai.zeroclaw.app.data.TtsStatus
 import ai.zeroclaw.app.ui.theme.MonoFamily
 import ai.zeroclaw.app.ui.theme.Zc
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 @Composable
 fun SectionLabel(text: String, modifier: Modifier = Modifier) {
@@ -146,12 +162,24 @@ fun MessageItem(message: ChatMessage, localNodeId: String, tts: TtsController) {
                 modifier = Modifier.fillMaxWidth(0.88f),
             ) {
                 SelectionContainer {
-                    Text(
-                        text = message.text,
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = Zc.Text,
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                    )
+                    Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                        message.attachments.forEachIndexed { index, attachment ->
+                            UserAttachment(attachment)
+                            if (index != message.attachments.lastIndex) {
+                                Spacer(Modifier.height(6.dp))
+                            }
+                        }
+                        if (message.attachments.isNotEmpty() && message.text.isNotBlank()) {
+                            Spacer(Modifier.height(8.dp))
+                        }
+                        if (message.text.isNotBlank()) {
+                            Text(
+                                text = message.text,
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = Zc.Text,
+                            )
+                        }
+                    }
                 }
             }
             MessageActions(
@@ -231,6 +259,90 @@ fun MessageItem(message: ChatMessage, localNodeId: String, tts: TtsController) {
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun UserAttachment(attachment: MessageAttachment) {
+    if (attachment.kind == AttachmentKind.Image && attachment.localUri != null) {
+        LocalImageAttachment(attachment)
+    } else {
+        AttachmentChip(attachment)
+    }
+}
+
+@Composable
+private fun LocalImageAttachment(attachment: MessageAttachment) {
+    val context = LocalContext.current
+    val uri = attachment.localUri ?: return
+    var image by remember(uri) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(uri) {
+        image = withContext(Dispatchers.IO) {
+            decodeSampledImage(context, Uri.parse(uri), 900)
+        }
+    }
+    val bitmap = image
+    if (bitmap != null) {
+        Image(
+            bitmap = bitmap,
+            contentDescription = attachment.name,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 180.dp)
+                .clip(RoundedCornerShape(8.dp)),
+        )
+    } else {
+        AttachmentChip(attachment)
+    }
+}
+
+@Composable
+private fun AttachmentChip(attachment: MessageAttachment) {
+    Surface(
+        color = Zc.Surface,
+        shape = RoundedCornerShape(8.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Zc.Border),
+    ) {
+        Row(
+            Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = if (attachment.kind == AttachmentKind.Image) "🖼" else "📄",
+                fontSize = 14.sp,
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = attachment.name,
+                style = MaterialTheme.typography.labelMedium,
+                color = Zc.Text,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.widthIn(max = 220.dp),
+            )
+        }
+    }
+}
+
+private fun decodeSampledImage(
+    context: Context,
+    uri: Uri,
+    maxDimension: Int,
+): ImageBitmap? {
+    val resolver = context.contentResolver
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+    var sample = 1
+    while (bounds.outWidth > 0 &&
+        bounds.outHeight > 0 &&
+        (bounds.outWidth / sample > maxDimension || bounds.outHeight / sample > maxDimension)
+    ) {
+        sample *= 2
+    }
+    val options = BitmapFactory.Options().apply { inSampleSize = sample }
+    return resolver.openInputStream(uri)?.use {
+        BitmapFactory.decodeStream(it, null, options)?.asImageBitmap()
     }
 }
 
@@ -537,11 +649,62 @@ private fun ToolDetailSection(label: String, text: String, maxHeight: Int) {
 }
 
 @Composable
+private fun PendingAttachmentChip(
+    attachment: PendingAttachment,
+    onRemove: (String) -> Unit,
+) {
+    Surface(
+        color = Zc.SurfaceRaised,
+        shape = RoundedCornerShape(10.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Zc.Border),
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 8.dp, end = 2.dp, top = 4.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = if (attachment.kind == AttachmentKind.Image) "🖼" else "📄",
+                fontSize = 14.sp,
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = attachment.name,
+                style = MaterialTheme.typography.labelSmall,
+                color = Zc.Text,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.widthIn(max = 180.dp),
+            )
+            if (attachment.uploading) {
+                Text(
+                    text = "…",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Zc.TextSubtle,
+                    modifier = Modifier.padding(horizontal = 8.dp),
+                )
+            } else {
+                Text(
+                    text = "×",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Zc.TextSubtle,
+                    modifier = Modifier
+                        .clickable { onRemove(attachment.id) }
+                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
 fun Composer(
     busy: Boolean,
     connected: Boolean,
     voiceListening: Boolean,
     voiceError: String?,
+    pendingAttachments: List<PendingAttachment>,
+    onAttach: (Uri) -> Unit,
+    onRemoveAttachment: (String) -> Unit,
     onSend: (String) -> Unit,
     onStop: () -> Unit,
     onVoiceStart: () -> Unit,
@@ -550,21 +713,52 @@ fun Composer(
     modifier: Modifier = Modifier,
 ) {
     var draft by remember { mutableStateOf("") }
+    val attachLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) onAttach(uri)
+    }
+    val canSend = (draft.isNotBlank() || pendingAttachments.isNotEmpty()) &&
+        pendingAttachments.none { it.uploading }
 
     fun send() {
+        if (!canSend) return
         val text = draft.trim()
-        if (text.isEmpty()) return
         draft = ""
         onSend(text)
     }
 
     Column(modifier = modifier.fillMaxWidth()) {
+    if (pendingAttachments.isNotEmpty()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 12.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            pendingAttachments.forEach { attachment ->
+                PendingAttachmentChip(attachment, onRemoveAttachment)
+            }
+        }
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalAlignment = Alignment.Bottom,
     ) {
+        IconButton(
+            onClick = { attachLauncher.launch(arrayOf("*/*")) },
+            enabled = connected && !busy,
+            modifier = Modifier.semantics { contentDescription = "Attach file or picture" },
+        ) {
+            Text(
+                text = "📎",
+                fontSize = 20.sp,
+                color = if (connected && !busy) Zc.TextMuted else Zc.TextSubtle,
+            )
+        }
         Surface(
             color = Zc.Surface,
             shape = RoundedCornerShape(22.dp),
@@ -636,12 +830,12 @@ fun Composer(
                 }
                 IconButton(
                     onClick = { send() },
-                    enabled = draft.isNotBlank(),
+                    enabled = canSend,
                 ) {
                     Icon(
                         imageVector = Icons.Default.Send,
                         contentDescription = "Send",
-                        tint = if (draft.isNotBlank()) Zc.Accent else Zc.TextSubtle,
+                        tint = if (canSend) Zc.Accent else Zc.TextSubtle,
                     )
                 }
             }

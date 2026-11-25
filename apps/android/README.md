@@ -24,8 +24,9 @@ on-phone voice transcription.
 | Stop an in-flight turn (`/abort`) | Done |
 | Reconnect with backoff, connection status | Done |
 | Device link: clock, location, folder, photo library | Done |
+| Attach pictures and files from the phone | Done |
 | QR pairing, push notifications, offline outbox | Not yet |
-| Attachments (inbound), voice, model picker | Not yet |
+| Inbound attachments, model picker | Not yet |
 | Camera, SMS, notification forwarding, contacts | Not yet |
 | OIDC / mTLS login | Not yet |
 
@@ -210,6 +211,24 @@ Advertised capabilities:
 | `talk.ptt.once` | `timeout_secs?` | Transcribe one utterance |
 | `talk.ptt.start` / `.stop` / `.cancel` | — | Session-based push-to-talk |
 
+## Attachments
+
+The composer paperclip opens Android's document picker for pictures and
+files. The app reads the selected content URI, enforces the 20 MB upload
+limit, and posts the raw bytes to `POST /api/upload` with the display name.
+The gateway saves server-named copies under the agent workspace's
+`webui_uploads/` directory and returns a marker:
+
+- Provider-loadable images return `[IMAGE:<path>]`, which the multimodal
+  provider path resolves into vision content. The selected model must support
+  vision; otherwise the gateway returns a `provider_capability_error`.
+- Everything else returns `[FILE:<path>]`; the agent can pass it to its file
+  tools.
+
+The app shows selected files as chips, previews local images after sending,
+and parses markers back into attachment chips when loading session history.
+Markers are removed from the visible message text.
+
 ## Voice input in the composer
 
 The chat composer has a mic button beside Send:
@@ -309,6 +328,7 @@ frame.
 | Stop a turn | `POST /api/sessions/{id}/abort` |
 | Chat stream | `WS /ws/chat?session_id=…&agent=…` |
 | Device node | `WS /ws/nodes` (register + invoke/result, optional `attachments`) |
+| Attachment upload | `POST /api/upload?agent=…&filename=…` raw bytes → `{path, marker, kind, name, size}` |
 | Voice transcription | `POST /api/transcribe` (audio/wav body) → `{text}` |
 
 Chat sockets authenticate with `Sec-WebSocket-Protocol: zeroclaw.v1,
