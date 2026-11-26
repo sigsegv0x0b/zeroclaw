@@ -114,7 +114,10 @@ Plus the dashboard through ZeroRelay, a CLI-only server build, and tighter isola
   - enrollment codes are redeemed on the daemon's own pairing guard (#11940).
 - **Gateway:**
   - OIDC bearer verification on the config routes is rate-limited (#12233, closes #12047);
-  - behind a trusted proxy, limits are keyed on the proxy-appended `X-Forwarded-For` hop (#12114, closes #12052).
+  - behind a trusted proxy, limits are keyed on the proxy-appended `X-Forwarded-For` hop (#12114, closes #12052);
+  - mTLS enrollment tokens are bound to the certificate issued with them, so a token is refused without that device's client certificate, and revoking the certificate revokes the token;
+  - enrollment, renewal and revocation append to the daemon's certificate audit chain, and a timed enrollment window's code expires with the window even if issuance was still in flight.
+- **Android:** the mTLS client key and the bearer token stay in the Android Keystore; imported PEM keys are sealed at rest and imported into the Keystore when the platform accepts them; backups exclude the app's settings.
 - **Command scanning:**
   - POSIX commands are split at substitution and subshell boundaries (#11822);
   - a bare semicolon or pipe in an incoming message is no longer treated as command injection (#12068).

@@ -1,47 +1,45 @@
-//! Local admin endpoints for the gateway mTLS certificate ledger.
+//! Admin and device endpoints for the gateway mTLS certificate ledger.
 //!
-//! The CLI uses these to list issued certificates and to revoke one, which
-//! also cancels that certificate's live connections. They are loopback-only.
+//! The CLI uses the admin endpoints to list issued certificates and to revoke
+//! one, which also cancels that certificate's live connections and, once a
+//! device has no live certificate left, revokes its bearer token. They are
+//! loopback-only and need this run's gateway admin token. Renewal is served
+//! to the device itself over the mTLS listener.
 
 use std::net::SocketAddr;
 
 use axum::{
     Json,
     extract::{ConnectInfo, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
 
 use crate::AppState;
+use crate::mtls_state::RenewRefusal;
 
-fn loopback_only(peer: SocketAddr) -> Option<Response> {
-    if peer.ip().is_loopback() {
-        None
-    } else {
-        Some(
-            (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "local admin endpoint"})),
-            )
-                .into_response(),
-        )
-    }
+fn mtls_disabled() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "[gateway.mtls] is not enabled"})),
+    )
+        .into_response()
 }
 
 pub async fn handle_list(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Response {
-    if let Some(denied) = loopback_only(peer) {
-        return denied;
+    if let Err(denied) = crate::require_localhost(&peer) {
+        return denied.into_response();
+    }
+    if let Err(denied) = crate::require_gateway_admin_token(&state, &headers) {
+        return denied.into_response();
     }
     let Some(mtls) = state.mtls.as_ref() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "[gateway.mtls] is not enabled"})),
-        )
-            .into_response();
+        return mtls_disabled();
     };
     let (issued, active) = mtls.list();
     Json(serde_json::json!({
@@ -61,108 +59,86 @@ pub async fn handle_list(
 #[derive(Deserialize)]
 pub struct RenewRequest {
     pub csr_pem: String,
-    #[serde(default)]
-    pub device_name: Option<String>,
 }
 
 /// Authenticated renewal: the caller presents a valid client certificate and
-/// bearer token, submits a fresh CSR, and receives a new certificate. The old
-/// certificate is revoked for future handshakes and the server leaf gets a new
-/// private key. The CA and gateway identity stay stable, so clients keep their
-/// pinned trust anchor.
+/// the bearer token bound to it, submits a fresh CSR, and receives a new
+/// certificate for the same device. The old certificate stays valid until the
+/// new one completes a handshake, so a lost response can be retried. The CA,
+/// the server leaf, and the gateway identity are unchanged.
 pub async fn handle_renew(
     State(state): State<AppState>,
-    axum::Extension(peer): axum::Extension<crate::mtls_state::PeerCertFingerprint>,
-    headers: axum::http::HeaderMap,
+    peer: Option<axum::Extension<crate::mtls_state::PeerCertFingerprint>>,
+    headers: HeaderMap,
     Json(request): Json<RenewRequest>,
 ) -> Response {
     if let Err(denied) = crate::api::require_auth(&state, &headers) {
         return denied.into_response();
     }
     let Some(mtls) = state.mtls.as_ref() else {
+        return mtls_disabled();
+    };
+    let Some(axum::Extension(peer)) = peer else {
         return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "[gateway.mtls] is not enabled"})),
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "renewal is only served on the mTLS listener"})),
         )
             .into_response();
     };
-    let old_fingerprint = peer.0.to_lowercase();
-    let device_id = mtls
-        .read_ledger()
-        .into_iter()
-        .find(|entry| entry.fingerprint.eq_ignore_ascii_case(&old_fingerprint))
-        .map(|entry| entry.device_id)
-        .unwrap_or_else(|| format!("dev-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
-    let issued = match zeroclaw_tls::sign_csr(
-        &mtls.ca_cert_pem,
-        &mtls.ca_key_pem,
-        &device_id,
-        &request.csr_pem,
-    ) {
-        Ok(issued) => issued,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("invalid CSR: {error}")})),
-            )
-                .into_response();
-        }
-    };
-    // Rotate the server leaf's private key, then swap the live acceptor.
-    let rotated = match zeroclaw_tls::rotate_gateway_server_leaf(&mtls.dir) {
-        Ok(materials) => materials,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("server key rotation failed: {error}")})),
-            )
-                .into_response();
-        }
-    };
-    match crate::mtls_state::build_acceptor(
-        &rotated.server_cert_path,
-        &rotated.server_key_path,
-        &rotated.ca_cert_path,
-        &mtls.pinned_client_certs,
-        mtls,
-    ) {
-        Ok(acceptor) => mtls.set_acceptor(acceptor),
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("rebuilding the listener failed: {error}")})),
-            )
-                .into_response();
-        }
-    }
-    // The old certificate stops working for new handshakes; the caller's own
-    // connection stays up long enough to receive this response.
-    let _ = mtls.revoke_for_renewal(&old_fingerprint);
-    let name = request.device_name.unwrap_or_else(|| device_id.clone());
-    if let Err(error) = mtls.record_issued(crate::mtls_state::IssuedCert {
-        device_id: device_id.clone(),
-        name,
-        fingerprint: issued.fingerprint.clone(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        not_after: issued.not_after,
-        revoked: false,
-    }) {
+    let Some(token) = crate::api::extract_bearer_token(&headers).filter(|t| !t.is_empty()) else {
         return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "renewal needs the device's bearer token"})),
+        )
+            .into_response();
+    };
+    let token_hash = zeroclaw_config::pairing::PairingGuard::token_hash(token);
+    match mtls.renew(&peer.0, &token_hash, &request.csr_pem) {
+        Ok(renewed) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(serde_json::json!({
+                        "device_id": renewed.device_id,
+                        "fingerprint": renewed.leaf.fingerprint,
+                        "replaces": peer.0,
+                    })),
+                "mTLS client certificate renewed"
+            );
+            Json(serde_json::json!({
+                "cert_pem": renewed.leaf.cert_pem,
+                "ca_chain_pem": mtls.ca_cert_pem,
+                "device_id": renewed.device_id,
+                "gateway_id": mtls.gateway_id,
+                "not_after": renewed.leaf.not_after,
+            }))
+            .into_response()
+        }
+        Err(RenewRefusal::NotIssued) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "this certificate was not issued by enrollment; pair the device again"
+            })),
+        )
+            .into_response(),
+        Err(RenewRefusal::TokenMismatch) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "the bearer token does not belong to this certificate's device"
+            })),
+        )
+            .into_response(),
+        Err(RenewRefusal::InvalidCsr(error)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("invalid CSR: {error}")})),
+        )
+            .into_response(),
+        Err(RenewRefusal::Internal(error)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                serde_json::json!({"error": format!("could not record the certificate: {error}")}),
-            ),
+            Json(serde_json::json!({"error": format!("renewal failed: {error}")})),
         )
-            .into_response();
+            .into_response(),
     }
-    Json(serde_json::json!({
-        "cert_pem": issued.cert_pem,
-        "ca_chain_pem": mtls.ca_cert_pem,
-        "device_id": device_id,
-        "gateway_id": mtls.gateway_id,
-        "not_after": issued.not_after,
-    }))
-    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -174,24 +150,55 @@ pub struct RevokeRequest {
 pub async fn handle_revoke(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<RevokeRequest>,
 ) -> Response {
-    if let Some(denied) = loopback_only(peer) {
-        return denied;
+    if let Err(denied) = crate::require_localhost(&peer) {
+        return denied.into_response();
+    }
+    if let Err(denied) = crate::require_gateway_admin_token(&state, &headers) {
+        return denied.into_response();
     }
     let Some(mtls) = state.mtls.as_ref() else {
+        return mtls_disabled();
+    };
+    // Serialize with every other credential write, as device revocation does.
+    let commit = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(error) => {
+            let (status, message) = crate::api_pairing::revocation_not_admitted(error);
+            return (status, Json(serde_json::json!({"error": message}))).into_response();
+        }
+    };
+    let outcome = match mtls.revoke(&request.selector) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{error:#}")})),
+            )
+                .into_response();
+        }
+    };
+    if !outcome.released.is_empty()
+        && let Err(error) = crate::persist_pairing_tokens_under(&state, commit).await
+    {
         return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "[gateway.mtls] is not enabled"})),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("certificates and tokens revoked in memory but config persist failed: {error}"),
+                "revoked": outcome.fingerprints,
+            })),
         )
             .into_response();
-    };
-    match mtls.revoke(&request.selector) {
-        Ok(revoked) => Json(serde_json::json!({"revoked": revoked})).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("{error}")})),
-        )
-            .into_response(),
     }
+    Json(serde_json::json!({
+        "revoked": outcome.fingerprints,
+        "revoked_devices": outcome
+            .released
+            .iter()
+            .map(|device| device.device_id.clone())
+            .collect::<Vec<_>>(),
+    }))
+    .into_response()
 }

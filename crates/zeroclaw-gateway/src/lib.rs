@@ -40,6 +40,7 @@ mod chat_core;
 pub mod core_rpc;
 pub mod dashboard_core;
 pub mod dashboard_session;
+mod mtls_binding;
 mod mtls_enroll;
 pub mod mtls_state;
 pub mod node_tool;
@@ -1342,21 +1343,20 @@ struct PreparedMtls {
 async fn prepare_gateway_mtls(
     config: &Config,
     pairing: Arc<zeroclaw_config::pairing::PairingGuard>,
+    cert_audit: Option<Arc<zeroclaw_runtime::security::audit::AuditLogger>>,
 ) -> anyhow::Result<Option<PreparedMtls>> {
     let Some(mtls) = config.gateway.mtls.as_ref().filter(|m| m.enabled) else {
         return Ok(None);
     };
-    let dir = if mtls.dir.trim().is_empty() {
-        config.data_dir.join("gateway-mtls")
-    } else {
-        std::path::PathBuf::from(mtls.dir.trim())
-    };
-    let materials = zeroclaw_tls::ensure_gateway_materials(&dir)?;
-    let ca_cert_pem = std::fs::read_to_string(&materials.ca_cert_path)?;
-    let ca_key_pem = zeroclaw_tls::load_ca_key_pem(
-        &materials.ca_key_path,
-        &zeroclaw_tls::CaKeyProtection::None,
+    let cert_audit = cert_audit.context(
+        "the certificate audit logger is unavailable; refusing to start mTLS enrollment \
+         without an audit trail",
     )?;
+    let dir = mtls.material_dir(&config.data_dir);
+    let protection = zeroclaw_tls::CaKeyProtection::from_env();
+    let materials = zeroclaw_tls::ensure_gateway_materials(&dir, &protection)?;
+    let ca_cert_pem = std::fs::read_to_string(&materials.ca_cert_path)?;
+    let ca_key_pem = zeroclaw_tls::load_ca_key_pem(&materials.ca_key_path, &protection)?;
     let state = mtls_state::MtlsState::load(
         dir,
         materials.gateway_id.clone(),
@@ -1364,11 +1364,13 @@ async fn prepare_gateway_mtls(
         ca_key_pem,
         pairing,
         mtls.pinned_client_certs.clone(),
+        mtls.crl_file(&config.data_dir),
         mtls.enroll_bind.clone(),
         mtls.enroll_port,
         materials.server_cert_path.clone(),
         materials.server_key_path.clone(),
     )?;
+    state.set_cert_audit(cert_audit);
     let acceptor = mtls_state::build_acceptor(
         &materials.server_cert_path,
         &materials.server_key_path,
@@ -1459,6 +1461,7 @@ fn spawn_gateway_mtls_listener(
                 let Some(fingerprint) = fingerprint else {
                     return;
                 };
+                state.note_handshake(&fingerprint);
                 let token = state.register_active(fingerprint.clone());
                 let request_fingerprint = fingerprint.clone();
                 let hyper_svc = hyper::service::service_fn(
@@ -1601,6 +1604,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         sop_driver_handles,
         dashboard_ingress,
     } = supervision;
+    let supervised = daemon_authority.is_some();
     let (shared_pairing, shared_inbound_auth, shared_config, shared_cert_audit) =
         match daemon_authority {
             Some(authority) => (
@@ -2655,7 +2659,40 @@ pub async fn run_gateway_with_plugin_webhooks(
         None => principal_gate::GatewayInboundAuth::from_config(&config, Arc::clone(&pairing))?,
     });
 
-    let mtls_prepared = prepare_gateway_mtls(&config, Arc::clone(&pairing)).await?;
+    // The mTLS listener appends to the same hash-chained certificate audit
+    // trail as every other certificate path. A supervised run must use the
+    // daemon's single logger (a second writer would corrupt the chain); a
+    // standalone gateway opens the one for this process. No logger means no
+    // mTLS issuance, matching the daemon's fail-closed certificate paths.
+    let mtls_cert_audit: Option<Arc<zeroclaw_runtime::security::audit::AuditLogger>> = if !config
+        .gateway
+        .mtls
+        .as_ref()
+        .is_some_and(|mtls| mtls.enabled)
+    {
+        None
+    } else if supervised {
+        shared_cert_audit.clone()
+    } else {
+        match zeroclaw_runtime::security::audit::AuditLogger::open_shared(
+            config.security.audit.clone(),
+            config.data_dir.clone(),
+        ) {
+            Ok(audit) => Some(audit),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(serde_json::json!({"error": format!("{error:#}")})),
+                    "certificate audit logger unavailable; the mTLS listener will not start"
+                );
+                None
+            }
+        }
+    };
+    let mtls_prepared =
+        prepare_gateway_mtls(&config, Arc::clone(&pairing), mtls_cert_audit).await?;
     let state = AppState {
         config: config_state,
         config_authority: authority.clone(),
@@ -2753,9 +2790,27 @@ pub async fn run_gateway_with_plugin_webhooks(
             future
         });
         mtls.set_pairing_persister(persister);
+        if let Some(registry) = state.device_registry.as_ref() {
+            mtls.set_device_registry(Arc::clone(registry));
+        }
+        // Devices revoked while the gateway was down (the CLI falls back to
+        // the CRL) lost their tokens when the ledger loaded; write that down.
+        if mtls.take_startup_token_revocations()
+            && let Err(error) = mtls.persist_pairing_tokens().await
+        {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": format!("{error:#}") })),
+                "revoked mTLS device tokens could not be removed from config; they stay \
+                 revoked for this run and are revoked again at the next start"
+            );
+        }
     }
 
     let dashboard_layer_state = state.clone();
+    let binding_layer_state = state.mtls.is_some().then(|| state.clone());
     // On every route that issues or redeems a pairing code: refused through a
     // relay-served dashboard, where the relay would see the code.
     let no_relayed_pairing = axum::middleware::from_fn(relay_ingress::no_pairing_through_a_relay);
@@ -3168,6 +3223,15 @@ pub async fn run_gateway_with_plugin_webhooks(
         app.layer(axum::middleware::from_fn(security_headers::apply_with_hsts))
     } else {
         app.layer(axum::middleware::from_fn(security_headers::apply))
+    };
+    // Applied to the router every listener serves, so an enrollment token is
+    // refused wherever no client certificate came with it.
+    let app = match binding_layer_state {
+        Some(binding_state) => app.layer(axum::middleware::from_fn_with_state(
+            binding_state,
+            mtls_binding::enforce,
+        )),
+        None => app,
     };
 
     // ── TLS / mTLS setup ───────────────────────────────────────────
@@ -9807,7 +9871,15 @@ path = "{trigger_path}"
     async fn run_gateway_starts_with_mismatched_provider_api_key() {
         // `run_gateway` binds the process-global pricing config handle.
         let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
-        let mut config = Config::default();
+        // Never boot over the operator's `~/.zeroclaw`: its lifecycle lock is
+        // held by a running gateway and the test would fail for that reason.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
         config.providers.models.anthropic.insert(
             "default".to_string(),
             zeroclaw_config::schema::AnthropicModelProviderConfig {

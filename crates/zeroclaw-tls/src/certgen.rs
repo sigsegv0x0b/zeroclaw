@@ -209,12 +209,39 @@ fn server_leaf_has_uri(path: &Path, uri: &str) -> Result<bool> {
         .any(|name| matches!(name, GeneralName::URI(value) if *value == uri)))
 }
 
+/// Whether the private key at `key_path` belongs to the leaf at `cert_path`.
+fn server_leaf_matches_key(cert_path: &Path, key_path: &Path) -> Result<bool> {
+    use x509_parser::prelude::*;
+    let pem = std::fs::read_to_string(cert_path)
+        .with_context(|| format!("reading server certificate {}", cert_path.display()))?;
+    let der = crate::load_certs_from_pem(&pem)?;
+    let leaf = der.first().ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "server certificate {} is empty",
+            cert_path.display()
+        ))
+    })?;
+    let (_, cert) =
+        X509Certificate::from_der(leaf.as_ref()).context("parsing server certificate DER")?;
+    let key_pem = Zeroizing::new(
+        std::fs::read_to_string(key_path)
+            .with_context(|| format!("reading server key {}", key_path.display()))?,
+    );
+    let key = rcgen::KeyPair::from_pem(&key_pem).context("parsing server key")?;
+    Ok(cert.public_key().raw == key.public_key_der().as_slice())
+}
+
 /// Ensure the gateway mTLS CA and identity server certificate exist under `dir`.
 ///
 /// The CA is never silently rotated; the server leaf is regenerated only when
 /// it is missing or when the persisted gateway id changed. That id is the
-/// certificate's identity and must survive address changes.
-pub fn ensure_gateway_materials(dir: &Path) -> Result<GatewayMaterials> {
+/// certificate's identity and must survive address changes. `protection`
+/// governs the CA key at rest (a passphrase encrypts a newly generated key and
+/// decrypts an existing encrypted one; a plaintext key is still read).
+pub fn ensure_gateway_materials(
+    dir: &Path,
+    protection: &CaKeyProtection,
+) -> Result<GatewayMaterials> {
     static GEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _gen_guard = GEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -262,7 +289,13 @@ pub fn ensure_gateway_materials(dir: &Path) -> Result<GatewayMaterials> {
         && materials.ca_key_path.exists()
         && materials.server_cert_path.exists()
         && materials.server_key_path.exists();
-    if all_present && !id_changed {
+    // A leaf whose key does not match (an interrupted rewrite) is regenerated
+    // instead of producing a listener that cannot complete a handshake.
+    if all_present
+        && !id_changed
+        && server_leaf_matches_key(&materials.server_cert_path, &materials.server_key_path)
+            .unwrap_or(false)
+    {
         return Ok(GatewayMaterials {
             gateway_id,
             ..materials
@@ -270,11 +303,7 @@ pub fn ensure_gateway_materials(dir: &Path) -> Result<GatewayMaterials> {
     }
 
     let (ca_cert, ca_key) = if materials.ca_cert_path.exists() && materials.ca_key_path.exists() {
-        load_ca(
-            &materials.ca_cert_path,
-            &materials.ca_key_path,
-            &CaKeyProtection::None,
-        )?
+        load_ca(&materials.ca_cert_path, &materials.ca_key_path, protection)?
     } else {
         let ca_key = rcgen::KeyPair::generate().context("generating gateway CA key")?;
         let ca_cert = ca_params("ZeroClaw Gateway mTLS CA")?
@@ -282,11 +311,7 @@ pub fn ensure_gateway_materials(dir: &Path) -> Result<GatewayMaterials> {
             .context("self-signing gateway CA certificate")?;
         write_public_pem(&materials.ca_cert_path, &ca_cert.pem())?;
         let ca_key_pem = Zeroizing::new(ca_key.serialize_pem());
-        write_ca_key(
-            &materials.ca_key_path,
-            ca_key_pem.as_str(),
-            &CaKeyProtection::None,
-        )?;
+        write_ca_key(&materials.ca_key_path, ca_key_pem.as_str(), protection)?;
         (ca_cert, ca_key)
     };
 
@@ -295,27 +320,6 @@ pub fn ensure_gateway_materials(dir: &Path) -> Result<GatewayMaterials> {
     Ok(GatewayMaterials {
         gateway_id,
         ..materials
-    })
-}
-
-/// Regenerate the gateway server leaf with a fresh private key, keeping the
-/// existing CA and gateway identity. Used by authenticated renewal.
-pub fn rotate_gateway_server_leaf(dir: &Path) -> Result<GatewayMaterials> {
-    let gateway_id = std::fs::read_to_string(dir.join("gateway_id"))
-        .with_context(|| format!("reading {}", dir.join("gateway_id").display()))?
-        .trim()
-        .to_string();
-    let ca_cert_pem = std::fs::read_to_string(dir.join("ca.crt"))
-        .with_context(|| format!("reading {}", dir.join("ca.crt").display()))?;
-    let ca_key_pem = load_ca_key_pem(&dir.join("ca.key"), &CaKeyProtection::None)?;
-    let (ca_cert, ca_key) = load_ca_from_pem(&ca_cert_pem, &ca_key_pem)?;
-    write_gateway_server_leaf(dir, &gateway_id, &ca_cert, &ca_key)?;
-    Ok(GatewayMaterials {
-        gateway_id,
-        ca_cert_path: dir.join("ca.crt"),
-        ca_key_path: dir.join("ca.key"),
-        server_cert_path: dir.join("server.crt"),
-        server_key_path: dir.join("server.key"),
     })
 }
 
@@ -341,8 +345,18 @@ fn write_gateway_server_leaf(
     let cert = params
         .signed_by(&server_key, ca_cert, ca_key)
         .context("signing gateway server certificate")?;
-    write_public_pem(&dir.join("server.crt"), &cert.pem())?;
-    write_private_pem(&dir.join("server.key"), &server_key.serialize_pem())
+    // Stage both files and rename the key before the certificate. The
+    // certificate is what `ensure_gateway_materials` checks, so a crash at any
+    // point leaves either the old pair or a certificate that triggers a fresh
+    // regeneration, never a certificate paired with a foreign key.
+    let cert_tmp = dir.join("server.crt.tmp");
+    let key_tmp = dir.join("server.key.tmp");
+    write_private_pem(&key_tmp, &server_key.serialize_pem())?;
+    write_public_pem(&cert_tmp, &cert.pem())?;
+    std::fs::rename(&key_tmp, dir.join("server.key"))
+        .with_context(|| format!("installing {}", dir.join("server.key").display()))?;
+    std::fs::rename(&cert_tmp, dir.join("server.crt"))
+        .with_context(|| format!("installing {}", dir.join("server.crt").display()))
 }
 
 /// Ensure mTLS server materials exist under `dir`.
@@ -1172,7 +1186,7 @@ mod gateway_material_tests {
     #[test]
     fn gateway_identity_is_a_stable_uri_not_an_address() {
         let dir = tempfile::tempdir().unwrap();
-        let first = ensure_gateway_materials(dir.path()).unwrap();
+        let first = ensure_gateway_materials(dir.path(), &CaKeyProtection::None).unwrap();
         assert!(first.gateway_id.starts_with("gw_"), "{}", first.gateway_id);
         let cert = std::fs::read_to_string(&first.server_cert_path).unwrap();
         let sans = san_entries(&cert);
@@ -1186,7 +1200,7 @@ mod gateway_material_tests {
         );
 
         let ca_one = std::fs::read_to_string(&first.ca_cert_path).unwrap();
-        let second = ensure_gateway_materials(dir.path()).unwrap();
+        let second = ensure_gateway_materials(dir.path(), &CaKeyProtection::None).unwrap();
         assert_eq!(
             first.gateway_id, second.gateway_id,
             "identity must be stable"
@@ -1196,5 +1210,46 @@ mod gateway_material_tests {
             std::fs::read_to_string(&second.ca_cert_path).unwrap(),
             "CA must not rotate on restart"
         );
+    }
+
+    #[test]
+    fn gateway_leaf_with_a_foreign_key_is_regenerated() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = ensure_gateway_materials(dir.path(), &CaKeyProtection::None).unwrap();
+        let ca_before = std::fs::read_to_string(&first.ca_cert_path).unwrap();
+        // Simulate an interrupted rewrite: a key that belongs to no leaf.
+        let stray = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        write_private_pem(&first.server_key_path, &stray.serialize_pem()).unwrap();
+        assert!(!server_leaf_matches_key(&first.server_cert_path, &first.server_key_path).unwrap());
+
+        let second = ensure_gateway_materials(dir.path(), &CaKeyProtection::None).unwrap();
+        assert!(
+            server_leaf_matches_key(&second.server_cert_path, &second.server_key_path).unwrap(),
+            "a mismatched pair must be replaced"
+        );
+        assert_eq!(first.gateway_id, second.gateway_id);
+        assert_eq!(
+            ca_before,
+            std::fs::read_to_string(&second.ca_cert_path).unwrap(),
+            "repairing the leaf must not rotate the CA"
+        );
+        assert!(!dir.path().join("server.crt.tmp").exists());
+        assert!(!dir.path().join("server.key.tmp").exists());
+    }
+
+    #[test]
+    fn gateway_ca_key_honours_a_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let protection = CaKeyProtection::passphrase("correct horse battery staple");
+        let materials = ensure_gateway_materials(dir.path(), &protection).unwrap();
+        let on_disk = std::fs::read(&materials.ca_key_path).unwrap();
+        assert!(
+            is_encrypted_ca_key(&on_disk),
+            "the CA key must be encrypted at rest"
+        );
+        assert!(load_ca_key_pem(&materials.ca_key_path, &CaKeyProtection::None).is_err());
+        assert!(load_ca_key_pem(&materials.ca_key_path, &protection).is_ok());
+        // Restart with the same passphrase reuses the CA.
+        ensure_gateway_materials(dir.path(), &protection).unwrap();
     }
 }

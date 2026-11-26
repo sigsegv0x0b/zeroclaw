@@ -62,6 +62,7 @@ impl DeviceRegistry {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA temp_store = MEMORY;
+             PRAGMA secure_delete = ON;
              CREATE TABLE IF NOT EXISTS devices (
                 token_hash TEXT PRIMARY KEY,
                 id TEXT NOT NULL,
@@ -146,7 +147,8 @@ impl DeviceRegistry {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA temp_store = MEMORY;",
+             PRAGMA temp_store = MEMORY;
+             PRAGMA secure_delete = ON;",
         )?;
         Ok(conn)
     }
@@ -344,6 +346,10 @@ impl DeviceRegistry {
         // Release the database writer before taking the cache lock. Reconciliation
         // takes the cache first and also writes this table.
         tx.commit()?;
+        // `secure_delete` zeroes the freed cell, and this checkpoint pushes the
+        // zeroed page out of the WAL. The revoked token hash then has no live
+        // row and no residue a later scan can recover.
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
         if let Some(hash) = deleted.as_ref() {
             self.cache.lock().remove(hash);
         }
@@ -631,6 +637,21 @@ pub(crate) fn revoke_device_credential<R>(
     match registry.revoke_authorized(device_id, authorize) {
         Ok(Ok(Some(hash))) => {
             state.pairing.revoke_token_hash(&hash);
+            // An mTLS-enrolled device's certificates go with its token.
+            if let Some(mtls) = state.mtls.as_ref()
+                && let Err(error) = mtls.revoke_token_hash(&hash)
+            {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "device_id": device_id,
+                            "error": format!("{error:#}"),
+                        })),
+                    "device token revoked but its mTLS certificates could not be revoked"
+                );
+            }
             Ok(Ok(true))
         }
         Ok(Ok(None)) => Ok(Ok(false)),

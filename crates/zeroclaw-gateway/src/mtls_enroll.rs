@@ -60,55 +60,55 @@ async fn handle_enroll(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(request): Json<EnrollRequest>,
 ) -> Response {
+    let refuse = |status: StatusCode, body: serde_json::Value| (status, Json(body)).into_response();
     if !state.allow_enroll(peer.ip()) {
-        return (
+        return refuse(
             StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({"error": "too many enrollment attempts; retry later"})),
-        )
-            .into_response();
+            serde_json::json!({"error": "too many enrollment attempts; retry later"}),
+        );
+    }
+    // A pin allowlist admits only the leaves it names, so a certificate issued
+    // here could never connect. Refuse before the code is spent.
+    if !state.pinned_client_certs.is_empty() {
+        return refuse(
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": "in-band enrollment is disabled because [gateway.mtls].pinned_client_certs \
+                          is configured; issue client certificates out of band"
+            }),
+        );
     }
     let code = request.pairing_code.trim();
     if code.is_empty() {
-        return (
+        return refuse(
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "pairing code is required"})),
-        )
-            .into_response();
+            serde_json::json!({"error": "pairing code is required"}),
+        );
     }
-    let token = match state.pairing.try_pair(code, &peer.ip().to_string()).await {
-        Ok(Some(token)) => token,
+    let client = peer.ip().to_string();
+    // Reserve, don't redeem: every later failure drops the reservation and
+    // restores the code, so a bad CSR or a disk error never burns it and never
+    // leaves a live token nobody received.
+    let reservation = match state.pairing.reserve_pair(code, &client).await {
+        Ok(Some(reservation)) => reservation,
         Ok(None) => {
-            return (
+            state.enrollment.record_failed_attempt();
+            return refuse(
                 StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "invalid or already-used pairing code"})),
-            )
-                .into_response();
+                serde_json::json!({"error": "invalid or already-used pairing code"}),
+            );
         }
         Err(retry_after) => {
-            return (
+            return refuse(
                 StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
+                serde_json::json!({
                     "error": "too many failed pairing attempts",
                     "retry_after": retry_after,
-                })),
-            )
-                .into_response();
+                }),
+            );
         }
     };
-
-    // Persist the bearer token before issuing material. Without this the token
-    // only lives in the pairing guard's memory and every enrolled device is
-    // unpaired by the next gateway restart.
-    if let Err(error) = state.persist_pairing_tokens().await {
-        state.pairing.revoke_token(&token);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("could not persist the pairing token: {error}")
-            })),
-        )
-            .into_response();
-    }
+    let token_hash = reservation.token_hash();
 
     let device_id = format!("dev-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     let issued = match zeroclaw_tls::sign_csr(
@@ -119,32 +119,82 @@ async fn handle_enroll(
     ) {
         Ok(issued) => issued,
         Err(error) => {
-            return (
+            return refuse(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("invalid CSR: {error}")})),
-            )
-                .into_response();
+                serde_json::json!({"error": format!("invalid CSR: {error}")}),
+            );
         }
     };
-    let name = request.device_name.unwrap_or_else(|| device_id.clone());
+    let name = request
+        .device_name
+        .map(|name| name.trim().chars().take(64).collect::<String>())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| device_id.clone());
+    if let Err(error) =
+        state.audit_issuance_attempted(&device_id, &issued.fingerprint, issued.not_after)
+    {
+        return refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"error": format!("could not audit the certificate issuance: {error}")}),
+        );
+    }
     if let Err(error) = state.record_issued(IssuedCert {
         device_id: device_id.clone(),
-        name,
+        name: name.clone(),
         fingerprint: issued.fingerprint.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
         not_after: issued.not_after,
         revoked: false,
+        token_hash: Some(token_hash.clone()),
+        supersedes: None,
     }) {
-        return (
+        return refuse(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                serde_json::json!({"error": format!("could not record the certificate: {error}")}),
-            ),
+            serde_json::json!({"error": format!("could not record the certificate: {error}")}),
+        );
+    }
+
+    let token = reservation.commit();
+    // Undo a committed issuance: the certificate goes to the CRL and the
+    // token, with it, out of the paired set.
+    let roll_back = |what: &str, error: String| {
+        let rollback = state
+            .revoke(&issued.fingerprint)
+            .err()
+            .map(|revoke_error| format!(" (rollback failed: {revoke_error:#})"))
+            .unwrap_or_default();
+        state.pairing.revoke_token_hash(&token_hash);
+        refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"error": format!("could not {what}: {error}{rollback}")}),
         )
-            .into_response();
+    };
+    if let Err(error) = state.register_enrolled_device(&token_hash, &device_id, &name, &client) {
+        return roll_back("register the device", format!("{error:#}"));
+    }
+    // Persist the bearer token before returning it. Without this the token
+    // only lives in the pairing guard's memory and every enrolled device is
+    // unpaired by the next gateway restart.
+    if let Err(error) = state.persist_pairing_tokens().await {
+        return roll_back("persist the pairing token", format!("{error:#}"));
+    }
+    if let Err(error) = state.audit_issued(&device_id, &issued.fingerprint, issued.not_after, false)
+    {
+        return roll_back("write the certificate audit event", format!("{error:#}"));
     }
 
     state.enrollment.close_after_pairing();
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            serde_json::json!({
+                "device_id": device_id,
+                "fingerprint": issued.fingerprint,
+                "peer": client,
+            })
+        ),
+        "mTLS client certificate issued by pairing-code enrollment"
+    );
 
     Json(EnrollResponse {
         cert_pem: issued.cert_pem,
@@ -214,24 +264,170 @@ pub(crate) fn serve(
                 Err(_) => continue,
             };
             let executor = tasks.clone();
+            let window = window.clone();
+            let mut stopping = shutdown.clone();
             tasks.spawn(async move {
-                let tls_stream = match acceptor.accept(tcp_stream).await {
-                    Ok(stream) => stream,
-                    Err(_) => return,
+                // Closing the window ends accepted connections too; otherwise
+                // a kept-alive connection could keep redeeming codes after the
+                // operator saw the port close.
+                let serve = async {
+                    let tls_stream = match acceptor.accept(tcp_stream).await {
+                        Ok(stream) => stream,
+                        Err(_) => return,
+                    };
+                    let hyper_svc = hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let svc = svc.clone();
+                            async move { tower::ServiceExt::oneshot(svc, req).await }
+                        },
+                    );
+                    let _ = hyper_util::server::conn::auto::Builder::new(executor)
+                        .serve_connection_with_upgrades(
+                            hyper_util::rt::TokioIo::new(tls_stream),
+                            hyper_svc,
+                        )
+                        .await;
                 };
-                let hyper_svc = hyper::service::service_fn(
-                    move |req: hyper::Request<hyper::body::Incoming>| {
-                        let svc = svc.clone();
-                        async move { tower::ServiceExt::oneshot(svc, req).await }
-                    },
-                );
-                let _ = hyper_util::server::conn::auto::Builder::new(executor)
-                    .serve_connection_with_upgrades(
-                        hyper_util::rt::TokioIo::new(tls_stream),
-                        hyper_svc,
-                    )
-                    .await;
+                tokio::select! {
+                    _ = window.cancelled() => {}
+                    _ = stopping.changed() => {}
+                    () = serve => {}
+                }
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mtls_state::BindingRefusal;
+    use zeroclaw_config::pairing::{PairingCodePolicy, PairingGuard};
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        state: Arc<MtlsState>,
+        pairing: Arc<PairingGuard>,
+    }
+
+    fn fixture(pinned: Vec<String>) -> Fixture {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let materials = zeroclaw_tls::ensure_gateway_materials(
+            dir.path(),
+            &zeroclaw_tls::CaKeyProtection::None,
+        )
+        .expect("materials");
+        let pairing = Arc::new(PairingGuard::new(true, &[], PairingCodePolicy::default()));
+        let state = MtlsState::load(
+            dir.path().to_path_buf(),
+            materials.gateway_id,
+            std::fs::read_to_string(&materials.ca_cert_path).expect("ca"),
+            zeroclaw_tls::load_ca_key_pem(
+                &materials.ca_key_path,
+                &zeroclaw_tls::CaKeyProtection::None,
+            )
+            .expect("ca key"),
+            Arc::clone(&pairing),
+            pinned,
+            dir.path().join("revoked"),
+            "127.0.0.1".to_string(),
+            0,
+            materials.server_cert_path,
+            materials.server_key_path,
+        )
+        .expect("state");
+        Fixture {
+            _dir: dir,
+            state,
+            pairing,
+        }
+    }
+
+    fn peer() -> ConnectInfo<SocketAddr> {
+        ConnectInfo("198.51.100.4:5000".parse().expect("addr"))
+    }
+
+    async fn enroll(fixture: &Fixture, code: &str, csr_pem: String) -> Response {
+        handle_enroll(
+            State(Arc::clone(&fixture.state)),
+            peer(),
+            Json(EnrollRequest {
+                pairing_code: code.to_string(),
+                csr_pem,
+                device_name: Some("phone".to_string()),
+            }),
+        )
+        .await
+    }
+
+    fn new_code(fixture: &Fixture) -> String {
+        fixture
+            .pairing
+            .generate_new_pairing_code(PairingCodePolicy::default())
+            .expect("pairing enabled")
+    }
+
+    #[tokio::test]
+    async fn a_rejected_csr_keeps_the_code_and_mints_no_token() {
+        let fixture = fixture(Vec::new());
+        let code = new_code(&fixture);
+        let response = enroll(&fixture, &code, "not a csr".to_string()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            fixture.pairing.pairing_code().as_deref(),
+            Some(code.as_str())
+        );
+        assert!(fixture.pairing.tokens().is_empty(), "no orphaned token");
+        assert!(fixture.state.read_ledger().is_empty());
+    }
+
+    #[tokio::test]
+    async fn enrollment_binds_the_token_to_the_certificate() {
+        let fixture = fixture(Vec::new());
+        let code = new_code(&fixture);
+        let (csr, _key) = zeroclaw_tls::generate_client_csr("phone").expect("csr");
+        let response = enroll(&fixture, &code, csr).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let token = body["token"].as_str().expect("token");
+        let hash = PairingGuard::token_hash(token);
+
+        assert!(fixture.pairing.token_is_paired(token));
+        assert!(
+            fixture.pairing.pairing_code().is_none(),
+            "the code is spent"
+        );
+        let ledger = fixture.state.read_ledger();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].token_hash.as_deref(), Some(hash.as_str()));
+        assert_eq!(ledger[0].device_id, body["device_id"].as_str().expect("id"));
+        assert_eq!(
+            fixture
+                .state
+                .check_binding(std::slice::from_ref(&hash), None),
+            Err(BindingRefusal::CertificateRequired)
+        );
+        assert_eq!(
+            fixture
+                .state
+                .check_binding(&[hash], Some(&ledger[0].fingerprint)),
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_client_certificates_refuse_enrollment_without_spending_the_code() {
+        let fixture = fixture(vec!["ab".repeat(32)]);
+        let code = new_code(&fixture);
+        let (csr, _key) = zeroclaw_tls::generate_client_csr("phone").expect("csr");
+        let response = enroll(&fixture, &code, csr).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            fixture.pairing.pairing_code().as_deref(),
+            Some(code.as_str())
+        );
+    }
 }
