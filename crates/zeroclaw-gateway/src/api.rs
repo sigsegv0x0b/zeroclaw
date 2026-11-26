@@ -4,7 +4,7 @@
 use super::{AppState, GW_SESSION_PREFIX, gateway_cancel_key, gateway_session_key};
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
@@ -33,10 +33,7 @@ fn integration_entry_json(
 
 /// Extract and validate bearer token from Authorization header.
 pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|auth| auth.strip_prefix("Bearer "))
+    crate::token_auth::authorization_bearer_token(headers)
 }
 
 /// Verify bearer token against PairingGuard. Returns error response if unauthorized.
@@ -2341,6 +2338,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::{AppState, GatewayRateLimiter, IdempotencyStore, nodes};
     use async_trait::async_trait;
+    use axum::http::header;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     // Gated on every channel feature whose `AppState` fields below are built
@@ -2611,6 +2609,8 @@ pub(crate) mod tests {
             node_id: "connected-node".into(),
             capabilities: Vec::new(),
             invoke_tx,
+            owner: "owner".into(),
+            generation: 0,
         }));
         state.mdns_peer_registry.insert(
             "peer-1".into(),

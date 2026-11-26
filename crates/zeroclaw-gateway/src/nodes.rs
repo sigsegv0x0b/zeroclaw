@@ -6,24 +6,73 @@ use axum::{
         Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderMap, header},
+    http::HeaderMap,
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq};
 
 pub mod mdns;
 
-/// Prefix used in `Sec-WebSocket-Protocol` to carry a bearer token.
-const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
-
 /// The sub-protocol we support for node connections.
 const WS_NODE_PROTOCOL: &str = "zeroclaw.nodes.v1";
+
+/// A node's registration frame is bounded so a compromised or buggy phone
+/// cannot fill the registry or every model prompt with thousands of tools.
+const MAX_NODE_CAPABILITIES: usize = 64;
+/// `node_` + id + `__` + capability + truncation headroom.
+const MAX_NODE_ID_BYTES: usize = 24;
+const MAX_CAPABILITY_NAME_BYTES: usize = 32;
+const MAX_CAPABILITY_DESCRIPTION_BYTES: usize = 1024;
+const MAX_CAPABILITY_PARAMETERS_BYTES: usize = 16 * 1024;
+/// Frame ceiling for `/ws/nodes`; a registration or result larger than this is
+/// refused before it reaches the JSON parser. It leaves room for one maximum
+/// image attachment (8 MiB decoded, ~10.7 MiB base64) plus JSON overhead.
+const NODE_WS_MAX_MESSAGE_BYTES: usize = 12 * 1024 * 1024;
+
+fn valid_node_id(node_id: &str) -> bool {
+    !node_id.is_empty()
+        && node_id.len() <= MAX_NODE_ID_BYTES
+        && node_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn valid_capability(capability: &NodeCapability) -> bool {
+    !capability.name.is_empty()
+        && capability.name.len() <= MAX_CAPABILITY_NAME_BYTES
+        && capability
+            .name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        && capability.description.len() <= MAX_CAPABILITY_DESCRIPTION_BYTES
+        && serde_json::to_vec(&capability.parameters)
+            .is_ok_and(|parameters| parameters.len() <= MAX_CAPABILITY_PARAMETERS_BYTES)
+}
+
+fn valid_registration(node_id: &str, capabilities: &[NodeCapability]) -> bool {
+    if !valid_node_id(node_id) || capabilities.len() > MAX_NODE_CAPABILITIES {
+        return false;
+    }
+    let mut names = HashSet::new();
+    let mut tool_names = HashSet::new();
+    capabilities.iter().all(|capability| {
+        if !valid_capability(capability) || !names.insert(capability.name.as_str()) {
+            return false;
+        }
+        // `a.b` and `a_b` both become `a_b` in a provider tool name. Reject
+        // that collision at the source rather than letting one capability
+        // shadow another.
+        tool_names
+            .insert(crate::node_tool::sanitize_component(&capability.name).to_ascii_lowercase())
+    })
+}
 
 /// A single capability advertised by a node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +97,13 @@ pub struct NodeInfo {
     pub capabilities: Vec<NodeCapability>,
     /// Channel to send invocation requests to the node's WebSocket handler.
     pub invoke_tx: mpsc::Sender<NodeInvocation>,
+    /// The authenticated credential that registered this node (the paired
+    /// token hash, or the shared `nodes.auth_token` hash). A different owner
+    /// cannot overwrite the node id or receive its invocations.
+    pub owner: String,
+    /// Per-registration generation, so a stale socket cannot unregister the
+    /// connection that replaced it.
+    pub generation: u64,
 }
 
 /// An invocation request sent to a node.
@@ -106,6 +162,7 @@ pub struct NodeInvocationResult {
 pub struct NodeRegistry {
     nodes: Arc<RwLock<HashMap<String, NodeInfo>>>,
     max_nodes: usize,
+    next_generation: Arc<AtomicU64>,
 }
 
 impl NodeRegistry {
@@ -114,17 +171,34 @@ impl NodeRegistry {
         Self {
             nodes: Arc::new(RwLock::new(HashMap::new())),
             max_nodes,
+            next_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Register a node with its capabilities. Returns false if at capacity.
+    /// Register a node with its capabilities. Returns false if at capacity or
+    /// when another credential already owns this node id.
     pub fn register(&self, info: NodeInfo) -> bool {
+        self.register_with_generation(info).is_some()
+    }
+
+    /// Register a node and return the generation this connection was assigned.
+    ///
+    /// The generation lets the socket's cleanup path remove only its own
+    /// registration, not a newer connection that replaced it.
+    pub fn register_with_generation(&self, mut info: NodeInfo) -> Option<u64> {
         let mut nodes = self.nodes.write();
-        if nodes.len() >= self.max_nodes && !nodes.contains_key(&info.node_id) {
-            return false;
+        if let Some(existing) = nodes.get(&info.node_id)
+            && existing.owner != info.owner
+        {
+            return None;
         }
+        if nodes.len() >= self.max_nodes && !nodes.contains_key(&info.node_id) {
+            return None;
+        }
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        info.generation = generation;
         nodes.insert(info.node_id.clone(), info);
-        true
+        Some(generation)
     }
 
     /// Remove a node from the registry.
@@ -132,21 +206,49 @@ impl NodeRegistry {
         self.nodes.write().remove(node_id);
     }
 
+    /// Remove this registration only if it is still the current one.
+    pub fn unregister_if_current(&self, node_id: &str, generation: u64) {
+        let mut nodes = self.nodes.write();
+        if nodes
+            .get(node_id)
+            .is_some_and(|node| node.generation == generation)
+        {
+            nodes.remove(node_id);
+        }
+    }
+
     /// List all registered node IDs.
     pub fn node_ids(&self) -> Vec<String> {
         self.nodes.read().keys().cloned().collect()
     }
 
-    /// Get all capabilities across all nodes, keyed by prefixed tool name.
-    pub fn all_capabilities(&self) -> Vec<(String, String, NodeCapability)> {
+    /// Get capabilities across nodes, optionally restricted to one node id and
+    /// one authenticated owner. A chat turn passes both, so a paired token can
+    /// only reach the phone that registered under that same token.
+    pub fn capabilities_for(
+        &self,
+        node_id: Option<&str>,
+        owner: Option<&str>,
+    ) -> Vec<(String, String, NodeCapability)> {
         let nodes = self.nodes.read();
         let mut caps = Vec::new();
         for info in nodes.values() {
+            if node_id.is_some_and(|wanted| wanted != info.node_id) {
+                continue;
+            }
+            if owner.is_some_and(|wanted| wanted != info.owner) {
+                continue;
+            }
             for cap in &info.capabilities {
                 caps.push((info.node_id.clone(), cap.name.clone(), cap.clone()));
             }
         }
         caps
+    }
+
+    /// Get all capabilities across all nodes, keyed by prefixed tool name.
+    pub fn all_capabilities(&self) -> Vec<(String, String, NodeCapability)> {
+        self.capabilities_for(None, None)
     }
 
     /// Get the invocation sender for a specific node.
@@ -211,49 +313,23 @@ fn extract_node_ws_token<'a>(
     headers: &'a HeaderMap,
     query_token: Option<&'a str>,
 ) -> Option<&'a str> {
-    // 1. Authorization header
-    if let Some(t) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|auth| auth.strip_prefix("Bearer "))
-        && !t.is_empty()
-    {
-        return Some(t);
-    }
-
-    // 2. Sec-WebSocket-Protocol: bearer.<token>
-    if let Some(t) = headers
-        .get("sec-websocket-protocol")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|protos| {
-            protos
-                .split(',')
-                .map(|p| p.trim())
-                .find_map(|p| p.strip_prefix(BEARER_SUBPROTO_PREFIX))
-        })
-        && !t.is_empty()
-    {
-        return Some(t);
-    }
-
-    // 3. ?token= query parameter
-    if let Some(t) = query_token
-        && !t.is_empty()
-    {
-        return Some(t);
-    }
-
-    None
+    crate::token_auth::websocket_bearer_token(headers, query_token)
 }
 
-pub(crate) fn check_node_auth(
+/// The authenticated owner a node registration belongs to.
+///
+/// A registration is keyed by this owner as well as by the claimed node id, so
+/// a second paired token cannot overwrite the first phone's node id, receive
+/// its invocations, or be handed its tools by a chat turn. `nodes.auth_token`
+/// is one shared credential, so every node using it shares one owner.
+fn authenticated_node_owner(
     nodes_config: &zeroclaw_config::schema::NodesConfig,
     pairing: &PairingGuard,
     headers: &HeaderMap,
     query_token: Option<&str>,
-) -> Option<(axum::http::StatusCode, &'static str)> {
+) -> Result<String, (axum::http::StatusCode, &'static str)> {
     if !nodes_config.enabled {
-        return Some((
+        return Err((
             axum::http::StatusCode::NOT_FOUND,
             "Not Found — node discovery is disabled (set nodes.enabled=true to enable)",
         ));
@@ -263,7 +339,7 @@ pub(crate) fn check_node_auth(
         // authenticate missing or arbitrary tokens (trimming both sides
         // would produce `constant_time_eq("", "")` = true and bypass auth).
         if expected_token.trim().is_empty() {
-            return Some((
+            return Err((
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "Service Unavailable — nodes.auth_token must not be empty or whitespace-only",
             ));
@@ -275,27 +351,38 @@ pub(crate) fn check_node_auth(
         // the canonical pattern at
         // `crates/zeroclaw-config/src/pairing.rs:139`.
         if !constant_time_eq(token.trim(), expected_token.trim()) {
-            return Some((
+            return Err((
                 axum::http::StatusCode::UNAUTHORIZED,
                 "Unauthorized — provide a valid node auth token",
             ));
         }
+        Ok(format!(
+            "nodes-token:{}",
+            PairingGuard::token_hash(expected_token.trim())
+        ))
     } else if pairing.require_pairing() {
         let token = extract_node_ws_token(headers, query_token).unwrap_or("");
-        if !pairing.is_authenticated(token) {
-            return Some((
-                axum::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization header or ?token= query param",
-            ));
-        }
+        pairing.authenticate_and_hash(token).ok_or((
+            axum::http::StatusCode::UNAUTHORIZED,
+            "Unauthorized — provide Authorization header or ?token= query param",
+        ))
     } else {
-        return Some((
+        Err((
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "Service Unavailable — node registration is disabled because no auth method is configured. \
              Set nodes.auth_token OR enable gateway.require_pairing.",
-        ));
+        ))
     }
-    None
+}
+
+#[cfg(test)]
+pub(crate) fn check_node_auth(
+    nodes_config: &zeroclaw_config::schema::NodesConfig,
+    pairing: &PairingGuard,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Option<(axum::http::StatusCode, &'static str)> {
+    authenticated_node_owner(nodes_config, pairing, headers, query_token).err()
 }
 
 pub async fn handle_ws_nodes(
@@ -305,14 +392,15 @@ pub async fn handle_ws_nodes(
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     let nodes_config = state.config.read().nodes.clone();
-    if let Some((status, body)) = check_node_auth(
+    let owner = match authenticated_node_owner(
         &nodes_config,
         &state.pairing,
         &headers,
         params.token.as_deref(),
     ) {
-        return (status, body).into_response();
-    }
+        Ok(owner) => owner,
+        Err((status, body)) => return (status, body).into_response(),
+    };
 
     // Echo sub-protocol if client requests it
     let ws = if headers
@@ -324,15 +412,17 @@ pub async fn handle_ws_nodes(
     } else {
         ws
     };
+    let ws = ws.max_message_size(NODE_WS_MAX_MESSAGE_BYTES);
 
     let registry = state.node_registry.clone();
-    ws.on_upgrade(move |socket| handle_node_socket(socket, registry))
+    ws.on_upgrade(move |socket| handle_node_socket(socket, registry, owner))
         .into_response()
 }
 
-async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
+async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>, owner: String) {
     let (mut sender, mut receiver) = socket.split();
     let mut registered_node_id: Option<String> = None;
+    let mut registered_generation: Option<u64> = None;
 
     // Channel for forwarding invocations to this node
     let (invoke_tx, mut invoke_rx) = mpsc::channel::<NodeInvocation>(32);
@@ -386,13 +476,12 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
                 node_id,
                 capabilities,
             } => {
-                // Validate node_id
-                if node_id.is_empty() || node_id.len() > 128 {
+                if !valid_registration(&node_id, &capabilities) {
                     ::zeroclaw_log::record!(
                         WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        "Node registration rejected: invalid node_id length"
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "Node registration rejected: invalid node id or oversized, duplicated, or malformed capability list"
                     );
                     continue;
                 }
@@ -402,9 +491,11 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
                     node_id: node_id.clone(),
                     capabilities,
                     invoke_tx: invoke_tx.clone(),
+                    owner: owner.clone(),
+                    generation: 0,
                 };
 
-                if registry.register(info) {
+                if let Some(generation) = registry.register_with_generation(info) {
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -414,13 +505,14 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
                         "Node registered: with capabilities"
                     );
                     registered_node_id = Some(node_id.clone());
+                    registered_generation = Some(generation);
                 } else {
                     ::zeroclaw_log::record!(
                         WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({"node_id": node_id})),
-                        "Node registration rejected: registry at capacity for"
+                        "Node registration rejected: registry at capacity or node id owned by another credential"
                     );
                 }
             }
@@ -443,9 +535,10 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
         }
     }
 
-    // Cleanup: unregister node on disconnect
-    if let Some(node_id) = registered_node_id {
-        registry.unregister(&node_id);
+    // Cleanup: only remove this connection's registration, not a newer one
+    // that replaced it with the same node id.
+    if let (Some(node_id), Some(generation)) = (registered_node_id, registered_generation) {
+        registry.unregister_if_current(&node_id, generation);
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -582,6 +675,30 @@ mod tests {
         assert!(result.is_none(), "correct token must pass auth gate");
     }
 
+    #[tokio::test]
+    async fn node_owner_is_the_authenticated_pairing_token_hash() {
+        let pairing = make_pairing(true);
+        let code = pairing
+            .generate_new_pairing_code(zeroclaw_config::pairing::PairingCodePolicy::default())
+            .expect("code");
+        let token = pairing
+            .try_pair(&code, "node-test")
+            .await
+            .expect("not locked out")
+            .expect("paired");
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: None,
+            ..NodesConfig::default()
+        };
+        let headers = bearer_headers(&token);
+        assert_eq!(
+            authenticated_node_owner(&cfg, &pairing, &headers, None).expect("authenticated"),
+            PairingGuard::token_hash(&token),
+            "a node registration must be owned by the token that authenticated it"
+        );
+    }
+
     #[test]
     fn nodes_pairing_required_wrong_token_returns_401() {
         let cfg = NodesConfig {
@@ -606,6 +723,8 @@ mod tests {
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
             }],
             invoke_tx: tx,
+            owner: "owner".to_string(),
+            generation: 0,
         };
 
         assert!(registry.register(info));
@@ -627,6 +746,8 @@ mod tests {
                 node_id: format!("node-{i}"),
                 capabilities: vec![],
                 invoke_tx: tx,
+                owner: "owner".to_string(),
+                generation: 0,
             };
             assert!(registry.register(info));
         }
@@ -636,6 +757,8 @@ mod tests {
             node_id: "node-overflow".to_string(),
             capabilities: vec![],
             invoke_tx: tx,
+            owner: "owner".to_string(),
+            generation: 0,
         };
         assert!(!registry.register(info));
         assert_eq!(registry.len(), 2);
@@ -655,6 +778,8 @@ mod tests {
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
             }],
             invoke_tx: tx1,
+            owner: "owner".to_string(),
+            generation: 0,
         };
         assert!(registry.register(info1));
 
@@ -666,6 +791,8 @@ mod tests {
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
             }],
             invoke_tx: tx2,
+            owner: "owner".to_string(),
+            generation: 0,
         };
         // Re-registering same node_id should succeed (update)
         assert!(registry.register(info2));
@@ -674,6 +801,100 @@ mod tests {
         let caps = registry.all_capabilities();
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0].2.name, "new");
+    }
+
+    #[test]
+    fn node_registry_refuses_another_owner_for_the_same_node_id() {
+        let registry = NodeRegistry::new(10);
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        assert!(registry.register(NodeInfo {
+            node_id: "phone-1".to_string(),
+            capabilities: vec![],
+            invoke_tx: tx1,
+            owner: "owner-a".to_string(),
+            generation: 0,
+        }));
+        assert!(
+            !registry.register(NodeInfo {
+                node_id: "phone-1".to_string(),
+                capabilities: vec![],
+                invoke_tx: tx2,
+                owner: "owner-b".to_string(),
+                generation: 0,
+            }),
+            "a different token must not overwrite another device's node id"
+        );
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn a_stale_socket_cannot_unregister_its_replacement() {
+        let registry = NodeRegistry::new(10);
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        let first = registry
+            .register_with_generation(NodeInfo {
+                node_id: "phone-1".to_string(),
+                capabilities: vec![],
+                invoke_tx: tx1,
+                owner: "owner".to_string(),
+                generation: 0,
+            })
+            .expect("first registration");
+        let second = registry
+            .register_with_generation(NodeInfo {
+                node_id: "phone-1".to_string(),
+                capabilities: vec![],
+                invoke_tx: tx2,
+                owner: "owner".to_string(),
+                generation: 0,
+            })
+            .expect("replacement registration");
+
+        registry.unregister_if_current("phone-1", first);
+        assert!(
+            registry.contains("phone-1"),
+            "the old socket must not unregister its replacement"
+        );
+        registry.unregister_if_current("phone-1", second);
+        assert!(!registry.contains("phone-1"));
+    }
+
+    #[test]
+    fn node_registration_limits_are_enforced() {
+        assert!(valid_node_id("android-1a2b3c4d"));
+        assert!(!valid_node_id(""));
+        assert!(!valid_node_id("has space"));
+        assert!(!valid_node_id(&"x".repeat(MAX_NODE_ID_BYTES + 1)));
+        assert!(valid_capability(&NodeCapability {
+            name: "camera.snap".to_string(),
+            description: "Take a photo".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }));
+        assert!(!valid_capability(&NodeCapability {
+            name: "x".repeat(MAX_CAPABILITY_NAME_BYTES + 1),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        }));
+        assert!(!valid_capability(&NodeCapability {
+            name: "tool".to_string(),
+            description: "x".repeat(MAX_CAPABILITY_DESCRIPTION_BYTES + 1),
+            parameters: serde_json::json!({}),
+        }));
+        let capability = |name: &str| NodeCapability {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        };
+        assert!(valid_registration(
+            "phone-1",
+            &[capability("a.b"), capability("c_d")]
+        ));
+        assert!(
+            !valid_registration("phone-1", &[capability("a.b"), capability("a_b")]),
+            "capability names that sanitize to the same tool name must be rejected"
+        );
     }
 
     #[test]
@@ -697,6 +918,8 @@ mod tests {
                 },
             ],
             invoke_tx: tx1,
+            owner: "owner".to_string(),
+            generation: 0,
         });
 
         registry.register(NodeInfo {
@@ -707,6 +930,8 @@ mod tests {
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
             }],
             invoke_tx: tx2,
+            owner: "owner".to_string(),
+            generation: 0,
         });
 
         let caps = registry.all_capabilities();
@@ -723,6 +948,8 @@ mod tests {
             node_id: "n".to_string(),
             capabilities: vec![],
             invoke_tx: tx,
+            owner: "owner".to_string(),
+            generation: 0,
         });
         assert!(!registry.is_empty());
     }

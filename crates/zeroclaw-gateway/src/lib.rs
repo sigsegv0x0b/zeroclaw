@@ -55,6 +55,7 @@ pub mod session_queue;
 pub mod sse;
 pub mod static_files;
 pub mod tls;
+mod token_auth;
 pub mod version;
 #[cfg(feature = "gateway-voice-duplex")]
 pub mod voice_duplex;
@@ -6097,6 +6098,28 @@ async fn handle_admin_paircode_new(
                 });
                 return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
             }
+            // Certificates are a separate durable surface from the token set.
+            // Rotate-all must revoke them too or the mTLS listener keeps
+            // trusting leaves the operator believes they just rotated.
+            let mtls_revoked = match state
+                .mtls
+                .as_ref()
+                .map(|mtls| mtls.revoke_all())
+                .transpose()
+            {
+                Ok(revoked) => revoked,
+                Err(e) => {
+                    let body = serde_json::json!({
+                        "success": false,
+                        "pairing_required": true,
+                        "pairing_code": null,
+                        "message": format!(
+                            "Tokens revoked in memory but mTLS certificate revocation failed: {e:#}"
+                        ),
+                    });
+                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+                }
+            };
             if let Err(e) = persist_pairing_tokens_under(&state, config_write_guard).await {
                 let body = serde_json::json!({
                     "success": false,
@@ -6106,14 +6129,20 @@ async fn handle_admin_paircode_new(
                 });
                 return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
             }
+            let certificates = mtls_revoked
+                .as_ref()
+                .map_or(0, |outcome| outcome.fingerprints.len());
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"revoked": revoked})),
-                "all paired tokens revoked via admin endpoint"
+                    .with_attrs(serde_json::json!({
+                        "revoked": revoked,
+                        "certificates": certificates,
+                    })),
+                "all paired tokens and mTLS certificates revoked via admin endpoint"
             );
             Some(format!(
-                "Revoked all {revoked} paired token(s) and cleared the device registry."
+                "Revoked all {revoked} paired token(s), {certificates} mTLS certificate(s), and cleared the device registry."
             ))
         }
         Some(device_id) => {

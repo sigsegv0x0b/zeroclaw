@@ -48,11 +48,22 @@ struct EnrollResponse {
     token: String,
 }
 
-async fn handle_ca(State(state): State<Arc<MtlsState>>) -> Json<CaResponse> {
+async fn handle_ca(
+    State(state): State<Arc<MtlsState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    if !state.allow_enroll(peer.ip()) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "too many enrollment attempts; retry later"})),
+        )
+            .into_response();
+    }
     Json(CaResponse {
         ca_chain_pem: state.ca_cert_pem.clone(),
         gateway_id: state.gateway_id.clone(),
     })
+    .into_response()
 }
 
 async fn handle_enroll(
