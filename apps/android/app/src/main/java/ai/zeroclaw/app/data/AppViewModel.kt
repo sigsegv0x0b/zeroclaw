@@ -46,7 +46,7 @@ data class UiState(
     val mtlsStatus: String = "",
     val mtlsNotAfter: Long = 0,
     val secureEnrolling: Boolean = false,
-    val secureSas: String? = null,
+    val secureConfirm: SecureEnrollConfirm? = null,
     val nodeStatus: NodeStatus = NodeStatus.Stopped,
     val agents: List<AgentEntry> = emptyList(),
     val agent: String = "",
@@ -68,6 +68,19 @@ data class UiState(
     val paired: Boolean get() = gatewayUrl.isNotBlank() && token.isNotBlank()
     val connected: Boolean get() = socket is SocketState.Open
 }
+
+/**
+ * The gateway a secure setup is about to pair with, shown for confirmation
+ * before the pairing code is sent. `verified` is true when a scanned QR code
+ * already matched the gateway's CA (and SAS); a typed code needs the operator
+ * to compare the SAS with the gateway console.
+ */
+data class SecureEnrollConfirm(
+    val host: String,
+    val gatewayId: String,
+    val sas: String,
+    val verified: Boolean,
+)
 
 /** Shown once per cleartext origin before the app sends a token over HTTP. */
 data class InsecureConnectionPrompt(val origin: String)
@@ -97,7 +110,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val gateway = GatewayClient()
     private val socket = ChatSocket(viewModelScope)
     private val androidVoice = AndroidVoiceInput(app)
-    private val gatewayVoice = GatewayVoiceInput(app)
+    private val gatewayVoice = GatewayVoiceInput(app) { currentTransport }
+    @Volatile private var currentTransport: okhttp3.OkHttpClient = MtlsTransport.plainClient()
     private var pendingProbe: MtlsEnrollment.Probe? = null
     private var pendingMtlsPort: Int = 42618
     private var pendingInsecure: PendingConnection? = null
@@ -183,6 +197,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun bootstrap() {
         viewModelScope.launch {
+            runCatching { store.migrateSecrets() }
             val saved = runCatching { store.current() }.getOrNull()
             if (saved == null || saved.gatewayUrl.isBlank() || saved.token.isBlank()) {
                 _ui.update { it.copy(booting = false) }
@@ -201,7 +216,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     mtlsGatewayId = saved.mtlsGatewayId,
                     mtlsLoaded = saved.mtlsCaPem.isNotBlank() &&
                         saved.mtlsClientCertPem.isNotBlank() &&
-                        saved.mtlsClientKeyPem.isNotBlank(),
+                        saved.hasClientKey,
                     mtlsStatus = MtlsTransport.describe(saved),
                     mtlsNotAfter = saved.mtlsNotAfter,
                     booting = false,
@@ -410,6 +425,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             NodeService.stop(getApplication())
             CertificateRenewalScheduler.cancel(getApplication())
             store.clear()
+            ClientKeys.deleteAllExcept("")
             appliedClientCertPem = ""
             _ui.update {
                 UiState(booting = false, deviceName = it.deviceName)
@@ -478,10 +494,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     // ── Identity-based mTLS transport ──────────────────────────────────────
 
     private fun applyMtlsTransport(settings: StoredSettings) {
-        val client = when (val result = MtlsTransport.build(settings)) {
-            is MtlsTransport.Result.Ready -> result.built.client
-            is MtlsTransport.Result.Unavailable -> MtlsTransport.plainClient()
-        }
+        val client = MtlsTransport.clientFor(settings)
+        currentTransport = client
         gateway.updateHttpClient(client)
         socket.updateHttpClient(client)
         appliedClientCertPem = settings.mtlsClientCertPem
@@ -494,29 +508,37 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         mtlsPort: Int,
         enrollPort: Int,
         code: String,
-        expectedSas: String?,
+        expected: MtlsEnrollment.Expected,
     ) {
         viewModelScope.launch {
-            _ui.update { it.copy(secureEnrolling = true, error = null, secureSas = null) }
+            _ui.update { it.copy(secureEnrolling = true, error = null, secureConfirm = null) }
             runCatching { MtlsEnrollment.probe(host.trim(), enrollPort, code.trim()) }
                 .onSuccess { probe ->
-                    pendingProbe = probe
-                    pendingMtlsPort = mtlsPort
-                    if (!expectedSas.isNullOrBlank() &&
-                        !expectedSas.equals(probe.sas, ignoreCase = true)
-                    ) {
+                    val mismatch = MtlsEnrollment.mismatch(probe, expected)
+                    if (mismatch != null) {
                         pendingProbe = null
                         _ui.update {
                             it.copy(
                                 secureEnrolling = false,
-                                error = "SAS mismatch: the QR expects $expectedSas but the gateway " +
-                                    "presented ${probe.sas}. Do not continue.",
+                                error = "Secure setup stopped: $mismatch. Do not continue.",
                             )
                         }
-                    } else if (!expectedSas.isNullOrBlank()) {
-                        completeSecureEnroll(probe, mtlsPort)
-                    } else {
-                        _ui.update { it.copy(secureEnrolling = false, secureSas = probe.sas) }
+                        return@onSuccess
+                    }
+                    pendingProbe = probe
+                    pendingMtlsPort = mtlsPort
+                    // Even a verified QR asks once: the operator sees which
+                    // gateway will be able to use this phone before pairing.
+                    _ui.update {
+                        it.copy(
+                            secureEnrolling = false,
+                            secureConfirm = SecureEnrollConfirm(
+                                host = probe.host,
+                                gatewayId = probe.gatewayId,
+                                sas = probe.sas,
+                                verified = expected.verifiesSas,
+                            ),
+                        )
                     }
                 }
                 .onFailure { error ->
@@ -537,13 +559,30 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun cancelSecureEnroll() {
         pendingProbe = null
-        _ui.update { it.copy(secureEnrolling = false, secureSas = null) }
+        _ui.update { it.copy(secureEnrolling = false, secureConfirm = null) }
     }
 
     private suspend fun completeSecureEnroll(probe: MtlsEnrollment.Probe, mtlsPort: Int) {
-        _ui.update { it.copy(secureEnrolling = true, error = null, secureSas = null) }
-        val result = runCatching {
-            MtlsEnrollment.enroll(probe, _ui.value.deviceName.ifBlank { "Android" }, mtlsPort)
+        _ui.update { it.copy(secureEnrolling = true, error = null, secureConfirm = null) }
+        pendingProbe = null
+        val baseUrl = "https://${probe.host}:$mtlsPort"
+        val enrolled = runCatching {
+            // Serialized with renewal, which prunes Keystore keys nothing
+            // refers to; the new key is referenced once this write lands.
+            CertificateRenewal.serialized {
+                val enrolled = MtlsEnrollment.enroll(
+                    probe,
+                    _ui.value.deviceName.ifBlank { "Android" },
+                )
+                try {
+                    store.saveEnrolledIdentity(enrolled.identity, baseUrl, enrolled.token)
+                } catch (error: Exception) {
+                    ClientKeys.delete(enrolled.identity.keyAlias)
+                    throw error
+                }
+                ClientKeys.deleteAllExcept(enrolled.identity.keyAlias)
+                enrolled
+            }
         }.getOrElse { error ->
             _ui.update {
                 it.copy(
@@ -551,33 +590,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     error = "Enrollment failed: ${error.userMessage()}",
                 )
             }
-            pendingProbe = null
             return
         }
-        pendingProbe = null
-        store.saveMtlsMaterial(
-            ca = result.caPem,
-            cert = result.certPem,
-            key = result.keyPem,
-        )
-        store.saveMtlsValidity(System.currentTimeMillis(), result.notAfter)
-        store.saveMtlsGatewayId(result.gatewayId)
-        store.saveMtlsEnabled(true)
-        val baseUrl = "https://${probe.host}:$mtlsPort"
-        store.saveConnection(baseUrl, result.token)
         val saved = store.current()
         applyMtlsTransport(saved)
         CertificateRenewalScheduler.schedule(getApplication())
         _ui.update {
             it.copy(
                 gatewayUrl = baseUrl,
-                token = result.token,
+                token = enrolled.token,
                 mtlsEnabled = true,
-                mtlsGatewayId = result.gatewayId,
+                mtlsGatewayId = enrolled.identity.gatewayId,
                 mtlsLoaded = true,
                 mtlsStatus = MtlsTransport.describe(saved),
+                mtlsNotAfter = saved.mtlsNotAfter,
                 secureEnrolling = false,
-                secureSas = null,
+                secureConfirm = null,
                 settingsOpen = false,
                 error = null,
                 messages = emptyList(),
@@ -612,12 +640,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * midpoint. No timer, no wakeup: the next foreground connection pays for it.
      */
     private suspend fun maybeRenewBeforeConnect() {
-        val saved = runCatching { store.current() }.getOrNull() ?: return
-        if (!saved.mtlsEnabled || saved.mtlsIssuedAt <= 0 || saved.mtlsNotAfter <= 0) return
-        val midpoint = saved.mtlsIssuedAt + (saved.mtlsNotAfter - saved.mtlsIssuedAt) / 2
-        if (System.currentTimeMillis() >= midpoint) {
-            renewInternal(manual = false)
-        }
+        renewInternal(manual = false)
     }
 
     fun renewCertificate() {
@@ -625,44 +648,32 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun renewInternal(manual: Boolean) {
-        val settings = runCatching { store.current() }.getOrNull() ?: return
-        if (!settings.mtlsEnabled || settings.mtlsClientCertPem.isBlank()) return
-        runCatching {
-            CertificateRenewal.serialized {
-                val latest = store.current()
-                if (!manual && !CertificateRenewal.isDue(latest)) {
-                    null
-                } else {
-                    MtlsEnrollment.renew(latest, latest.deviceName.ifBlank { "Android" })
+        runCatching { CertificateRenewal.renewIfDue(store, force = manual) }
+            .onSuccess { saved ->
+                if (saved == null) {
+                    if (manual) {
+                        _ui.update { it.copy(error = "No enrolled client certificate to renew.") }
+                    }
+                    return@onSuccess
+                }
+                applyMtlsTransport(saved)
+                CertificateRenewalScheduler.schedule(getApplication())
+                NodeService.notifyCertificateRenewed(getApplication())
+                _ui.update {
+                    it.copy(
+                        mtlsStatus = MtlsTransport.describe(saved),
+                        mtlsLoaded = true,
+                        mtlsNotAfter = saved.mtlsNotAfter,
+                        notice = "Client certificate renewed.",
+                    )
+                }
+                if (manual) reconnect(_ui.value.gatewayUrl, _ui.value.token)
+            }
+            .onFailure { error ->
+                if (manual) {
+                    _ui.update { it.copy(error = "Certificate renewal failed: ${error.userMessage()}") }
                 }
             }
-        }.onSuccess { result ->
-            if (result == null) return@onSuccess
-            store.saveMtlsMaterial(
-                ca = result.caPem,
-                cert = result.certPem,
-                key = result.keyPem,
-            )
-            store.saveMtlsGatewayId(result.gatewayId)
-            store.saveMtlsValidity(System.currentTimeMillis(), result.notAfter)
-            val saved = store.current()
-            applyMtlsTransport(saved)
-            CertificateRenewalScheduler.schedule(getApplication())
-            NodeService.notifyCertificateRenewed(getApplication())
-            _ui.update {
-                it.copy(
-                    mtlsStatus = MtlsTransport.describe(saved),
-                    mtlsLoaded = true,
-                    mtlsNotAfter = saved.mtlsNotAfter,
-                    notice = "Client certificate renewed.",
-                )
-            }
-            if (manual) reconnect(_ui.value.gatewayUrl, _ui.value.token)
-        }.onFailure { error ->
-            if (manual) {
-                _ui.update { it.copy(error = "Certificate renewal failed: ${error.userMessage()}") }
-            }
-        }
     }
 
     fun setMtlsEnabled(enabled: Boolean) {
@@ -723,8 +734,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 it.copy(
                     mtlsLoaded = saved.mtlsCaPem.isNotBlank() &&
                         saved.mtlsClientCertPem.isNotBlank() &&
-                        saved.mtlsClientKeyPem.isNotBlank(),
+                        saved.hasClientKey,
                     mtlsStatus = MtlsTransport.describe(saved),
+                    mtlsNotAfter = saved.mtlsNotAfter,
                 )
             }
         }

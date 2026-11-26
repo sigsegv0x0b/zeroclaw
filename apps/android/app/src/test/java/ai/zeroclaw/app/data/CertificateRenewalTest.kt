@@ -3,6 +3,7 @@ package ai.zeroclaw.app.data
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 class CertificateRenewalTest {
@@ -43,5 +44,25 @@ class CertificateRenewalTest {
         assertFalse(CertificateRenewal.isDue(s.copy(mtlsClientKeyPem = ""), now = 800L))
         assertFalse(CertificateRenewal.isDue(s.copy(mtlsIssuedAt = 0L), now = 800L))
         assertFalse(CertificateRenewal.isDue(s.copy(mtlsNotAfter = 0L), now = 800L))
+    }
+
+    @Test
+    fun aKeystoreKeyCountsAsClientKeyMaterial() {
+        val s = settings(issuedAt = 100L, notAfter = 900L, key = "")
+            .copy(mtlsClientKeyAlias = "zeroclaw-mtls-client-1")
+        assertTrue(CertificateRenewal.isDue(s, now = 800L))
+    }
+
+    @Test
+    fun mtlsWithBrokenMaterialNeverFallsBackToAPlainClient() {
+        val broken = StoredSettings(mtlsEnabled = true, mtlsGatewayId = "gw_1")
+        val client = MtlsTransport.clientFor(broken)
+        val call = client.newCall(okhttp3.Request.Builder().url("https://gw.example/").build())
+        try {
+            call.execute()
+            fail("the refusing client must not open a connection")
+        } catch (expected: java.io.IOException) {
+            assertTrue(expected.message.orEmpty().startsWith("mTLS transport unavailable"))
+        }
     }
 }

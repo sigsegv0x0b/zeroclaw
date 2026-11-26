@@ -1,5 +1,6 @@
 package ai.zeroclaw.app.data
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.location.Location
 import android.location.LocationListener
@@ -74,6 +75,8 @@ object LocationCapability {
         return CapabilityOutcome(true, text)
     }
 
+    // Only reached after `read` has checked location permission.
+    @SuppressLint("MissingPermission")
     private fun bestLastKnown(manager: LocationManager, maxAgeSecs: Int): Location? {
         if (maxAgeSecs <= 0) return null
         val cutoff = System.currentTimeMillis() - maxAgeSecs * 1000L
@@ -85,6 +88,9 @@ object LocationCapability {
             .maxByOrNull { it.time }
     }
 
+    // `read` refuses before reaching here unless location permission is
+    // granted; lint cannot follow the check across these private helpers.
+    @SuppressLint("MissingPermission")
     private suspend fun requestFix(manager: LocationManager, timeoutSecs: Int): Location? {
         val provider = activeProviders(manager).firstOrNull() ?: return null
         return withContext(Dispatchers.Main.immediate) {

@@ -1,5 +1,6 @@
 package ai.zeroclaw.app.data
 
+import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.app.KeyguardManager
 import android.app.NotificationChannel
@@ -168,6 +169,9 @@ object DeviceInfoCapabilities {
             }
         }
 
+    // The POST_NOTIFICATIONS check below is the permission lint cannot see
+    // through; on older releases posting notifications needs no runtime grant.
+    @SuppressLint("MissingPermission")
     suspend fun notify(context: Context, args: JsonObject): CapabilityOutcome =
         withContext(Dispatchers.IO) {
             val title = args.string("title")?.trim().orEmpty()

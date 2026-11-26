@@ -21,7 +21,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -185,7 +185,11 @@ fun SettingsScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(onClick = onBack) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Zc.TextMuted)
+                Icon(
+                    Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = "Back",
+                    tint = Zc.TextMuted,
+                )
             }
             Text(
                 text = "Settings",
@@ -357,7 +361,7 @@ fun SettingsScreen(
                 }
                 Text(
                     text = "Certificate expires: $expiry. Renewal is attempted at half " +
-                        "the lifetime; the server rotates both keys and revokes the old cert.",
+                        "the lifetime; the old certificate stays valid until the new one connects.",
                     style = MaterialTheme.typography.labelSmall,
                     color = Zc.TextSubtle,
                 )

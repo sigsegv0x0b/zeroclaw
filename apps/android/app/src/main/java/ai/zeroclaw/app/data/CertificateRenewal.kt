@@ -23,8 +23,8 @@ import kotlinx.coroutines.sync.withLock
  */
 object CertificateRenewal {
 
-    /** Serializes renewal so the worker and the foreground app cannot both
-     *  revoke each other's still-current certificate. */
+    /** Serializes renewal and enrollment, so two of them cannot replace each
+     *  other's key or certificate halfway through. */
     private val mutex = Mutex()
 
     suspend fun <T> serialized(block: suspend () -> T): T = mutex.withLock { block() }
@@ -33,7 +33,7 @@ object CertificateRenewal {
     internal fun hasMaterial(settings: StoredSettings): Boolean =
         settings.mtlsEnabled &&
             settings.mtlsClientCertPem.isNotBlank() &&
-            settings.mtlsClientKeyPem.isNotBlank() &&
+            settings.hasClientKey &&
             settings.mtlsNotAfter > settings.mtlsIssuedAt &&
             settings.mtlsIssuedAt > 0
 
@@ -42,6 +42,29 @@ object CertificateRenewal {
 
     internal fun isDue(settings: StoredSettings, now: Long = System.currentTimeMillis()): Boolean =
         hasMaterial(settings) && now >= midpoint(settings)
+
+    /**
+     * Renew when due (or always, when `force`), store the new identity in one
+     * write, and only then delete the key it replaced. Returns the stored
+     * settings after a renewal, or null when nothing was due.
+     */
+    suspend fun renewIfDue(store: SettingsStore, force: Boolean): StoredSettings? = serialized {
+        val latest = store.current()
+        if (!hasMaterial(latest)) return@serialized null
+        if (!force && !isDue(latest)) return@serialized null
+        // A run that died between generating a key and saving it left a key
+        // nothing refers to.
+        ClientKeys.deleteAllExcept(latest.mtlsClientKeyAlias)
+        val renewed = MtlsEnrollment.renew(latest, latest.deviceName.ifBlank { "Android" })
+        try {
+            store.saveRenewedIdentity(renewed)
+        } catch (error: Exception) {
+            ClientKeys.delete(renewed.keyAlias)
+            throw error
+        }
+        ClientKeys.deleteAllExcept(renewed.keyAlias)
+        store.current()
+    }
 }
 
 /**
@@ -110,11 +133,11 @@ object CertificateRenewalScheduler {
 /**
  * Renews the stored client certificate once, without user interaction.
  *
- * The bearer token and the current client certificate authenticate the call;
- * the gateway revokes the old leaf, rotates its own server leaf, and returns
- * the replacement material. The foreground view model performs the same
- * operation when it notices the midpoint passed, and the mutex above keeps
- * the two from racing.
+ * The bearer token and the current client certificate authenticate the call.
+ * The gateway issues a new leaf for the same device and retires the old one
+ * once the new one completes a handshake. The foreground view model performs
+ * the same operation when it notices the midpoint passed, and the mutex above
+ * keeps the two from racing.
  */
 class CertificateRenewalWorker(
     context: Context,
@@ -130,34 +153,21 @@ class CertificateRenewalWorker(
         if (System.currentTimeMillis() >= initial.mtlsNotAfter) return Result.failure()
 
         return try {
-            val renewed = CertificateRenewal.serialized {
-                val latest = store.current()
-                if (!CertificateRenewal.isDue(latest)) {
-                    null
-                } else {
-                    MtlsEnrollment.renew(latest, latest.deviceName.ifBlank { "Android" })
-                }
-            }
+            val renewed = CertificateRenewal.renewIfDue(store, force = false)
             if (renewed != null) {
-                store.saveMtlsMaterial(
-                    ca = renewed.caPem,
-                    cert = renewed.certPem,
-                    key = renewed.keyPem,
-                )
-                store.saveMtlsGatewayId(renewed.gatewayId)
-                store.saveMtlsValidity(System.currentTimeMillis(), renewed.notAfter)
                 // The running device link still holds the old key manager.
                 NodeService.notifyCertificateRenewed(applicationContext)
             }
             CertificateRenewalScheduler.scheduleNext(applicationContext)
             Result.success()
         } catch (error: Exception) {
-            val message = error.message.orEmpty()
-            if (message.contains("HTTP 401") || message.contains("HTTP 403")) {
-                // The bearer token was revoked; only re-enrollment can fix it.
+            if (error is GatewayException && (error.status == 401 || error.status == 403)) {
+                // The token or certificate was revoked; only re-enrollment fixes it.
                 Result.failure()
             } else {
-                // WorkManager retries with the configured backoff.
+                // WorkManager retries with the configured backoff. The gateway
+                // keeps the current certificate valid until a replacement is
+                // used, so a failed attempt never strands the device.
                 Result.retry()
             }
         }
