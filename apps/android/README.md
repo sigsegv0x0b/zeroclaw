@@ -319,6 +319,13 @@ pass through the agent's tool policy and the caller's allowlist, and tool
 approvals reach the paired client over the chat socket's `approval_request`
 frame.
 
+A registration is keyed by the paired-token hash that authenticated
+`/ws/nodes`, not by the self-declared node id alone. A second token cannot
+overwrite another phone's node id, a stale socket cannot unregister the
+connection that replaced it, and a chat turn only receives tools from the node
+registered under the same token it authenticated with. A chat that names no
+node gets no phone tools.
+
 ## Wire contract used
 
 | Purpose | Call |

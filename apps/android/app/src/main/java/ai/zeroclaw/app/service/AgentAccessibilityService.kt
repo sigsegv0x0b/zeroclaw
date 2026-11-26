@@ -45,6 +45,8 @@ class AgentAccessibilityService : AccessibilityService() {
 
     fun observe(): SnapshotResult? {
         val root = rootInActiveWindow ?: return null
+        val packageName = root.packageName?.toString() ?: "unknown"
+        if (isBlockedPackage(packageName)) return null
         val id = UUID.randomUUID().toString().take(8)
         val paths = LinkedHashMap<String, IntArray>()
         val lines = ArrayList<String>()
@@ -67,7 +69,7 @@ class AgentAccessibilityService : AccessibilityService() {
                 }
             }
         }
-        val result = Snapshot(id, root.packageName?.toString() ?: "unknown", paths, lines)
+        val result = Snapshot(id, packageName, paths, lines)
         snapshot = result
         return SnapshotResult(result.id, result.packageName, result.lines)
     }
@@ -80,7 +82,17 @@ class AgentAccessibilityService : AccessibilityService() {
         if (current.id != snapshotId) {
             return ActionResult(false, "Snapshot $snapshotId is stale; call mobile.ui.observe again.")
         }
+        if (isBlockedPackage(current.packageName)) {
+            return ActionResult(false, "Automation is not allowed on ${current.packageName}.")
+        }
         val root = rootInActiveWindow ?: return ActionResult(false, "No active window.")
+        val livePackage = root.packageName?.toString() ?: "unknown"
+        if (livePackage != current.packageName) {
+            return ActionResult(
+                false,
+                "The screen changed to $livePackage; take a new snapshot before acting.",
+            )
+        }
         return when (action) {
             is Action.Click -> {
                 val node = resolve(root, current, action.ref)
@@ -222,6 +234,26 @@ class AgentAccessibilityService : AccessibilityService() {
         ) : Action
         data class Global(val name: String) : Action
     }
+
+    /**
+     * Screens automation must never drive: system permission prompts, the
+     * package installer, system settings and ZeroClaw's own UI. Otherwise the
+     * agent could grant itself permissions, change its approval policy, or
+     * type into a dialog the operator believes only they can answer.
+     */
+    private fun isBlockedPackage(packageName: String): Boolean =
+        packageName == "ai.zeroclaw.app" ||
+            packageName.startsWith("ai.zeroclaw.app.") ||
+            packageName in BLOCKED_SYSTEM_PACKAGES
+
+    private val BLOCKED_SYSTEM_PACKAGES = setOf(
+        "com.android.settings",
+        "com.google.android.settings",
+        "com.android.permissioncontroller",
+        "com.google.android.permissioncontroller",
+        "com.android.packageinstaller",
+        "com.google.android.packageinstaller",
+    )
 
     companion object {
         private const val MAX_NODES = 800

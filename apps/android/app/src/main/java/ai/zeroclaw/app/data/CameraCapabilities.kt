@@ -96,6 +96,12 @@ object CameraCapabilities {
                 .coerceIn(500, MAX_CLIP_MS)
             val id = selectCamera(context, facing)
                 ?: return@withContext CapabilityOutcome(false, "", "No $facing camera was found.")
+            // Video clips are not attached to tool results and no phone file
+            // tool can read the app cache, so keep at most the clip this call
+            // produces rather than letting old recordings accumulate.
+            context.cacheDir.listFiles { file ->
+                file.name.startsWith("clip-") && file.name.endsWith(".mp4")
+            }?.forEach { old -> runCatching { old.delete() } }
             val output = File(context.cacheDir, "clip-${System.currentTimeMillis()}.mp4")
             recordClip(context, id, output, durationMs)
             if (!output.exists() || output.length() == 0L) {
