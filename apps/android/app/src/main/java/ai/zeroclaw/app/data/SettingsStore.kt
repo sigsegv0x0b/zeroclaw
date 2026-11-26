@@ -9,8 +9,12 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -41,17 +45,35 @@ data class StoredSettings(
     val mtlsGatewayId: String = "",
     val mtlsCaPem: String = "",
     val mtlsClientCertPem: String = "",
+    /** An imported PEM key. Enrollment never sets this; it uses [mtlsClientKeyAlias]. */
     val mtlsClientKeyPem: String = "",
+    /** Android Keystore alias of the enrolled, non-exportable client key. */
+    val mtlsClientKeyAlias: String = "",
+    /** Validity of [mtlsClientCertPem], epoch millis, read from the certificate itself. */
     val mtlsIssuedAt: Long = 0,
     val mtlsNotAfter: Long = 0,
     /** Cleartext origins the operator explicitly accepted after a warning. */
     val insecureHttpOrigins: Set<String> = emptySet(),
-)
+) {
+    val hasClientKey: Boolean
+        get() = mtlsClientKeyAlias.isNotBlank() || mtlsClientKeyPem.isNotBlank()
+}
+
+/** `notBefore` and `notAfter` of the first certificate in `pem`, epoch millis. */
+internal fun certificateValidity(pem: String): Pair<Long, Long>? {
+    if (pem.isBlank()) return null
+    return runCatching {
+        val certificate = CertificateFactory.getInstance("X.509")
+            .generateCertificate(pem.byteInputStream()) as X509Certificate
+        certificate.notBefore.time to certificate.notAfter.time
+    }.getOrNull()
+}
 
 /**
- * Connection state lives in app-private DataStore. The bearer token is the
- * same one the web dashboard keeps in localStorage; on Android that is
- * app-private storage, not world-readable.
+ * Connection state lives in app-private DataStore, which is excluded from
+ * backup and device transfer. The bearer token and any imported key are
+ * additionally sealed with a Keystore key ([SecretBox]); an enrolled client
+ * key lives only in the Keystore ([ClientKeys]).
  */
 class SettingsStore(private val context: Context) {
 
@@ -71,15 +93,20 @@ class SettingsStore(private val context: Context) {
         val mtlsCaPem = stringPreferencesKey("mtls_ca_pem")
         val mtlsClientCertPem = stringPreferencesKey("mtls_client_cert_pem")
         val mtlsClientKeyPem = stringPreferencesKey("mtls_client_key_pem")
-        val mtlsIssuedAt = longPreferencesKey("mtls_issued_at")
-        val mtlsNotAfter = longPreferencesKey("mtls_not_after")
+        val mtlsClientKeyAlias = stringPreferencesKey("mtls_client_key_alias")
         val insecureHttpOrigins = stringSetPreferencesKey("insecure_http_origins")
+
+        // Written by earlier builds; the certificate is now the only source.
+        val legacyIssuedAt = longPreferencesKey("mtls_issued_at")
+        val legacyNotAfter = longPreferencesKey("mtls_not_after")
     }
 
     val settings: Flow<StoredSettings> = context.settingsDataStore.data.map { prefs ->
+        val certPem = prefs[Keys.mtlsClientCertPem].orEmpty()
+        val validity = certificateValidity(certPem)
         StoredSettings(
             gatewayUrl = prefs[Keys.gatewayUrl].orEmpty(),
-            token = prefs[Keys.token].orEmpty(),
+            token = SecretBox.open(prefs[Keys.token].orEmpty()),
             agent = prefs[Keys.agent].orEmpty(),
             deviceName = prefs[Keys.deviceName] ?: "Android",
             lastSessionId = prefs[Keys.lastSession].orEmpty(),
@@ -91,20 +118,33 @@ class SettingsStore(private val context: Context) {
             mtlsEnabled = prefs[Keys.mtlsEnabled] ?: false,
             mtlsGatewayId = prefs[Keys.mtlsGatewayId].orEmpty(),
             mtlsCaPem = prefs[Keys.mtlsCaPem].orEmpty(),
-            mtlsClientCertPem = prefs[Keys.mtlsClientCertPem].orEmpty(),
-            mtlsClientKeyPem = prefs[Keys.mtlsClientKeyPem].orEmpty(),
-            mtlsIssuedAt = prefs[Keys.mtlsIssuedAt] ?: 0L,
-            // Early builds stored the server's epoch seconds here. Normalize
-            // on read so renewal deadlines and the expiry label use millis.
-            mtlsNotAfter = normalizeEpochMillis(prefs[Keys.mtlsNotAfter] ?: 0L),
+            mtlsClientCertPem = certPem,
+            mtlsClientKeyPem = SecretBox.open(prefs[Keys.mtlsClientKeyPem].orEmpty()),
+            mtlsClientKeyAlias = prefs[Keys.mtlsClientKeyAlias].orEmpty(),
+            mtlsIssuedAt = validity?.first ?: 0L,
+            mtlsNotAfter = validity?.second ?: 0L,
             insecureHttpOrigins = prefs[Keys.insecureHttpOrigins] ?: emptySet(),
         )
-    }
+    }.flowOn(Dispatchers.IO)
 
     suspend fun current(): StoredSettings = settings.first()
 
-    private fun normalizeEpochMillis(value: Long): Long =
-        if (value in 1 until 1_000_000_000_000L) value * 1000L else value
+    /**
+     * Seal secrets that earlier builds stored in plain text and drop the
+     * duplicated validity fields. Idempotent; run once per start.
+     */
+    suspend fun migrateSecrets() {
+        context.settingsDataStore.edit { prefs ->
+            for (key in listOf(Keys.token, Keys.mtlsClientKeyPem)) {
+                val stored = prefs[key].orEmpty()
+                if (stored.isNotEmpty() && !SecretBox.isSealed(stored)) {
+                    prefs[key] = SecretBox.seal(stored)
+                }
+            }
+            prefs.remove(Keys.legacyIssuedAt)
+            prefs.remove(Keys.legacyNotAfter)
+        }
+    }
 
     suspend fun isInsecureOriginAllowed(origin: String): Boolean =
         settings.first().insecureHttpOrigins.contains(origin.lowercase())
@@ -117,9 +157,10 @@ class SettingsStore(private val context: Context) {
     }
 
     suspend fun saveConnection(gatewayUrl: String, token: String) {
+        val sealed = SecretBox.seal(token)
         context.settingsDataStore.edit { prefs ->
             prefs[Keys.gatewayUrl] = gatewayUrl
-            prefs[Keys.token] = token
+            prefs[Keys.token] = sealed
         }
     }
 
@@ -151,13 +192,6 @@ class SettingsStore(private val context: Context) {
         }
     }
 
-    suspend fun saveMtlsValidity(issuedAt: Long, notAfter: Long) {
-        context.settingsDataStore.edit { prefs ->
-            prefs[Keys.mtlsIssuedAt] = issuedAt
-            prefs[Keys.mtlsNotAfter] = notAfter
-        }
-    }
-
     suspend fun saveMtlsEnabled(enabled: Boolean) {
         context.settingsDataStore.edit { prefs -> prefs[Keys.mtlsEnabled] = enabled }
     }
@@ -166,12 +200,91 @@ class SettingsStore(private val context: Context) {
         context.settingsDataStore.edit { prefs -> prefs[Keys.mtlsGatewayId] = id.trim() }
     }
 
+    /**
+     * Manually imported material. A provided key replaces an enrolled one, and
+     * once both the certificate and its key are present they are imported into
+     * the Keystore so the app no longer keeps an extractable PEM. If the
+     * platform refuses the import, the sealed PEM remains the fallback.
+     */
     suspend fun saveMtlsMaterial(ca: String?, cert: String?, key: String?) {
+        if (ca == null && cert == null && key == null) return
+        val before = settings.first()
+        val sealedKey = key?.let(SecretBox::seal)
         context.settingsDataStore.edit { prefs ->
             ca?.let { prefs[Keys.mtlsCaPem] = it }
             cert?.let { prefs[Keys.mtlsClientCertPem] = it }
-            key?.let { prefs[Keys.mtlsClientKeyPem] = it }
+            if (sealedKey != null) {
+                prefs[Keys.mtlsClientKeyPem] = sealedKey
+                prefs.remove(Keys.mtlsClientKeyAlias)
+            } else if (cert != null) {
+                // A new certificate cannot use the old alias's key.
+                prefs.remove(Keys.mtlsClientKeyAlias)
+            }
         }
+
+        // Import in either order: a key imported before its certificate waits
+        // here until the certificate arrives.
+        val current = settings.first()
+        val imported = if (current.mtlsClientKeyAlias.isBlank() &&
+            current.mtlsClientCertPem.isNotBlank() &&
+            current.mtlsClientKeyPem.isNotBlank()
+        ) {
+            ClientKeys.importPem(current.mtlsClientCertPem, current.mtlsClientKeyPem)
+        } else {
+            null
+        }
+        if (imported != null) {
+            context.settingsDataStore.edit { prefs ->
+                prefs[Keys.mtlsClientKeyAlias] = imported
+                prefs.remove(Keys.mtlsClientKeyPem)
+            }
+        }
+        val keep = imported ?: settings.first().mtlsClientKeyAlias
+        if (imported != null || cert != null || key != null) {
+            ClientKeys.delete(before.mtlsClientKeyAlias.takeIf { it != keep }.orEmpty())
+            ClientKeys.deleteAllExcept(keep)
+        }
+    }
+
+    /**
+     * Everything a successful enrollment produced, in one write, so a crash
+     * can never leave a certificate stored without its key or its token.
+     */
+    suspend fun saveEnrolledIdentity(
+        identity: MtlsEnrollment.Identity,
+        gatewayUrl: String,
+        token: String,
+    ) {
+        val sealedToken = SecretBox.seal(token)
+        var previous = ""
+        context.settingsDataStore.edit { prefs ->
+            previous = writeIdentity(prefs, identity)
+            prefs[Keys.mtlsEnabled] = true
+            prefs[Keys.gatewayUrl] = gatewayUrl
+            prefs[Keys.token] = sealedToken
+        }
+        ClientKeys.delete(previous.takeIf { it != identity.keyAlias }.orEmpty())
+    }
+
+    /** A renewed certificate and its new key alias, in one write. */
+    suspend fun saveRenewedIdentity(identity: MtlsEnrollment.Identity) {
+        var previous = ""
+        context.settingsDataStore.edit { prefs -> previous = writeIdentity(prefs, identity) }
+        ClientKeys.delete(previous.takeIf { it != identity.keyAlias }.orEmpty())
+    }
+
+    /** Returns the alias this replaces, so the caller can prune it after the write. */
+    private fun writeIdentity(
+        prefs: androidx.datastore.preferences.core.MutablePreferences,
+        identity: MtlsEnrollment.Identity,
+    ): String {
+        val previous = prefs[Keys.mtlsClientKeyAlias].orEmpty()
+        prefs[Keys.mtlsCaPem] = identity.caPem
+        prefs[Keys.mtlsClientCertPem] = identity.certPem
+        prefs[Keys.mtlsClientKeyAlias] = identity.keyAlias
+        prefs.remove(Keys.mtlsClientKeyPem)
+        prefs[Keys.mtlsGatewayId] = identity.gatewayId.trim()
+        return previous
     }
 
     suspend fun saveVoiceBackend(backend: String) {

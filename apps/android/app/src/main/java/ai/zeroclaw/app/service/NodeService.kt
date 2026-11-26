@@ -83,10 +83,7 @@ class NodeService : Service() {
                 stopSelf()
                 return@launch
             }
-            val transport = when (val result = MtlsTransport.build(settings)) {
-                is MtlsTransport.Result.Ready -> result.built.client
-                is MtlsTransport.Result.Unavailable -> MtlsTransport.plainClient()
-            }
+            val transport = MtlsTransport.clientFor(settings)
             val nodeClient = NodeClient(
                 scope = scope,
                 http = transport,

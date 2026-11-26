@@ -28,7 +28,8 @@ on-phone voice transcription.
 | QR pairing, push notifications, offline outbox | Not yet |
 | Inbound attachments, model picker | Not yet |
 | Camera, SMS, notification forwarding, contacts | Not yet |
-| OIDC / mTLS login | Not yet |
+| mTLS transport (QR pairing, client certificates, renewal) | Done |
+| OIDC login | Not yet |
 
 ## Build
 
@@ -118,10 +119,12 @@ certificate, key, gateway id and token in app-private storage. The client
 certificate is valid for 30 days and is renewed at half its lifetime: a single
 deferred WorkManager job (not an hourly poll) is armed for the midpoint, and the
 foreground app also renews before connecting when the midpoint has passed. The
-gateway revokes the old leaf and rotates both keys on success. Use **Settings →
-Transport → Renew certificate** to renew immediately, or `zeroclaw mtls list`
-and `zeroclaw mtls delete` to inspect or revoke a device; revocation drops its
-live connections.
+gateway keeps the old leaf valid until the new one completes a handshake, then
+revokes it; the gateway's own identity and server leaf do not change. Use
+**Settings → Transport → Renew certificate** to renew immediately, or
+`zeroclaw mtls list` and `zeroclaw mtls delete` to inspect or revoke a device;
+revocation drops its live connections and, once a device has no live
+certificate left, revokes its bearer token too.
 
 For a manual fallback, issue a certificate with
 `zeroclaw security issue-client-cert --ca-dir <data_dir>/gateway-mtls` and

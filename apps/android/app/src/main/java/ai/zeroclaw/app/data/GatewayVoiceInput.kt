@@ -24,9 +24,13 @@ import kotlin.math.sqrt
  * Push-to-talk for the `zeroclaw` voice backend: record 16 kHz mono PCM on the
  * phone, stop on release or silence, and POST the WAV to the gateway's
  * `/api/transcribe`, which uses its configured STT provider. Audio leaves the
- * phone only when this backend is selected.
+ * phone only when this backend is selected. The upload goes over the same
+ * transport as the chat, so an mTLS gateway gets the client certificate.
  */
-class GatewayVoiceInput(private val context: Context) {
+class GatewayVoiceInput(
+    private val context: Context,
+    private val transport: () -> OkHttpClient,
+) {
 
     interface Listener {
         fun onStarted()
@@ -193,6 +197,11 @@ class GatewayVoiceInput(private val context: Context) {
             .header("Authorization", "Bearer $token")
             .post(wav.toRequestBody(media))
             .build()
+        val http = transport().newBuilder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(120, TimeUnit.SECONDS)
+            .build()
         http.newCall(request).execute().use { response ->
             val body = response.body?.string().orEmpty()
             val json = runCatching {
@@ -209,12 +218,6 @@ class GatewayVoiceInput(private val context: Context) {
             return text
         }
     }
-
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .writeTimeout(60, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS)
-        .build()
 
     companion object {
         private const val SAMPLE_RATE = 16_000

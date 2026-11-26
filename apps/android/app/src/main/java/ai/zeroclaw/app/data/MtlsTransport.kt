@@ -1,20 +1,14 @@
 package ai.zeroclaw.app.data
 
-import java.security.KeyFactory
+import java.io.IOException
 import java.security.KeyStore
-import java.security.PrivateKey
 import java.security.cert.CertificateException
-import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
-import java.security.spec.PKCS8EncodedKeySpec
-import java.util.Base64
-import javax.net.ssl.KeyManagerFactory
+import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import java.util.concurrent.TimeUnit
 
 /**
  * Identity-based mTLS for the gateway transport.
@@ -27,13 +21,6 @@ import java.util.concurrent.TimeUnit
  * chain and the identity. The client certificate proves this device.
  */
 object MtlsTransport {
-
-    data class Material(
-        val caPem: String,
-        val clientCertPem: String,
-        val clientKeyPem: String,
-        val gatewayId: String,
-    )
 
     data class Built(
         val client: OkHttpClient,
@@ -55,23 +42,22 @@ object MtlsTransport {
         }
         if (settings.mtlsCaPem.isBlank() ||
             settings.mtlsClientCertPem.isBlank() ||
-            settings.mtlsClientKeyPem.isBlank()
+            !settings.hasClientKey
         ) {
             return Result.Unavailable("import the CA, client certificate and client key")
         }
         return runCatching {
-            val ca = certificates(settings.mtlsCaPem).firstOrNull()
+            val ca = Pem.certificates(settings.mtlsCaPem).firstOrNull()
                 ?: error("CA PEM contains no certificate")
-            val chain = certificates(settings.mtlsClientCertPem)
+            val chain = Pem.certificates(settings.mtlsClientCertPem)
             if (chain.isEmpty()) error("client certificate PEM contains no certificate")
-            val key = privateKey(settings.mtlsClientKeyPem)
+            val key = if (settings.mtlsClientKeyAlias.isNotBlank()) {
+                ClientKeys.privateKey(settings.mtlsClientKeyAlias)
+                    ?: error("the client key is missing from the Android Keystore; pair again")
+            } else {
+                Pem.privateKey(settings.mtlsClientKeyPem)
+            }
             val identity = "spiffe://zeroclaw/gateway/${settings.mtlsGatewayId}"
-
-            val keyStore = KeyStore.getInstance("PKCS12").apply { load(null, null) }
-            keyStore.setKeyEntry("client", key, charArrayOf(), chain.toTypedArray())
-            val keyManagers = KeyManagerFactory.getInstance(
-                KeyManagerFactory.getDefaultAlgorithm(),
-            ).apply { init(keyStore, charArrayOf()) }.keyManagers
 
             val trustStore = KeyStore.getInstance("PKCS12").apply {
                 load(null, null)
@@ -87,7 +73,7 @@ object MtlsTransport {
             val trust = IdentityTrustManager(base, identity)
 
             val context = SSLContext.getInstance("TLS").apply {
-                init(keyManagers, arrayOf(trust), null)
+                init(arrayOf(SingleIdentityKeyManager(key, chain.toTypedArray())), arrayOf(trust), null)
             }
             val client = OkHttpClient.Builder()
                 .sslSocketFactory(context.socketFactory, trust)
@@ -106,11 +92,27 @@ object MtlsTransport {
         }
     }
 
-    /** The plain transport, used when mTLS is off or its material is incomplete. */
+    /**
+     * The client every gateway connection should use. With mTLS turned on
+     * this never falls back to a plain client: broken material yields a
+     * client that refuses every request, so the bearer token is not sent
+     * anywhere the mTLS checks did not approve.
+     */
+    fun clientFor(settings: StoredSettings): OkHttpClient = when (val result = build(settings)) {
+        is Result.Ready -> result.built.client
+        is Result.Unavailable ->
+            if (settings.mtlsEnabled) refusingClient(result.reason) else plainClient()
+    }
+
+    /** The plain transport, used only when mTLS is off. */
     fun plainClient(): OkHttpClient = OkHttpClient.Builder()
         .pingInterval(20, TimeUnit.SECONDS)
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS)
+        .build()
+
+    private fun refusingClient(reason: String): OkHttpClient = OkHttpClient.Builder()
+        .addInterceptor { throw IOException("mTLS transport unavailable: $reason") }
         .build()
 
     /** Human-readable status for Settings. */
@@ -119,45 +121,34 @@ object MtlsTransport {
         is Result.Unavailable -> result.reason
     }
 
-    private fun certificates(pem: String): List<X509Certificate> {
-        val factory = CertificateFactory.getInstance("X.509")
-        return pem.byteInputStream().use { stream ->
-            factory.generateCertificates(stream).map { it as X509Certificate }
+}
+
+/**
+ * Chain validation against the pinned CA plus an exact match on the gateway's
+ * URI identity. Shared by enrollment and the mTLS transport.
+ */
+internal class IdentityTrustManager(
+    private val delegate: X509TrustManager,
+    private val expectedIdentity: String,
+) : X509TrustManager {
+    override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) =
+        delegate.checkClientTrusted(chain, authType)
+
+    override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
+        delegate.checkServerTrusted(chain, authType)
+        val leaf = chain?.firstOrNull()
+            ?: throw CertificateException("gateway presented no certificate")
+        val uris = leaf.subjectAlternativeNames
+            ?.filter { it.size >= 2 && it[0] == 6 }
+            ?.map { it[1]?.toString().orEmpty() }
+            .orEmpty()
+        if (uris.none { it == expectedIdentity }) {
+            throw CertificateException(
+                "gateway identity mismatch: expected $expectedIdentity, certificate URIs are " +
+                    uris.joinToString(","),
+            )
         }
     }
 
-    private fun privateKey(pem: String): PrivateKey {
-        val body = pem
-            .replace(Regex("-----BEGIN [^-]+-----"), "")
-            .replace(Regex("-----END [^-]+-----"), "")
-            .replace(Regex("\\s"), "")
-        val der = Base64.getDecoder().decode(body)
-        return KeyFactory.getInstance("EC").generatePrivate(PKCS8EncodedKeySpec(der))
-    }
-
-    private class IdentityTrustManager(
-        private val delegate: X509TrustManager,
-        private val expectedIdentity: String,
-    ) : X509TrustManager {
-        override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) =
-            delegate.checkClientTrusted(chain, authType)
-
-        override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
-            delegate.checkServerTrusted(chain, authType)
-            val leaf = chain?.firstOrNull()
-                ?: throw CertificateException("gateway presented no certificate")
-            val uris = leaf.subjectAlternativeNames
-                ?.filter { it.size >= 2 && it[0] == 6 }
-                ?.map { it[1]?.toString().orEmpty() }
-                .orEmpty()
-            if (uris.none { it == expectedIdentity }) {
-                throw CertificateException(
-                    "gateway identity mismatch: expected $expectedIdentity, certificate URIs are " +
-                        uris.joinToString(","),
-                )
-            }
-        }
-
-        override fun getAcceptedIssuers(): Array<X509Certificate> = delegate.acceptedIssuers
-    }
+    override fun getAcceptedIssuers(): Array<X509Certificate> = delegate.acceptedIssuers
 }

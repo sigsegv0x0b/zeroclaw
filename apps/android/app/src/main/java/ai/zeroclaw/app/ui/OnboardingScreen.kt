@@ -42,6 +42,8 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.text.KeyboardOptions
+import ai.zeroclaw.app.data.MtlsEnrollment
+import ai.zeroclaw.app.data.SecureEnrollConfirm
 import ai.zeroclaw.app.ui.theme.Zc
 
 @Composable
@@ -50,10 +52,16 @@ fun OnboardingScreen(
     error: String?,
     deviceName: String,
     secureEnrolling: Boolean,
-    secureSas: String?,
+    secureConfirm: SecureEnrollConfirm?,
     onPair: (url: String, code: String, deviceName: String) -> Unit,
     onTokenConnect: (url: String, token: String) -> Unit,
-    onSecureEnroll: (host: String, mtlsPort: Int, enrollPort: Int, code: String, sas: String?) -> Unit,
+    onSecureEnroll: (
+        host: String,
+        mtlsPort: Int,
+        enrollPort: Int,
+        code: String,
+        expected: MtlsEnrollment.Expected,
+    ) -> Unit,
     onConfirmSas: () -> Unit,
     onCancelSas: () -> Unit,
     onDismissError: () -> Unit,
@@ -74,13 +82,18 @@ fun OnboardingScreen(
             val mtls = json.optInt("mtls", 42618)
             val enroll = json.optInt("enroll", 42619)
             val code = json.optString("code")
-            val sas = json.optString("sas").ifBlank { null }
+            // `ca` pins the gateway CA outright; `gw` and `sas` are checked too.
+            val expected = MtlsEnrollment.Expected(
+                caFingerprint = json.optString("ca").ifBlank { null },
+                gatewayId = json.optString("gw").ifBlank { null },
+                sas = json.optString("sas").ifBlank { null },
+            )
             if (host.isNotBlank() && code.isNotBlank()) {
                 secureHost = host
                 mtlsPort = mtls.toString()
                 enrollPort = enroll.toString()
                 secureCode = code
-                onSecureEnroll(host, mtls, enroll, code, sas)
+                onSecureEnroll(host, mtls, enroll, code, expected)
             }
         }
     }
@@ -285,7 +298,13 @@ fun OnboardingScreen(
                 onClick = {
                     val mtls = mtlsPort.toIntOrNull() ?: 42618
                     val enroll = enrollPort.toIntOrNull() ?: 42619
-                    onSecureEnroll(secureHost.trim(), mtls, enroll, secureCode.trim(), null)
+                    onSecureEnroll(
+                        secureHost.trim(),
+                        mtls,
+                        enroll,
+                        secureCode.trim(),
+                        MtlsEnrollment.Expected(),
+                    )
                 },
                 enabled = !secureEnrolling && secureHost.isNotBlank() && secureCode.isNotBlank(),
                 shape = RoundedCornerShape(12.dp),
@@ -322,30 +341,55 @@ fun OnboardingScreen(
         }
     }
 
-    if (secureSas != null) {
+    if (secureConfirm != null) {
         AlertDialog(
             onDismissRequest = onCancelSas,
-            title = { Text("Confirm the gateway SAS") },
+            title = {
+                Text(if (secureConfirm.verified) "Pair with this gateway?" else "Confirm the gateway SAS")
+            },
             text = {
                 Column {
-                    Text("The gateway shows this value; it must match exactly.")
+                    Text(
+                        text = secureConfirm.host,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = Zc.Text,
+                    )
+                    Text(
+                        text = secureConfirm.gatewayId,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Zc.TextSubtle,
+                    )
                     Spacer(Modifier.height(10.dp))
                     Text(
-                        text = secureSas,
+                        text = secureConfirm.sas,
                         style = MaterialTheme.typography.headlineSmall,
                         color = Zc.Accent,
                     )
                     Spacer(Modifier.height(10.dp))
                     Text(
-                        text = "If it does not match, cancel: a mismatched SAS means the CA " +
-                            "is not the one the gateway printed.",
+                        text = if (secureConfirm.verified) {
+                            "The gateway matches the QR code you scanned."
+                        } else {
+                            "The gateway console shows a SAS. Continue only if it matches " +
+                                "this value exactly; a different value means someone else's " +
+                                "certificate is in the way."
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        text = "Once paired, this gateway's agents can use the phone " +
+                            "capabilities you allow in Settings, such as location, files, " +
+                            "contacts, SMS and the camera. Pair only with a gateway you run.",
                         style = MaterialTheme.typography.bodySmall,
                         color = Zc.TextSubtle,
                     )
                 }
             },
             confirmButton = {
-                TextButton(onClick = onConfirmSas) { Text("Matches", color = Zc.Accent) }
+                TextButton(onClick = onConfirmSas) {
+                    Text(if (secureConfirm.verified) "Pair" else "Matches", color = Zc.Accent)
+                }
             },
             dismissButton = {
                 TextButton(onClick = onCancelSas) { Text("Cancel", color = Zc.Danger) }
