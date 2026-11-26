@@ -537,7 +537,8 @@ fun SettingsScreen(
             PermissionRow(
                 title = "Accessibility",
                 detail = if (accessibilityGranted) {
-                    "Granted. mobile.ui.observe / mobile.ui.act."
+                    "Granted. mobile.ui.observe / mobile.ui.act. System settings, permission " +
+                        "prompts and ZeroClaw's own screens are excluded."
                 } else {
                     "Special access. Enable the ZeroClaw service in system accessibility settings."
                 },
