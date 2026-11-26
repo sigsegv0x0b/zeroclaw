@@ -20,7 +20,7 @@ pub mod certgen;
 pub use certgen::{
     CaKeyProtection, GatewayMaterials, IssuedLeaf, Pem, ServerMaterials, ensure_gateway_materials,
     ensure_server_materials, ensure_server_materials_protected, generate_client_csr,
-    issue_client_cert, load_ca_key_pem, rotate_gateway_server_leaf, server_leaf_sans, sign_csr,
+    issue_client_cert, load_ca_key_pem, server_leaf_sans, sign_csr,
 };
 
 pub mod csr;
@@ -845,6 +845,9 @@ mod tests {
     #[test]
     fn enrollment_sas_is_deterministic_and_ca_sensitive() {
         let a = enrollment_sas("270391", "aa11bb22");
+        // Fixed vector shared with the Android client's SAS test
+        // (`MtlsEnrollmentTest.sasMatchesTheGatewayVector`).
+        assert_eq!(a, "6791-21FA");
         // Same inputs -> same SAS (daemon and client must agree).
         assert_eq!(a, enrollment_sas("270391", "AA11BB22"));
         // A different CA fingerprint (a MITM CA) -> a different SAS.

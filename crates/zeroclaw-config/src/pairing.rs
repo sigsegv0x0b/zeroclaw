@@ -474,6 +474,13 @@ pub struct PairingGuard {
     /// that must not pair (the relay-terminated frontdoor, a shared link).
     /// It shares this guard's policy, lifetime and lockout accounting.
     enrollment_code: Arc<Mutex<Option<PendingCode>>>,
+    /// The instant a timed window cancelled every gateway pairing code minted
+    /// at or after, set by
+    /// [`PairingGuard::expire_pairing_code_minted_since`]. A reservation for
+    /// such a code may be in flight while it is out of its slot; its `Drop`
+    /// must not put it back, or the cancelled code comes back until its TTL.
+    /// Minting a new code clears the floor: that code is outside the window.
+    expired_pairing_code_floor: Arc<Mutex<Option<Instant>>>,
     /// Set of SHA-256 hashed bearer tokens (persisted across restarts).
     /// A reader-writer lock so that a caller holding it across an effect
     /// (see [`PairingGuard::hold_paired_tokens`]) delays only pairing and
@@ -531,6 +538,18 @@ impl Drop for PairingReservation {
         }
         let ttl = self.guard.code_ttl();
         let restored = PendingCode::restored(self.code.clone(), self.minted_at);
+        // A timed window may have closed while this reservation was in flight.
+        // Its code was cancelled there, not merely taken out of the slot, so
+        // restoring it would resurrect a code the operator was told expired.
+        if self.slot == CodeSlot::Pairing
+            && self
+                .guard
+                .expired_pairing_code_floor
+                .lock()
+                .is_some_and(|floor| self.minted_at >= floor)
+        {
+            return;
+        }
         // A code whose lifetime ran out while it was reserved is cleared here,
         // as on every other path, rather than put back for a later read to
         // clear.
@@ -629,6 +648,7 @@ impl PairingGuard {
             require_pairing,
             pairing_code: Arc::new(Mutex::new(code)),
             enrollment_code: Arc::new(Mutex::new(None)),
+            expired_pairing_code_floor: Arc::new(Mutex::new(None)),
             paired_tokens: Arc::new(RwLock::new(tokens)),
             failed_attempts: Arc::new(Mutex::new((HashMap::new(), Instant::now()))),
             admin_token: Arc::new(Mutex::new(None)),
@@ -694,6 +714,23 @@ impl PairingGuard {
     pub fn pairing_code(&self) -> Option<String> {
         let ttl = self.code_ttl();
         take_live(&mut self.pairing_code.lock(), ttl).map(|p| p.code)
+    }
+
+    /// Clear the pending gateway pairing code if it was minted at or after
+    /// `since`. A time-boxed pairing window uses this when it closes, so the
+    /// code it advertised stops working on every surface, not only on the
+    /// listener that closed. A code minted before the window is left alone.
+    pub fn expire_pairing_code_minted_since(&self, since: Instant) -> bool {
+        *self.expired_pairing_code_floor.lock() = Some(since);
+        let mut slot = self.pairing_code.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|pending| pending.minted_at >= since)
+        {
+            *slot = None;
+            return true;
+        }
+        false
     }
 
     /// Test-only: rewind the active code's mint time so expiry is exercisable
@@ -1090,6 +1127,7 @@ impl PairingGuard {
             return None;
         }
         let new_code = code_policy.generate();
+        *self.expired_pairing_code_floor.lock() = None;
         *self.pairing_code.lock() = Some(PendingCode::new(new_code.clone()));
         Some(new_code)
     }
@@ -1106,6 +1144,9 @@ impl PairingGuard {
             return Err(GeneratePairingCodeError::PairingDisabled);
         }
         let ttl = self.code_ttl();
+        // Same lock order as `expire_pairing_code_minted_since` and
+        // `PairingReservation::drop`: floor first, then the code slot.
+        let mut floor = self.expired_pairing_code_floor.lock();
         let mut slot = self.pairing_code.lock();
         // An expired code leaves the slot vacant: otherwise a lapsed code would
         // block minting a replacement until the process restarted.
@@ -1113,6 +1154,7 @@ impl PairingGuard {
             return Err(GeneratePairingCodeError::Pending);
         }
         let new_code = code_policy.generate();
+        *floor = None;
         *slot = Some(PendingCode::new(new_code.clone()));
         Ok(new_code)
     }
@@ -1376,6 +1418,49 @@ mod tests {
             "dropping an uncommitted reservation restores the one-time code"
         );
         assert!(!guard.is_paired());
+    }
+
+    #[test]
+    async fn expiring_a_window_clears_only_codes_minted_inside_it() {
+        let guard = new_guard(true, &[]);
+        let before = guard.pairing_code().expect("startup code");
+        let window_opened = Instant::now();
+        assert!(
+            !guard.expire_pairing_code_minted_since(window_opened),
+            "a code minted before the window survives its close"
+        );
+        assert_eq!(guard.pairing_code().as_deref(), Some(before.as_str()));
+
+        let inside = guard
+            .generate_new_pairing_code(PairingCodePolicy::default())
+            .expect("pairing enabled");
+        assert!(guard.expire_pairing_code_minted_since(window_opened));
+        assert!(guard.pairing_code().is_none());
+        assert_eq!(guard.try_pair(&inside, "client").await.unwrap(), None);
+    }
+
+    #[test]
+    async fn a_cancelled_code_does_not_come_back_when_its_reservation_drops() {
+        let guard = new_guard(true, &[]);
+        let window_opened = Instant::now();
+        let code = guard
+            .generate_new_pairing_code(PairingCodePolicy::default())
+            .expect("pairing enabled");
+        let reservation = guard
+            .reserve_pair(&code, "test_client")
+            .await
+            .unwrap()
+            .expect("code should reserve");
+
+        // The timed window closes while issuance is still in flight. Its
+        // reservation is the only holder of the code, and must not restore it.
+        guard.expire_pairing_code_minted_since(window_opened);
+        drop(reservation);
+        assert!(
+            guard.pairing_code().is_none(),
+            "a code the window cancelled must not be restored by a late drop"
+        );
+        assert_eq!(guard.try_pair(&code, "client").await.unwrap(), None);
     }
 
     #[test]

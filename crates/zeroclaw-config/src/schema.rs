@@ -8305,9 +8305,11 @@ pub struct GatewayMtlsConfig {
     pub dir: String,
     /// Extra client-certificate SHA-256 pins (hex). The generated CA remains
     /// the chain root; a non-empty list additionally restricts which leaves
-    /// are accepted.
+    /// are accepted, and disables in-band enrollment.
     pub pinned_client_certs: Vec<String>,
-    /// Optional CRL file (one revoked SHA-256 fingerprint per line).
+    /// Optional CRL file (one revoked SHA-256 fingerprint per line). Empty
+    /// means `revoked` in the material directory. `zeroclaw mtls delete`
+    /// appends to it, and the listener refuses every fingerprint it lists.
     pub crl_path: String,
     /// Serve the pairing-code-gated certificate enrollment endpoint for this
     /// listener (default: false). The endpoint runs on its own TLS port so a
@@ -8331,6 +8333,27 @@ impl Default for GatewayMtlsConfig {
             enroll: false,
             enroll_bind: "127.0.0.1".to_string(),
             enroll_port: 42_619,
+        }
+    }
+}
+
+impl GatewayMtlsConfig {
+    /// The material directory: `dir`, or `<data_dir>/gateway-mtls` when empty.
+    pub fn material_dir(&self, data_dir: &std::path::Path) -> std::path::PathBuf {
+        if self.dir.trim().is_empty() {
+            data_dir.join("gateway-mtls")
+        } else {
+            std::path::PathBuf::from(self.dir.trim())
+        }
+    }
+
+    /// The revocation list: `crl_path`, or `revoked` in the material
+    /// directory when empty.
+    pub fn crl_file(&self, data_dir: &std::path::Path) -> std::path::PathBuf {
+        if self.crl_path.trim().is_empty() {
+            self.material_dir(data_dir).join("revoked")
+        } else {
+            std::path::PathBuf::from(self.crl_path.trim())
         }
     }
 }

@@ -11433,6 +11433,10 @@ mod tests {
             (r"\\.\NUL", &outside),
         ] {
             let alias = workspace.join(name);
+            // macOS's default filesystem is case-insensitive, so `nul` and
+            // `NUL` name the same path here. Each spelling still exercises the
+            // Unix resolver; only the fixture entry has to be replaced.
+            let _ = std::fs::remove_file(&alias);
             symlink(target, &alias).unwrap();
             assert_eq!(
                 policy.resolve_policy_target(&alias),

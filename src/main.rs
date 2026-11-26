@@ -8285,10 +8285,16 @@ async fn run_pair_command(
     enroll_port: Option<u16>,
 ) -> Result<()> {
     if enroll_port.is_some() && pair_timeout.is_none() {
-        anyhow::bail!("--enroll-port requires --pair-timeout");
+        anyhow::bail!(t(
+            "cli-pair-enroll-port-requires-timeout",
+            "--enroll-port requires --pair-timeout"
+        ));
     }
     if enroll_port == Some(0) {
-        anyhow::bail!("--enroll-port must be between 1 and 65535");
+        anyhow::bail!(t(
+            "cli-pair-enroll-port-range",
+            "--enroll-port must be between 1 and 65535"
+        ));
     }
     if let Some(seconds) = pair_timeout {
         if !config
@@ -8297,18 +8303,33 @@ async fn run_pair_command(
             .as_ref()
             .is_some_and(|mtls| mtls.enabled)
         {
-            anyhow::bail!("--pair-timeout needs [gateway.mtls] enabled");
+            anyhow::bail!(t(
+                "cli-pair-timeout-needs-mtls",
+                "--pair-timeout needs [gateway.mtls] enabled"
+            ));
         }
         let max = zeroclaw_config::pairing::PAIRING_CODE_TTL_MAX_SECS;
         if !(1..=max).contains(&seconds) {
-            anyhow::bail!("--pair-timeout must be between 1 and {max} seconds");
+            anyhow::bail!(ta(
+                "cli-pair-timeout-range",
+                &[("max", &max.to_string())],
+                "--pair-timeout must be between 1 and {$max} seconds"
+            ));
         }
         open_enrollment_window(config, seconds, enroll_port).await?;
         let port = enroll_port
             .or_else(|| config.gateway.mtls.as_ref().map(|mtls| mtls.enroll_port))
             .unwrap_or(42619);
         println!(
-            "Enrollment:   open for {seconds}s on port {port}; closes after pairing or timeout"
+            "{}",
+            ta(
+                "cli-pair-enrollment-open",
+                &[
+                    ("seconds", &seconds.to_string()),
+                    ("port", &port.to_string())
+                ],
+                "Enrollment:   open for {$seconds}s on port {$port}; closes after pairing or timeout"
+            )
         );
     }
     let public_host = host.unwrap_or_else(|| config.gateway.host.clone());
@@ -8325,53 +8346,91 @@ async fn run_pair_command(
         PaircodeResult::NoCode { message } => {
             anyhow::bail!(
                 "{}",
-                message.unwrap_or_else(|| "the gateway did not issue a pairing code".to_string())
+                message.unwrap_or_else(|| {
+                    t(
+                        "cli-pair-no-code",
+                        "the gateway did not issue a pairing code",
+                    )
+                })
             )
         }
     };
 
     let mtls = config.gateway.mtls.as_ref().filter(|mtls| mtls.enabled);
-    let dir = if let Some(mtls) = mtls {
-        if mtls.dir.trim().is_empty() {
-            config.data_dir.join("gateway-mtls")
-        } else {
-            PathBuf::from(mtls.dir.trim())
-        }
-    } else {
-        config.data_dir.join("gateway-mtls")
-    };
+    let dir = mtls.map_or_else(
+        || config.data_dir.join("gateway-mtls"),
+        |mtls| mtls.material_dir(&config.data_dir),
+    );
     let gateway_id = std::fs::read_to_string(dir.join("gateway_id"))
         .unwrap_or_default()
         .trim()
         .to_string();
-    let sas = std::fs::read_to_string(dir.join("ca.crt"))
+    let ca_fingerprint = std::fs::read_to_string(dir.join("ca.crt"))
         .ok()
-        .and_then(|ca| zeroclaw_tls::single_cert_pem_sha256_fingerprint(&ca).ok())
-        .map(|fingerprint| zeroclaw_tls::enrollment_sas(&code, &fingerprint));
+        .and_then(|ca| zeroclaw_tls::single_cert_pem_sha256_fingerprint(&ca).ok());
+    let sas = ca_fingerprint
+        .as_deref()
+        .map(|fingerprint| zeroclaw_tls::enrollment_sas(&code, fingerprint));
 
-    println!("Pairing code: {code}");
+    println!(
+        "{}",
+        ta("cli-pair-code", &[("code", &code)], "Pairing code: {$code}")
+    );
     if let Some(sas) = &sas {
-        println!("SAS:          {sas}   (the app must show the same value)");
+        println!(
+            "{}",
+            ta(
+                "cli-pair-sas",
+                &[("sas", sas)],
+                "SAS:          {$sas}   (the app must show the same value)"
+            )
+        );
     }
     if !gateway_id.is_empty() {
-        println!("Gateway ID:   {gateway_id}");
+        println!(
+            "{}",
+            ta(
+                "cli-pair-gateway-id",
+                &[("gateway_id", &gateway_id)],
+                "Gateway ID:   {$gateway_id}"
+            )
+        );
     }
     let effective_enroll_port = enroll_port
         .or_else(|| mtls.map(|value| value.enroll_port))
         .unwrap_or(42619);
     if let Some(mtls) = mtls {
         println!(
-            "mTLS:         https://{public_host}:{}   enrollment: https://{public_host}:{}",
-            mtls.port, effective_enroll_port
+            "{}",
+            ta(
+                "cli-pair-mtls-url",
+                &[
+                    ("host", &public_host),
+                    ("port", &mtls.port.to_string()),
+                    ("enroll_port", &effective_enroll_port.to_string()),
+                ],
+                "mTLS:         https://{$host}:{$port}   enrollment: https://{$host}:{$enroll_port}"
+            )
         );
     } else {
-        println!("mTLS:         [gateway.mtls] is not enabled");
+        println!(
+            "{}",
+            t(
+                "cli-pair-mtls-disabled",
+                "mTLS:         [gateway.mtls] is not enabled"
+            )
+        );
     }
 
     if qr {
         let Some(mtls) = mtls else {
-            anyhow::bail!("QR pairing needs [gateway.mtls] enabled");
+            anyhow::bail!(t(
+                "cli-pair-qr-needs-mtls",
+                "QR pairing needs [gateway.mtls] enabled"
+            ));
         };
+        // `ca` is the full CA fingerprint: a scanning client pins it before it
+        // sends the code anywhere, so the QR alone authenticates the gateway.
         let payload = serde_json::json!({
             "v": 1,
             "host": public_host,
@@ -8380,6 +8439,7 @@ async fn run_pair_command(
             "gw": gateway_id,
             "code": code,
             "sas": sas,
+            "ca": ca_fingerprint,
         });
         let qr_code = qrcode::QrCode::new(serde_json::to_string(&payload)?)?;
         let image = qr_code
@@ -8401,9 +8461,12 @@ async fn run_pair_command(
 #[cfg(feature = "agent-runtime")]
 fn gateway_admin_token(config: &Config) -> Result<String> {
     zeroclaw_config::pairing::read_gateway_admin_token(&config.data_dir).ok_or_else(|| {
-        anyhow::Error::msg(format!(
-            "No gateway admin token at {}. Run this on the gateway host, as the user that              runs the gateway, while the gateway is running.",
-            zeroclaw_config::pairing::gateway_admin_token_path(&config.data_dir).display()
+        let path = zeroclaw_config::pairing::gateway_admin_token_path(&config.data_dir);
+        anyhow::Error::msg(ta(
+            "cli-mtls-admin-token-missing",
+            &[("path", &path.display().to_string())],
+            "No gateway admin token at {$path}. Run this on the gateway host, as the user \
+             that runs the gateway, while the gateway is running.",
         ))
     })
 }
@@ -8426,14 +8489,26 @@ async fn fetch_enrollment_status(config: &Config) -> Result<serde_json::Value> {
         .timeout(std::time::Duration::from_secs(3))
         .send()
         .await
-        .map_err(|error| anyhow::Error::msg(format!("Enrollment status failed: {error}")))?;
+        .map_err(|error| {
+            anyhow::Error::msg(ta(
+                "cli-mtls-status-failed",
+                &[("error", &error.to_string())],
+                "Enrollment status failed: {$error}",
+            ))
+        })?;
     let status = response.status();
     let body: serde_json::Value = response.json().await.unwrap_or_default();
     if !status.is_success() {
         let message = body
             .get("error")
             .and_then(|value| value.as_str())
-            .unwrap_or("gateway refused the enrollment status request");
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                t(
+                    "cli-mtls-status-refused",
+                    "gateway refused the enrollment status request",
+                )
+            });
         anyhow::bail!("{message}");
     }
     Ok(body)
@@ -8457,9 +8532,18 @@ async fn close_enrollment_window(config: &Config) -> Result<()> {
         .timeout(std::time::Duration::from_secs(3))
         .send()
         .await
-        .map_err(|error| anyhow::Error::msg(format!("Closing enrollment failed: {error}")))?;
+        .map_err(|error| {
+            anyhow::Error::msg(ta(
+                "cli-mtls-close-failed",
+                &[("error", &error.to_string())],
+                "Closing enrollment failed: {$error}",
+            ))
+        })?;
     if !response.status().is_success() {
-        anyhow::bail!("gateway refused to close the enrollment window");
+        anyhow::bail!(t(
+            "cli-mtls-close-refused",
+            "gateway refused to close the enrollment window"
+        ));
     }
     Ok(())
 }
@@ -8488,11 +8572,9 @@ async fn wait_for_pairing(config: &Config, timeout_secs: u64) -> Result<()> {
             let Ok(Event::Key(key)) = read() else {
                 continue;
             };
-            let stop = matches!(
-                key.code,
-                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc
-            ) || (key.code == KeyCode::Char('c')
-                && key.modifiers.contains(KeyModifiers::CONTROL));
+            let stop = matches!(key.code, KeyCode::Char('q' | 'Q') | KeyCode::Esc)
+                || (key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL));
             if stop {
                 let _ = stop_tx.send(());
                 return;
@@ -8508,13 +8590,27 @@ async fn wait_for_pairing(config: &Config, timeout_secs: u64) -> Result<()> {
                 .get("last_close")
                 .and_then(|value| value.as_str())
                 .unwrap_or("closed");
-            let message = match reason {
-                "paired" => "Device paired; enrollment port closed.",
-                "timeout" => "Pairing timed out; enrollment port closed.",
-                "closed" => "Pairing stopped; enrollment port closed.",
-                "replaced" => "Pairing window replaced.",
-                _ => "Enrollment port closed.",
+            let (key, fallback) = match reason {
+                "paired" => (
+                    "cli-pair-status-paired",
+                    "Device paired; enrollment port closed.",
+                ),
+                "timeout" => (
+                    "cli-pair-status-timeout",
+                    "Pairing timed out; enrollment port closed.",
+                ),
+                "closed" => (
+                    "cli-pair-status-closed",
+                    "Pairing stopped; enrollment port closed.",
+                ),
+                "replaced" => ("cli-pair-status-replaced", "Pairing window replaced."),
+                "too_many_failures" => (
+                    "cli-pair-status-too-many",
+                    "Too many wrong pairing codes; enrollment port closed and the code expired.",
+                ),
+                _ => ("cli-pair-status-default", "Enrollment port closed."),
             };
+            let message = t(key, fallback);
             let _ = disable_raw_mode();
             println!("\n{message}");
             return Ok(());
@@ -8530,13 +8626,24 @@ async fn wait_for_pairing(config: &Config, timeout_secs: u64) -> Result<()> {
             .and_then(|value| value.as_u64())
             .unwrap_or(0);
         let port_text = if port > 0 {
-            format!(" · port {port}")
+            ta(
+                "cli-pair-window-port",
+                &[("port", &port.to_string())],
+                " · port {$port}",
+            )
         } else {
             String::new()
         };
         print!(
-            "\r\x1b[2KEnrollment open{port_text} · {}s remaining · press q to stop",
-            last_remaining
+            "\r\x1b[2K{}",
+            ta(
+                "cli-pair-window-open",
+                &[
+                    ("port_text", &port_text),
+                    ("seconds", &last_remaining.to_string()),
+                ],
+                "Enrollment open{$port_text} · {$seconds}s remaining · press q to stop"
+            )
         );
         std::io::stdout().flush().ok();
 
@@ -8544,7 +8651,10 @@ async fn wait_for_pairing(config: &Config, timeout_secs: u64) -> Result<()> {
             _ = stop_rx.recv() => {
                 close_enrollment_window(config).await?;
                 let _ = disable_raw_mode();
-                println!("\nPairing stopped; enrollment port closed.");
+                println!(
+                    "\n{}",
+                    t("cli-pair-stopped", "Pairing stopped; enrollment port closed.")
+                );
                 return Ok(());
             }
             () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
@@ -8554,15 +8664,8 @@ async fn wait_for_pairing(config: &Config, timeout_secs: u64) -> Result<()> {
 
 #[cfg(feature = "agent-runtime")]
 async fn run_mtls_command(config: &Config, command: MtlsCommands) -> Result<()> {
-    let dir = if let Some(mtls) = config.gateway.mtls.as_ref() {
-        if mtls.dir.trim().is_empty() {
-            config.data_dir.join("gateway-mtls")
-        } else {
-            PathBuf::from(mtls.dir.trim())
-        }
-    } else {
-        config.data_dir.join("gateway-mtls")
-    };
+    let mtls = config.gateway.mtls.clone().unwrap_or_default();
+    let dir = mtls.material_dir(&config.data_dir);
     match command {
         MtlsCommands::List { json } => {
             let path = dir.join("issued.json");
@@ -8575,12 +8678,22 @@ async fn run_mtls_command(config: &Config, command: MtlsCommands) -> Result<()> 
                 return Ok(());
             }
             if entries.is_empty() {
-                println!("No client certificates issued by the gateway mTLS CA.");
+                println!(
+                    "{}",
+                    t(
+                        "cli-mtls-list-none",
+                        "No client certificates issued by the gateway mTLS CA."
+                    )
+                );
                 return Ok(());
             }
             println!(
-                "{:<14} {:<12} {:<64} {:<22} {}",
-                "DEVICE", "REVOKED", "FINGERPRINT", "EXPIRES", "NAME"
+                "{}",
+                t(
+                    "cli-mtls-list-header",
+                    "DEVICE         REVOKED      FINGERPRINT                                                      \
+                     EXPIRES                TOKEN              REPLACES         NAME"
+                )
             );
             for entry in entries {
                 let device = entry["device_id"].as_str().unwrap_or("-");
@@ -8590,8 +8703,19 @@ async fn run_mtls_command(config: &Config, command: MtlsCommands) -> Result<()> 
                 let expires = chrono::DateTime::from_timestamp(not_after, 0)
                     .map(|time| time.to_rfc3339())
                     .unwrap_or_else(|| "-".to_string());
+                let token = entry["token_hash"]
+                    .as_str()
+                    .map(|hash| &hash[..hash.len().min(16)])
+                    .unwrap_or("-");
+                let replaces = entry["supersedes"]
+                    .as_str()
+                    .map(|hash| &hash[..hash.len().min(16)])
+                    .unwrap_or("-");
                 let name = entry["name"].as_str().unwrap_or("-");
-                println!("{device:<14} {revoked:<12} {fingerprint:<64} {expires:<22} {name}");
+                println!(
+                    "{device:<14} {revoked:<12} {fingerprint:<64} {expires:<22} \
+                     {token:<18} {replaces:<16} {name}"
+                );
             }
             Ok(())
         }
@@ -8601,47 +8725,123 @@ async fn run_mtls_command(config: &Config, command: MtlsCommands) -> Result<()> 
         } => {
             let selector = device.or(fingerprint).unwrap_or_default();
             if selector.trim().is_empty() {
-                anyhow::bail!("pass --device or --fingerprint");
+                anyhow::bail!(t(
+                    "cli-mtls-selector-missing",
+                    "pass --device or --fingerprint"
+                ));
             }
-            let url = format!("http://127.0.0.1:{}/admin/mtls/revoke", config.gateway.port);
-            let response = reqwest::Client::new()
+            let selector = selector.trim().to_string();
+            let url = gateway_admin_url(
+                admin_gateway_host(&config.gateway.host),
+                config.gateway.port,
+                config.gateway.path_prefix.as_deref(),
+                "/admin/mtls/revoke",
+            );
+            let mut request = reqwest::Client::new()
                 .post(&url)
-                .json(&serde_json::json!({"selector": selector.trim()}))
-                .send()
-                .await;
-            match response {
+                .json(&serde_json::json!({"selector": selector}))
+                .timeout(std::time::Duration::from_secs(5));
+            // A missing token file means no gateway has run here; the request
+            // then fails to connect and the offline path below applies.
+            if let Ok(admin_token) = gateway_admin_token(config) {
+                request = request.header(
+                    zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+                    admin_token,
+                );
+            }
+            match request.send().await {
                 Ok(response) if response.status().is_success() => {
                     let body: serde_json::Value = response.json().await?;
                     println!("{}", serde_json::to_string_pretty(&body)?);
                 }
                 Ok(response) => {
-                    anyhow::bail!(
-                        "gateway refused the revocation (HTTP {}): {}",
-                        response.status(),
-                        response.text().await.unwrap_or_default()
-                    );
+                    let status = response.status().to_string();
+                    let body = response.text().await.unwrap_or_default();
+                    anyhow::bail!(ta(
+                        "cli-mtls-revoke-refused",
+                        &[("status", &status), ("body", &body)],
+                        "gateway refused the revocation (HTTP {$status}): {$body}"
+                    ));
                 }
-                Err(error) => {
-                    // Gateway not running: write the CRL directly so the next
-                    // start refuses the certificate. Live sessions end when the
-                    // gateway stops.
-                    let revoked = dir.join("revoked");
+                Err(error) if error.is_connect() || error.is_timeout() => {
+                    // Gateway not running: write the CRL directly. The next
+                    // start folds it into the ledger, refuses the certificates,
+                    // and revokes the bearer token of a device left without a
+                    // live certificate.
+                    let fingerprints = offline_revocation_fingerprints(&dir, &selector)?;
+                    let revoked = mtls.crl_file(&config.data_dir);
                     use std::io::Write as _;
                     let mut file = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
                         .open(&revoked)?;
-                    writeln!(file, "{}", selector.trim())?;
+                    for fingerprint in &fingerprints {
+                        writeln!(file, "{fingerprint}")?;
+                    }
                     println!(
-                        "Gateway not reachable ({error}); wrote {} to {}. Restart the gateway to apply it.",
-                        selector.trim(),
-                        revoked.display()
+                        "{}",
+                        ta(
+                            "cli-mtls-offline-revoked",
+                            &[
+                                ("error", &error.to_string()),
+                                ("count", &fingerprints.len().to_string()),
+                                ("path", &revoked.display().to_string()),
+                            ],
+                            "Gateway not reachable ({$error}); wrote {$count} fingerprint(s) to \
+                             {$path}. Restart the gateway to apply it."
+                        )
                     );
+                }
+                Err(error) => {
+                    anyhow::bail!(ta(
+                        "cli-mtls-revoke-failed",
+                        &[("error", &error.to_string())],
+                        "revocation request failed: {$error}"
+                    ));
                 }
             }
             Ok(())
         }
     }
+}
+
+/// Fingerprints `zeroclaw mtls delete` revokes when the gateway is down: every
+/// ledger certificate of a device id, a ledger fingerprint, or a bare SHA-256
+/// fingerprint issued out of band. A device id that is not in the ledger is an
+/// error, not a CRL line that matches nothing.
+#[cfg(feature = "agent-runtime")]
+fn offline_revocation_fingerprints(dir: &Path, selector: &str) -> Result<Vec<String>> {
+    let normalized = selector.replace(':', "").to_lowercase();
+    let path = dir.join("issued.json");
+    let entries: Vec<serde_json::Value> = if path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&path)?)
+            .with_context(|| format!("parsing {}", path.display()))?
+    } else {
+        Vec::new()
+    };
+    let matches: Vec<String> = entries
+        .iter()
+        .filter(|entry| {
+            entry["device_id"]
+                .as_str()
+                .is_some_and(|id| id.eq_ignore_ascii_case(&normalized))
+                || entry["fingerprint"]
+                    .as_str()
+                    .is_some_and(|fp| fp.eq_ignore_ascii_case(&normalized))
+        })
+        .filter_map(|entry| entry["fingerprint"].as_str().map(str::to_lowercase))
+        .collect();
+    if !matches.is_empty() {
+        return Ok(matches);
+    }
+    if normalized.len() == 64 && normalized.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(vec![normalized]);
+    }
+    anyhow::bail!(ta(
+        "cli-mtls-offline-no-match",
+        &[("selector", selector)],
+        "no issued certificate matches '{$selector}'"
+    ))
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -15129,7 +15329,11 @@ async fn open_enrollment_window(
         .send()
         .await
         .map_err(|error| {
-            anyhow::Error::msg(format!("Failed to open enrollment window: {error}"))
+            anyhow::Error::msg(ta(
+                "cli-mtls-open-failed",
+                &[("error", &error.to_string())],
+                "Failed to open enrollment window: {$error}",
+            ))
         })?;
     let status = response.status();
     let body: serde_json::Value = response.json().await.unwrap_or_default();
@@ -15137,7 +15341,13 @@ async fn open_enrollment_window(
         let message = body
             .get("error")
             .and_then(|value| value.as_str())
-            .unwrap_or("gateway refused the enrollment window");
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                t(
+                    "cli-mtls-open-refused",
+                    "gateway refused the enrollment window",
+                )
+            });
         anyhow::bail!("{message}");
     }
     Ok(())
@@ -15154,10 +15364,12 @@ async fn fetch_paircode(
     // the gateway writes owner-only into its data directory at startup.
     let admin_token =
         zeroclaw_config::pairing::read_gateway_admin_token(data_dir).ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "No gateway admin token at {}. Run this on the gateway host, as the user that \
-             runs the gateway, while the gateway is running.",
-                zeroclaw_config::pairing::gateway_admin_token_path(data_dir).display()
+            let path = zeroclaw_config::pairing::gateway_admin_token_path(data_dir);
+            anyhow::Error::msg(ta(
+                "cli-mtls-admin-token-missing",
+                &[("path", &path.display().to_string())],
+                "No gateway admin token at {$path}. Run this on the gateway host, as the user \
+             that runs the gateway, while the gateway is running.",
             ))
         })?;
     let client = reqwest::Client::new();
