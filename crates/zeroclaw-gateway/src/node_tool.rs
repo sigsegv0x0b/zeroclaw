@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use tokio::time::Duration;
 
 use crate::nodes::{MAX_NODE_ATTACHMENT_BYTES, NodeAttachment, NodeInvocation, NodeRegistry};
@@ -75,14 +76,23 @@ impl NodeTool {
             sanitize_component(node_id),
             sanitize_component(capability_name)
         );
-        name.truncate(64);
+        if name.len() > 64 {
+            // Registration limits keep production names below the cap, but a
+            // truncated name alone can collide (`a.b` vs `a_b`, long ids).
+            // Keep a stable digest of the full name in the suffix so two
+            // different capabilities never share a tool name.
+            let digest = hex::encode(Sha256::digest(name.as_bytes()));
+            name.truncate(55);
+            name.push('-');
+            name.push_str(&digest[..8]);
+        }
         name
     }
 }
 
 /// Replace characters providers reject with `_` so a tool name survives the
 /// strict `[a-zA-Z0-9_-]` rule. `:` and `.` are the common offenders.
-fn sanitize_component(raw: &str) -> String {
+pub(crate) fn sanitize_component(raw: &str) -> String {
     raw.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
@@ -104,6 +114,8 @@ fn sanitize_component(raw: &str) -> String {
 pub struct NodeToolSource {
     registry: Arc<NodeRegistry>,
     node_id: Option<String>,
+    owner: Option<String>,
+    enabled: bool,
 }
 
 impl NodeToolSource {
@@ -111,6 +123,8 @@ impl NodeToolSource {
         Self {
             registry,
             node_id: None,
+            owner: None,
+            enabled: true,
         }
     }
 
@@ -121,20 +135,43 @@ impl NodeToolSource {
         Self {
             registry,
             node_id: Some(node_id),
+            owner: None,
+            enabled: true,
+        }
+    }
+
+    /// Scope to one node AND the authenticated credential that registered it.
+    /// A chat turn authenticated by a paired token can only reach the phone
+    /// that registered under that same token.
+    pub fn for_owned_node(registry: Arc<NodeRegistry>, node_id: String, owner: String) -> Self {
+        Self {
+            registry,
+            node_id: Some(node_id),
+            owner: Some(owner),
+            enabled: true,
+        }
+    }
+
+    /// A source with no tools. Chat turns that did not authenticate as a node's
+    /// owner get this instead of every connected phone.
+    pub fn none(registry: Arc<NodeRegistry>) -> Self {
+        Self {
+            registry,
+            node_id: None,
+            owner: None,
+            enabled: false,
         }
     }
 
     /// Build one tool per connected capability. Split from [`ToolSource::tools`]
     /// so tests can exercise it without constructing a full [`ToolRequest`].
     fn collect(&self) -> Vec<Box<dyn Tool>> {
+        if !self.enabled {
+            return Vec::new();
+        }
         self.registry
-            .all_capabilities()
+            .capabilities_for(self.node_id.as_deref(), self.owner.as_deref())
             .into_iter()
-            .filter(|(node_id, _, _)| {
-                self.node_id
-                    .as_deref()
-                    .is_none_or(|wanted| wanted == node_id)
-            })
             .map(|(node_id, capability_name, capability)| {
                 Box::new(NodeTool::new(
                     node_id,
@@ -369,6 +406,8 @@ mod tests {
                 }),
             }],
             invoke_tx,
+            owner: "owner".to_string(),
+            generation: 0,
         });
 
         let source = NodeToolSource::new(Arc::clone(&registry));
@@ -394,6 +433,8 @@ mod tests {
                     parameters: serde_json::json!({"type": "object", "properties": {}}),
                 }],
                 invoke_tx,
+                owner: format!("owner-{node_id}"),
+                generation: 0,
             });
         }
 
@@ -407,6 +448,27 @@ mod tests {
         let disconnected =
             NodeToolSource::for_node(Arc::clone(&registry), "android-gone".to_string());
         assert!(disconnected.collect().is_empty());
+
+        let owned = NodeToolSource::for_owned_node(
+            Arc::clone(&registry),
+            "android-origin".to_string(),
+            "owner-android-origin".to_string(),
+        );
+        assert_eq!(owned.collect().len(), 1);
+        let wrong_owner = NodeToolSource::for_owned_node(
+            Arc::clone(&registry),
+            "android-origin".to_string(),
+            "owner-someone-else".to_string(),
+        );
+        assert!(
+            wrong_owner.collect().is_empty(),
+            "a paired token must not reach a node registered by another token"
+        );
+        assert!(
+            NodeToolSource::none(Arc::clone(&registry))
+                .collect()
+                .is_empty()
+        );
 
         let all = NodeToolSource::new(Arc::clone(&registry));
         assert_eq!(all.collect().len(), 2);
@@ -458,6 +520,8 @@ mod tests {
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
             }],
             invoke_tx,
+            owner: "owner".to_string(),
+            generation: 0,
         });
 
         let tool = NodeTool::new(

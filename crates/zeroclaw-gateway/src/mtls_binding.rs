@@ -15,7 +15,7 @@
 use axum::{
     Json,
     extract::{Query, Request, State},
-    http::{StatusCode, header},
+    http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -23,9 +23,6 @@ use zeroclaw_config::pairing::PairingGuard;
 
 use crate::AppState;
 use crate::mtls_state::PeerCertFingerprint;
-
-const AUTHORIZATION_SCHEME: &str = "Bearer ";
-const BEARER_PROTOCOL: &str = "bearer.";
 
 pub(crate) async fn enforce(
     State(state): State<AppState>,
@@ -54,65 +51,44 @@ pub(crate) async fn enforce(
 }
 
 /// Every bearer candidate in the request, as a handler would extract it.
-/// Prefixes match without regard to case so no spelling slips past.
+///
+/// This uses the same extractor as `/ws/chat` and `/ws/nodes`; the only
+/// route-specific choice is whether `?token=` is a bearer carrier, which only
+/// the WebSocket routes treat it as. On every other route a `token` parameter
+/// is unrelated data, and treating it as a presented bearer would let a bound
+/// certificate fail requests that never intended to authenticate.
 fn presented_tokens(request: &Request) -> Vec<String> {
-    let headers = request.headers();
-    let mut tokens = Vec::new();
-    for value in headers
-        .get_all(header::AUTHORIZATION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-    {
-        if let Some(token) = strip_prefix_ignore_case(value, AUTHORIZATION_SCHEME)
-            && !token.is_empty()
-        {
-            tokens.push(token.to_string());
-        }
-    }
-    for protocol in headers
-        .get_all(header::SEC_WEBSOCKET_PROTOCOL)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|protocols| protocols.split(','))
-    {
-        if let Some(token) = strip_prefix_ignore_case(protocol.trim(), BEARER_PROTOCOL)
-            && !token.is_empty()
-        {
-            tokens.push(token.to_string());
-        }
-    }
-    // Only the WebSocket routes read a bearer from `?token=`. On every other
-    // route a `token` parameter is unrelated data (a provider token, a
-    // verification token), so treating it as a presented bearer would let a
-    // bound certificate fail requests that never intended to authenticate.
     let websocket_route = request
         .uri()
         .path()
         .split('/')
         .any(|segment| segment == "ws");
-    if websocket_route
-        && let Ok(Query(pairs)) = Query::<Vec<(String, String)>>::try_from_uri(request.uri())
-    {
-        tokens.extend(
-            pairs
-                .into_iter()
-                .filter(|(name, value)| name == "token" && !value.is_empty())
-                .map(|(_, value)| value),
-        );
-    }
-    tokens
-}
-
-fn strip_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    value
-        .get(..prefix.len())
-        .filter(|head| head.eq_ignore_ascii_case(prefix))
-        .map(|_| &value[prefix.len()..])
+    let query_tokens: Vec<String> = if websocket_route {
+        Query::<Vec<(String, String)>>::try_from_uri(request.uri())
+            .map(|Query(pairs)| {
+                pairs
+                    .into_iter()
+                    .filter(|(name, value)| name == "token" && !value.is_empty())
+                    .map(|(_, value)| value)
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let query_refs: Vec<&str> = query_tokens.iter().map(String::as_str).collect();
+    let tokens = if websocket_route {
+        crate::token_auth::websocket_bearer_tokens(request.headers(), query_refs)
+    } else {
+        crate::token_auth::authorization_bearer_tokens(request.headers())
+    };
+    tokens.into_iter().map(str::to_string).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::header;
 
     fn request(builder: axum::http::request::Builder) -> Request {
         builder.body(axum::body::Body::empty()).expect("request")

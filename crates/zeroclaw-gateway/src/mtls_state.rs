@@ -766,16 +766,28 @@ impl MtlsState {
         if fresh.is_empty() {
             return Ok(());
         }
-        let mut crl = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.crl_path)
-            .with_context(|| format!("opening {}", self.crl_path.display()))?;
-        use std::io::Write as _;
-        for fingerprint in &fresh {
-            writeln!(crl, "{fingerprint}")?;
+        // Replace the CRL atomically: an interrupted in-place append could
+        // leave a partial fingerprint that no later line can repair. The
+        // existing file is small, so rewriting it costs nothing.
+        let mut body = if self.crl_path.exists() {
+            std::fs::read_to_string(&self.crl_path)
+                .with_context(|| format!("reading {}", self.crl_path.display()))?
+        } else {
+            String::new()
+        };
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
         }
-        crl.sync_all()?;
+        for fingerprint in &fresh {
+            body.push_str(fingerprint);
+            body.push('\n');
+        }
+        let tmp = self.crl_path.with_extension("tmp");
+        std::fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
+        if let Err(error) = std::fs::rename(&tmp, &self.crl_path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error).with_context(|| format!("replacing {}", self.crl_path.display()));
+        }
         for fingerprint in fresh {
             revoked.insert(fingerprint.clone());
         }
@@ -813,6 +825,13 @@ impl MtlsState {
             |entry| entry.token_hash.as_deref() == Some(token_hash) && !entry.revoked,
             None,
         )
+    }
+
+    /// Revoke every live certificate. The "rotate all credentials" path clears
+    /// the token set and device registry; the mTLS ledger and active
+    /// connections must go with them.
+    pub fn revoke_all(&self) -> Result<RevokeOutcome> {
+        self.revoke_matching(|entry| !entry.revoked, None)
     }
 
     fn revoke_matching(
@@ -1004,7 +1023,7 @@ impl MtlsState {
         if !pending {
             return;
         }
-        let retired = (|| -> Result<Option<String>> {
+        let retired = (|| -> Result<Option<(String, Option<IssuedCert>)>> {
             let mut ledger = self.ledger.write();
             let mut next = ledger.clone();
             let Some(index) = next
@@ -1017,18 +1036,25 @@ impl MtlsState {
                 return Ok(None);
             };
             let previous = normalize_fingerprint(&previous);
+            let mut retired_entry = None;
             for entry in &mut next {
                 if entry.fingerprint.eq_ignore_ascii_case(&previous) {
                     entry.revoked = true;
+                    retired_entry = Some(entry.clone());
                 }
             }
             self.append_crl(std::slice::from_ref(&previous))?;
             write_ledger_file(&self.ledger_path(), &next)?;
             *ledger = next;
-            Ok(Some(previous))
+            Ok(Some((previous, retired_entry)))
         })();
         match retired {
-            Ok(Some(previous)) => self.cancel_active(&[previous]),
+            Ok(Some((previous, retired_entry))) => {
+                if let Some(entry) = retired_entry.as_ref() {
+                    self.audit_revoked(entry);
+                }
+                self.cancel_active(&[previous]);
+            }
             Ok(None) => {}
             Err(error) => ::zeroclaw_log::record!(
                 WARN,
@@ -1395,6 +1421,68 @@ mod tests {
                 "cert_revoked"
             ],
             "the mTLS path must append to the shared certificate audit chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_all_marks_every_certificate_and_cancels_connections() {
+        let fixture = fixture();
+        let (phone, _) = enroll(&fixture, "dev-phone").await;
+        let (tablet, _) = enroll(&fixture, "dev-tablet").await;
+        let phone_connection = fixture.state.register_active(phone.clone());
+        let tablet_connection = fixture.state.register_active(tablet.clone());
+
+        let outcome = fixture.state.revoke_all().expect("revoke all");
+        assert_eq!(outcome.fingerprints.len(), 2);
+        assert!(phone_connection.is_cancelled());
+        assert!(tablet_connection.is_cancelled());
+        assert!(
+            fixture
+                .state
+                .read_ledger()
+                .iter()
+                .all(|entry| entry.revoked),
+            "rotate-all must leave no live certificate"
+        );
+    }
+
+    #[tokio::test]
+    async fn retiring_a_renewed_certificate_is_audited() {
+        let fixture = fixture();
+        let audit = Arc::new(
+            zeroclaw_runtime::security::audit::AuditLogger::new(
+                zeroclaw_config::schema::AuditConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                fixture.dir.path().to_path_buf(),
+            )
+            .expect("audit logger"),
+        );
+        fixture.state.set_cert_audit(audit);
+        let (fingerprint, token) = enroll(&fixture, "dev-phone").await;
+        let renewed = fixture
+            .state
+            .renew(&fingerprint, &PairingGuard::token_hash(&token), &csr())
+            .expect("renewed");
+
+        fixture.state.note_handshake(&renewed.leaf.fingerprint);
+        let log = std::fs::read_to_string(fixture.dir.path().join("audit.log"))
+            .expect("certificate audit log");
+        assert!(
+            log.lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|event| {
+                        event
+                            .get("event_type")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    == Some("cert_revoked")
+            }),
+            "retiring the predecessor after a renewal handshake must be audited"
         );
     }
 

@@ -18,7 +18,7 @@ use axum::{
         Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderMap, header},
+    http::HeaderMap,
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -93,9 +93,6 @@ pub(crate) struct ConnectParams {
 /// The sub-protocol we support for the chat WebSocket.
 pub(crate) const WS_PROTOCOL: &str = "zeroclaw.v1";
 
-/// Prefix used in `Sec-WebSocket-Protocol` to carry a bearer token.
-const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
-
 #[derive(Deserialize)]
 pub struct WsQuery {
     pub token: Option<String>,
@@ -117,40 +114,11 @@ pub struct WsQuery {
     pub workspace_dir: Option<String>,
 }
 
-fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) -> Option<&'a str> {
-    // 1. Authorization header
-    if let Some(t) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|auth| auth.strip_prefix("Bearer "))
-        && !t.is_empty()
-    {
-        return Some(t);
-    }
-
-    // 2. Sec-WebSocket-Protocol: bearer.<token>
-    if let Some(t) = headers
-        .get("sec-websocket-protocol")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|protos| {
-            protos
-                .split(',')
-                .map(|p| p.trim())
-                .find_map(|p| p.strip_prefix(BEARER_SUBPROTO_PREFIX))
-        })
-        && !t.is_empty()
-    {
-        return Some(t);
-    }
-
-    // 3. ?token= query parameter
-    if let Some(t) = query_token
-        && !t.is_empty()
-    {
-        return Some(t);
-    }
-
-    None
+pub(crate) fn extract_ws_token<'a>(
+    headers: &'a HeaderMap,
+    query_token: Option<&'a str>,
+) -> Option<&'a str> {
+    crate::token_auth::websocket_bearer_token(headers, query_token)
 }
 
 /// GET /ws/chat — WebSocket upgrade for agent chat
@@ -844,16 +812,29 @@ async fn handle_socket(
         return;
     }
 
+    // The chat's authenticated token hash is also the node owner: a phone's
+    // tools are reachable only from the same credential that registered the
+    // phone. A dashboard session (no token, no owner) gets no phone tools, and
+    // a chat that names no node gets none either instead of every phone.
+    let node_owner = auth_subject.clone();
+    let node_source = match (node_id, node_owner) {
+        (Some(node_id), Some(owner)) => crate::node_tool::NodeToolSource::for_owned_node(
+            state.node_registry.clone(),
+            node_id,
+            owner,
+        ),
+        // Pairing disabled means the gateway already trusts every caller; keep
+        // the node-id scoping available there.
+        (Some(node_id), None) if !state.pairing.require_pairing() => {
+            crate::node_tool::NodeToolSource::for_node(state.node_registry.clone(), node_id)
+        }
+        _ => crate::node_tool::NodeToolSource::none(state.node_registry.clone()),
+    };
     let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
         state.config.clone(),
         state.agent_lifecycle.clone(),
     )
-    .with_tool_source(Arc::new(match node_id {
-        Some(node_id) => {
-            crate::node_tool::NodeToolSource::for_node(state.node_registry.clone(), node_id)
-        }
-        None => crate::node_tool::NodeToolSource::new(state.node_registry.clone()),
-    }));
+    .with_tool_source(Arc::new(node_source));
     let mut agent =
         match zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
             state.config.clone(),
