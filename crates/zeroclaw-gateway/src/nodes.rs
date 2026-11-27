@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq};
 
 pub mod mdns;
@@ -104,6 +105,18 @@ pub struct NodeInfo {
     /// Per-registration generation, so a stale socket cannot unregister the
     /// connection that replaced it.
     pub generation: u64,
+    /// Cancelling this closes the node's WebSocket. Device revocation uses it
+    /// so a revoked token stops receiving invocations immediately instead of
+    /// waiting for the phone to notice.
+    pub shutdown: CancellationToken,
+}
+
+/// A read-only view of one live node registration for management surfaces.
+#[derive(Debug, Clone)]
+pub struct NodeSnapshot {
+    pub node_id: String,
+    pub owner: String,
+    pub capabilities: Vec<NodeCapability>,
 }
 
 /// An invocation request sent to a node.
@@ -217,6 +230,35 @@ impl NodeRegistry {
         }
     }
 
+    /// Close and remove every node registered by one credential. Returns the
+    /// node ids that were dropped, for the caller's response/logging.
+    pub fn revoke_owner(&self, owner: &str) -> Vec<String> {
+        let mut nodes = self.nodes.write();
+        let revoked: Vec<String> = nodes
+            .values()
+            .filter(|node| node.owner == owner)
+            .map(|node| node.node_id.clone())
+            .collect();
+        for node_id in &revoked {
+            if let Some(node) = nodes.remove(node_id) {
+                node.shutdown.cancel();
+            }
+        }
+        revoked
+    }
+
+    /// Close and remove every live node registration. Used by rotate-all.
+    pub fn revoke_all(&self) -> Vec<String> {
+        let mut nodes = self.nodes.write();
+        let revoked: Vec<String> = nodes.keys().cloned().collect();
+        for node_id in &revoked {
+            if let Some(node) = nodes.remove(node_id) {
+                node.shutdown.cancel();
+            }
+        }
+        revoked
+    }
+
     /// List all registered node IDs.
     pub fn node_ids(&self) -> Vec<String> {
         self.nodes.read().keys().cloned().collect()
@@ -249,6 +291,19 @@ impl NodeRegistry {
     /// Get all capabilities across all nodes, keyed by prefixed tool name.
     pub fn all_capabilities(&self) -> Vec<(String, String, NodeCapability)> {
         self.capabilities_for(None, None)
+    }
+
+    /// Snapshot every live node, including the credential that owns it.
+    pub fn snapshots(&self) -> Vec<NodeSnapshot> {
+        self.nodes
+            .read()
+            .values()
+            .map(|info| NodeSnapshot {
+                node_id: info.node_id.clone(),
+                owner: info.owner.clone(),
+                capabilities: info.capabilities.clone(),
+            })
+            .collect()
     }
 
     /// Get the invocation sender for a specific node.
@@ -421,6 +476,7 @@ pub async fn handle_ws_nodes(
 
 async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>, owner: String) {
     let (mut sender, mut receiver) = socket.split();
+    let shutdown = CancellationToken::new();
     let mut registered_node_id: Option<String> = None;
     let mut registered_generation: Option<u64> = None;
 
@@ -453,7 +509,14 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>, owne
     });
 
     // Process incoming messages from node
-    while let Some(msg) = receiver.next().await {
+    loop {
+        let msg = tokio::select! {
+            () = shutdown.cancelled() => break,
+            msg = receiver.next() => msg,
+        };
+        let Some(msg) = msg else {
+            break;
+        };
         let text = match msg {
             Ok(Message::Text(text)) => text,
             Ok(Message::Close(_)) | Err(_) => break,
@@ -493,6 +556,7 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>, owne
                     invoke_tx: invoke_tx.clone(),
                     owner: owner.clone(),
                     generation: 0,
+                    shutdown: shutdown.clone(),
                 };
 
                 if let Some(generation) = registry.register_with_generation(info) {
@@ -725,6 +789,7 @@ mod tests {
             invoke_tx: tx,
             owner: "owner".to_string(),
             generation: 0,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
 
         assert!(registry.register(info));
@@ -748,6 +813,7 @@ mod tests {
                 invoke_tx: tx,
                 owner: "owner".to_string(),
                 generation: 0,
+                shutdown: tokio_util::sync::CancellationToken::new(),
             };
             assert!(registry.register(info));
         }
@@ -759,6 +825,7 @@ mod tests {
             invoke_tx: tx,
             owner: "owner".to_string(),
             generation: 0,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         assert!(!registry.register(info));
         assert_eq!(registry.len(), 2);
@@ -780,6 +847,7 @@ mod tests {
             invoke_tx: tx1,
             owner: "owner".to_string(),
             generation: 0,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         assert!(registry.register(info1));
 
@@ -793,6 +861,7 @@ mod tests {
             invoke_tx: tx2,
             owner: "owner".to_string(),
             generation: 0,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         // Re-registering same node_id should succeed (update)
         assert!(registry.register(info2));
@@ -814,6 +883,7 @@ mod tests {
             invoke_tx: tx1,
             owner: "owner-a".to_string(),
             generation: 0,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }));
         assert!(
             !registry.register(NodeInfo {
@@ -822,10 +892,29 @@ mod tests {
                 invoke_tx: tx2,
                 owner: "owner-b".to_string(),
                 generation: 0,
+                shutdown: tokio_util::sync::CancellationToken::new(),
             }),
             "a different token must not overwrite another device's node id"
         );
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn revoking_an_owner_closes_its_live_node() {
+        let registry = NodeRegistry::new(10);
+        let (tx, _rx) = mpsc::channel(1);
+        let shutdown = CancellationToken::new();
+        registry.register(NodeInfo {
+            node_id: "phone-1".to_string(),
+            capabilities: vec![],
+            invoke_tx: tx,
+            owner: "owner-a".to_string(),
+            generation: 0,
+            shutdown: shutdown.clone(),
+        });
+        assert_eq!(registry.revoke_owner("owner-a"), vec!["phone-1"]);
+        assert!(shutdown.is_cancelled());
+        assert!(!registry.contains("phone-1"));
     }
 
     #[test]
@@ -840,6 +929,7 @@ mod tests {
                 invoke_tx: tx1,
                 owner: "owner".to_string(),
                 generation: 0,
+                shutdown: tokio_util::sync::CancellationToken::new(),
             })
             .expect("first registration");
         let second = registry
@@ -849,6 +939,7 @@ mod tests {
                 invoke_tx: tx2,
                 owner: "owner".to_string(),
                 generation: 0,
+                shutdown: tokio_util::sync::CancellationToken::new(),
             })
             .expect("replacement registration");
 
@@ -920,6 +1011,7 @@ mod tests {
             invoke_tx: tx1,
             owner: "owner".to_string(),
             generation: 0,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
 
         registry.register(NodeInfo {
@@ -932,6 +1024,7 @@ mod tests {
             invoke_tx: tx2,
             owner: "owner".to_string(),
             generation: 0,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
 
         let caps = registry.all_capabilities();
@@ -950,6 +1043,7 @@ mod tests {
             invoke_tx: tx,
             owner: "owner".to_string(),
             generation: 0,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
         assert!(!registry.is_empty());
     }

@@ -2611,6 +2611,7 @@ pub(crate) mod tests {
             invoke_tx,
             owner: "owner".into(),
             generation: 0,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }));
         state.mdns_peer_registry.insert(
             "peer-1".into(),

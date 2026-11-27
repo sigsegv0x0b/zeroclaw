@@ -13,6 +13,7 @@ pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
 pub mod api_mtls;
+pub mod api_nodes;
 pub mod api_oidc;
 mod api_oidc_enroll;
 pub mod api_pairing;
@@ -2815,6 +2816,8 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/admin/mtls/list", get(api_mtls::handle_list))
         .route("/admin/mtls/revoke", post(api_mtls::handle_revoke))
         .route("/api/mtls/renew", post(api_mtls::handle_renew))
+        .route("/admin/nodes", get(api_nodes::handle_admin_list))
+        .route("/admin/nodes/revoke", post(api_nodes::handle_admin_revoke))
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
         .route("/admin/sop/pending", get(api_sop::handle_sop_pending))
@@ -3017,6 +3020,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             post(api_pairing::submit_pairing_enhanced).layer(no_relayed_pairing.clone()),
         )
         .route("/api/devices", get(api_pairing::list_devices))
+        .route("/api/nodes", get(api_nodes::handle_list))
         .route("/api/devices/{id}/voice", get(api_pairing::get_device_voice_preferences).put(api_pairing::put_device_voice_preferences))
         .route("/api/devices/me/voice", get(api_pairing::get_my_voice_preferences).put(api_pairing::put_my_voice_preferences))
         .route(
@@ -6074,7 +6078,7 @@ async fn handle_admin_paircode_new(
         Some("all") => {
             // Every live token and every device row go in one step under
             // the lock, so a dropped request leaves neither half behind.
-            let ((revoked, cleared), config_write_guard) = match state
+            let ((revoked, cleared, disconnected_nodes), config_write_guard) = match state
                 .pairing
                 .revoke_under_config_write_lock(state.begin_config_commit(), |pairing| {
                     let revoked = pairing.revoke_all_tokens();
@@ -6082,7 +6086,8 @@ async fn handle_admin_paircode_new(
                         .device_registry
                         .as_ref()
                         .map(|registry| registry.clear());
-                    (revoked, cleared)
+                    let disconnected_nodes = state.node_registry.revoke_all();
+                    (revoked, cleared, disconnected_nodes)
                 })
                 .await
             {
@@ -6138,11 +6143,13 @@ async fn handle_admin_paircode_new(
                     .with_attrs(serde_json::json!({
                         "revoked": revoked,
                         "certificates": certificates,
+                        "disconnected_nodes": disconnected_nodes,
                     })),
-                "all paired tokens and mTLS certificates revoked via admin endpoint"
+                "all paired tokens, mTLS certificates and live nodes revoked via admin endpoint"
             );
             Some(format!(
-                "Revoked all {revoked} paired token(s), {certificates} mTLS certificate(s), and cleared the device registry."
+                "Revoked all {revoked} paired token(s), {certificates} mTLS certificate(s), disconnected {} live node(s), and cleared the device registry.",
+                disconnected_nodes.len()
             ))
         }
         Some(device_id) => {

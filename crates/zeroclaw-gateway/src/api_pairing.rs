@@ -266,12 +266,16 @@ impl DeviceRegistry {
         Ok(inserted)
     }
 
-    pub fn list(&self) -> Result<Vec<DeviceInfo>, rusqlite::Error> {
+    /// Paired-device rows keyed by the token hash that owns them. The node
+    /// registry uses the same hash as its registration owner, so management
+    /// views join the two without ever handling the plaintext token.
+    pub fn entries(&self) -> Result<Vec<(String, DeviceInfo)>, rusqlite::Error> {
         let conn = self.open_db()?;
         let mut stmt = conn.prepare(
             "SELECT token_hash, id, name, device_type, paired_at, last_seen, ip_address, capabilities FROM devices",
         )?;
         let rows = stmt.query_map([], |row| {
+            let token_hash: String = row.get(0)?;
             let id: String = row.get(1)?;
             let name: Option<String> = row.get(2)?;
             let device_type: Option<String> = row.get(3)?;
@@ -288,17 +292,28 @@ impl DeviceRegistry {
             let capabilities = capabilities_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
-            Ok(DeviceInfo {
-                id,
-                name,
-                device_type,
-                paired_at,
-                last_seen,
-                ip_address,
-                capabilities,
-            })
+            Ok((
+                token_hash,
+                DeviceInfo {
+                    id,
+                    name,
+                    device_type,
+                    paired_at,
+                    last_seen,
+                    ip_address,
+                    capabilities,
+                },
+            ))
         })?;
         rows.collect()
+    }
+
+    pub fn list(&self) -> Result<Vec<DeviceInfo>, rusqlite::Error> {
+        Ok(self
+            .entries()?
+            .into_iter()
+            .map(|(_, device)| device)
+            .collect())
     }
 
     pub fn revoke(&self, device_id: &str) -> Result<Option<String>, rusqlite::Error> {
@@ -620,6 +635,9 @@ pub(crate) fn revoke_device_credential<R>(
     match registry.revoke_authorized(device_id, authorize) {
         Ok(Ok(Some(hash))) => {
             state.pairing.revoke_token_hash(&hash);
+            // The phone's live node socket must stop receiving invocations
+            // now, not when it next notices the revoked token.
+            state.node_registry.revoke_owner(&hash);
             // An mTLS-enrolled device's certificates go with its token.
             if let Some(mtls) = state.mtls.as_ref()
                 && let Err(error) = mtls.revoke_token_hash(&hash)
