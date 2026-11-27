@@ -1,9 +1,13 @@
 package ai.zeroclaw.app.data
 
+import android.provider.MediaStore
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -416,6 +420,53 @@ class IntentCapabilitiesTest {
             ),
         )
         assertEquals("android.intent.action.DIAL", dial.action)
+    }
+
+    @Test
+    fun `raw mode types extras and accepts string arrays`() {
+        val intent = resolved(
+            IntentCapabilities.plan(
+                JsonObject(
+                    mapOf(
+                        "action" to JsonPrimitive("VIEW"),
+                        "uri" to JsonPrimitive("https://example.com"),
+                        "extras" to buildJsonObject {
+                            put("score", 1.5)
+                            put("flag", true)
+                            put("count", 3)
+                            putJsonArray("labels") {
+                                add(JsonPrimitive("a"))
+                                add(JsonPrimitive("b"))
+                            }
+                        },
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals(1.5, (intent.extras["score"] as ExtraValue.Decimal).value, 0.0)
+        assertTrue((intent.extras["flag"] as ExtraValue.Flag).value)
+        assertEquals(3L, (intent.extras["count"] as ExtraValue.Number).value)
+        assertEquals(
+            listOf("a", "b"),
+            (intent.extras["labels"] as ExtraValue.TextList).values,
+        )
+    }
+
+    @Test
+    fun `media focus maps to a MediaStore content type`() {
+        val intent = resolved(
+            IntentCapabilities.plan(
+                recipeArgs(
+                    "media.play_search",
+                    "query" to JsonPrimitive("jazz"),
+                    "focus" to JsonPrimitive("artist"),
+                ),
+            ),
+        )
+
+        val focus = (intent.extras[MediaStore.EXTRA_MEDIA_FOCUS] as ExtraValue.Text).value
+        assertEquals("vnd.android.cursor.dir/artist", focus)
     }
 
     @Test

@@ -141,6 +141,8 @@ sealed interface ExtraValue {
     data class Text(val value: String) : ExtraValue
     data class Flag(val value: Boolean) : ExtraValue
     data class Number(val value: Long) : ExtraValue
+    data class Decimal(val value: Double) : ExtraValue
+    data class TextList(val values: List<String>) : ExtraValue
 }
 
 /** PackageManager seam: returns `"Label (package)"` strings for a candidate intent. */
@@ -162,6 +164,7 @@ object IntentCapabilities {
     private const val MAX_RAW_URI_CHARS = 2048
     private const val MAX_EXTRA_COUNT = 20
     private const val MAX_EXTRA_CHARS = 2048
+    private const val MAX_EXTRA_VALUES = 50
 
     /**
      * Raw (non-recipe) intents are default-closed: only these actions are
@@ -1187,6 +1190,11 @@ object IntentCapabilities {
                 is ExtraValue.Text -> intent.putExtra(key, value.value)
                 is ExtraValue.Flag -> intent.putExtra(key, value.value)
                 is ExtraValue.Number -> intent.putExtra(key, value.value)
+                is ExtraValue.Decimal -> intent.putExtra(key, value.value)
+                is ExtraValue.TextList -> intent.putStringArrayListExtra(
+                    key,
+                    ArrayList(value.values),
+                )
             }
         }
         return intent
@@ -1450,13 +1458,29 @@ object IntentCapabilities {
             for ((key, value) in extras) {
                 if (key.length > 120) return RawValidation.Invalid("extra key is too long")
                 when (value) {
+                    is JsonArray -> {
+                        if (value.size > MAX_EXTRA_VALUES) {
+                            return RawValidation.Invalid("extra $key has too many values")
+                        }
+                        for (item in value) {
+                            val primitive = item as? JsonPrimitive
+                            if (primitive == null || !primitive.isString) {
+                                return RawValidation.Invalid(
+                                    "extra $key entries must be strings",
+                                )
+                            }
+                            if (primitive.content.length > MAX_EXTRA_CHARS) {
+                                return RawValidation.Invalid("extra $key entry is too large")
+                            }
+                        }
+                    }
                     is JsonPrimitive -> {
                         if (value.isString && value.content.length > MAX_EXTRA_CHARS) {
                             return RawValidation.Invalid("extra $key is too large")
                         }
                     }
                     else -> return RawValidation.Invalid(
-                        "extra $key must be a string, boolean, or number",
+                        "extra $key must be a string, boolean, number, or string array",
                     )
                 }
             }
@@ -1477,15 +1501,23 @@ object IntentCapabilities {
 
         val extraValues = mutableMapOf<String, ExtraValue>()
         extras?.forEach { (key, value) ->
-            val primitive = value as? JsonPrimitive ?: return@forEach
-            extraValues[key] = when {
-                primitive.isString -> ExtraValue.Text(primitive.content)
-                primitive.content.equals("true", true) -> ExtraValue.Flag(true)
-                primitive.content.equals("false", true) -> ExtraValue.Flag(false)
-                primitive.content.toLongOrNull() != null -> ExtraValue.Number(
-                    primitive.content.toLong(),
+            extraValues[key] = when (value) {
+                is JsonArray -> ExtraValue.TextList(
+                    value.mapNotNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content },
                 )
-                else -> ExtraValue.Text(primitive.content)
+                is JsonPrimitive -> when {
+                    value.isString -> ExtraValue.Text(value.content)
+                    value.content.equals("true", true) -> ExtraValue.Flag(true)
+                    value.content.equals("false", true) -> ExtraValue.Flag(false)
+                    value.content.toLongOrNull() != null -> ExtraValue.Number(
+                        value.content.toLong(),
+                    )
+                    value.content.toDoubleOrNull() != null -> ExtraValue.Decimal(
+                        value.content.toDouble(),
+                    )
+                    else -> ExtraValue.Text(value.content)
+                }
+                else -> ExtraValue.Text(value.toString())
             }
         }
 
@@ -1619,9 +1651,24 @@ object IntentCapabilities {
         val out = mutableMapOf<String, ExtraValue>()
         for (mapping in mappings) {
             val text = values[mapping.param]?.jsonPrimitiveContent().orEmpty()
-            if (text.isNotEmpty()) out[mapping.key] = ExtraValue.Text(text)
+            if (text.isEmpty()) continue
+            val extra = if (mapping.key == MediaStore.EXTRA_MEDIA_FOCUS) {
+                mediaFocus(text)
+            } else {
+                text
+            }
+            out[mapping.key] = ExtraValue.Text(extra)
         }
         return out
+    }
+
+    /** EXTRA_MEDIA_FOCUS takes a MediaStore content type, not a plain word. */
+    private fun mediaFocus(value: String): String = when (value.lowercase()) {
+        "music" -> "vnd.android.cursor.dir/audio"
+        "artist" -> "vnd.android.cursor.dir/artist"
+        "album" -> "vnd.android.cursor.dir/album"
+        "playlist" -> "vnd.android.cursor.dir/playlist"
+        else -> value
     }
 
     private fun planType(recipe: IntentRecipe): String? = when (recipe.plan) {
