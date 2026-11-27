@@ -36,6 +36,7 @@ data class UiState(
     val deviceName: String = "Android",
     val deviceId: String = "",
     val nodeEnabled: Boolean = true,
+    val preferNodeTools: Boolean = true,
     val nodeFolderName: String = "",
     val voiceBackend: String = "android",
     val voiceListening: Boolean = false,
@@ -184,6 +185,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                                 sessionId = snapshot.sessionId,
                                 agent = snapshot.agent,
                                 nodeId = snapshot.deviceId,
+                                preferNodeTools = snapshot.preferNodeTools,
                             ),
                         )
                     }
@@ -210,6 +212,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     deviceName = saved.deviceName,
                     deviceId = runCatching { store.ensureDeviceId() }.getOrDefault(""),
                     nodeEnabled = saved.nodeEnabled,
+                    preferNodeTools = saved.preferNodeTools,
                     nodeFolderName = saved.nodeFolderName,
                     voiceBackend = saved.voiceBackend,
                     mtlsEnabled = saved.mtlsEnabled,
@@ -441,6 +444,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             NodeService.start(getApplication())
         } else {
             NodeService.stop(getApplication())
+        }
+    }
+
+    /**
+     * When on, matching requests default to this phone's tools. When off, the
+     * agent asks which device to use when the host offers the same action.
+     * The preference travels in the chat socket handshake, so reopen it for
+     * the next turn once the user is not mid-turn.
+     */
+    fun setPreferNodeTools(enabled: Boolean) {
+        _ui.update { it.copy(preferNodeTools = enabled) }
+        viewModelScope.launch {
+            store.savePreferNodeTools(enabled)
+            if (!_ui.value.busy && _ui.value.connected) reconnectSocket()
         }
     }
 
@@ -993,6 +1010,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     sessionId = sessionId,
                     agent = agentAlias,
                     nodeId = _ui.value.deviceId,
+                    preferNodeTools = _ui.value.preferNodeTools,
                 ),
             )
         }
@@ -1008,6 +1026,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 sessionId = snapshot.sessionId,
                 agent = snapshot.agent,
                 nodeId = snapshot.deviceId,
+                preferNodeTools = snapshot.preferNodeTools,
             ),
         )
     }

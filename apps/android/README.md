@@ -303,6 +303,11 @@ Notes:
 - The node id is a stable `android-xxxxxxxx` value stored with the pairing. It
   appears in tool names, which is why the gateway sanitizes them to
   `[a-zA-Z0-9_-]` (OpenAI-compatible providers reject `:` and `.`).
+- **Prefer this phone's tools** is on by default in Settings. The chat socket
+  sends the choice as `X-ZeroClaw-Prefer-Node-Tools`; when on, node tool
+  descriptions say this phone is the default for matching actions unless the
+  user names the server, host, cron or another device. When off, they tell the
+  model to ask which device the user means before calling either.
 - If no app handles the intent, the tool returns an error instead of failing
   silently.
 

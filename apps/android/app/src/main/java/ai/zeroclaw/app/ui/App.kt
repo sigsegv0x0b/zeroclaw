@@ -50,6 +50,7 @@ fun ZeroClawRoot(viewModel: AppViewModel = viewModel()) {
                     onReconnect = viewModel::reconnect,
                     onForget = viewModel::forgetGateway,
                     onNodeEnabled = viewModel::setNodeEnabled,
+                    onPreferNodeTools = viewModel::setPreferNodeTools,
                     onFolderPicked = viewModel::saveNodeFolder,
                     onVoiceBackend = viewModel::setVoiceBackend,
                     onMtlsEnabled = viewModel::setMtlsEnabled,

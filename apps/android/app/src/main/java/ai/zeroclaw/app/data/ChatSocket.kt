@@ -48,6 +48,11 @@ class ChatSocket(
         val agent: String,
         /** Local node id; scopes the gateway's phone tools to this device. */
         val nodeId: String = "",
+        /**
+         * Prefer this phone's tools over equivalent host tools. When false,
+         * the agent asks which device the user means.
+         */
+        val preferNodeTools: Boolean = true,
     )
 
     private val _events = MutableSharedFlow<ChatEvent>(extraBufferCapacity = 512)
@@ -130,6 +135,10 @@ class ChatSocket(
                 if (cfg.nodeId.isNotBlank()) {
                     header("X-ZeroClaw-Node-Id", cfg.nodeId)
                 }
+                header(
+                    "X-ZeroClaw-Prefer-Node-Tools",
+                    if (cfg.preferNodeTools) "true" else "false",
+                )
             }
             .build()
         _state.value = if (attempt == 0) SocketState.Connecting else SocketState.Reconnecting(attempt)

@@ -75,6 +75,7 @@ fun SettingsScreen(
     onReconnect: (url: String, token: String) -> Unit,
     onForget: () -> Unit,
     onNodeEnabled: (Boolean) -> Unit,
+    onPreferNodeTools: (Boolean) -> Unit,
     onFolderPicked: (android.net.Uri?) -> Unit,
     onVoiceBackend: (String) -> Unit,
     onMtlsEnabled: (Boolean) -> Unit,
@@ -432,6 +433,43 @@ fun SettingsScreen(
             }
             if (state.deviceId.isNotBlank()) {
                 InfoRow("Node id", state.deviceId)
+            }
+
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        text = "Prefer this phone's tools",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Zc.Text,
+                    )
+                    Text(
+                        text = if (state.preferNodeTools) {
+                            "Matching requests use this phone unless you say server, host or cron. " +
+                                "Off: the agent asks which device when both offer the action."
+                        } else {
+                            "The agent asks which device to use when this phone and the host both " +
+                                "offer the same action."
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Zc.TextSubtle,
+                    )
+                }
+                Switch(
+                    checked = state.preferNodeTools,
+                    onCheckedChange = onPreferNodeTools,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = Color(0xFF00242B),
+                        checkedTrackColor = Zc.Accent,
+                        uncheckedThumbColor = Zc.TextSubtle,
+                        uncheckedTrackColor = Zc.SurfaceRaised,
+                        uncheckedBorderColor = Zc.BorderStrong,
+                    ),
+                )
             }
 
             Spacer(Modifier.height(6.dp))
