@@ -404,6 +404,14 @@ pass through the agent's tool policy and the caller's allowlist, and tool
 approvals reach the paired client over the chat socket's `approval_request`
 frame.
 
+When the app is not visible, an `approval_request` also posts a
+HIGH-importance local notification with the tool name and argument summary.
+Tapping it returns to the approval dialog, and answering or opening the app
+clears it; the notification expires with the gateway's approval window. This
+is a local notification, not a remote push: it only works while Android keeps
+the app process and its chat socket alive. If the process is gone, the
+gateway's window expires and the call is denied.
+
 A registration is keyed by the paired-token hash that authenticated
 `/ws/nodes`, not by the self-declared node id alone. A second token cannot
 overwrite another phone's node id, a stale socket cannot unregister the

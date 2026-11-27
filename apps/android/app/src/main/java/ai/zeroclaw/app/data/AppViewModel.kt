@@ -115,6 +115,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val androidVoice = AndroidVoiceInput(app)
     private val gatewayVoice = GatewayVoiceInput(app) { currentTransport }
     @Volatile private var currentTransport: okhttp3.OkHttpClient = MtlsTransport.plainClient()
+    @Volatile private var appVisible = false
     private var pendingProbe: MtlsEnrollment.Probe? = null
     private var pendingMtlsPort: Int = 42618
     private var pendingInsecure: PendingConnection? = null
@@ -643,6 +644,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * the new material before the chat or node clients use the old one.
      */
     fun onForeground() {
+        appVisible = true
+        // The dialog is back in front of the operator; the notification is
+        // redundant and would linger after they answer.
+        ApprovalNotifications.cancel(getApplication(), _ui.value.approval?.requestId)
         viewModelScope.launch {
             if (_ui.value.booting || !_ui.value.paired) return@launch
             // The chat socket and the device-node link are separate. A
@@ -655,6 +660,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             maybeRenewBeforeConnect()
         }
+    }
+
+    fun onBackground() {
+        appVisible = false
     }
 
     /**
@@ -1259,6 +1268,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         socket.sendApproval(prompt.requestId, decision)
         _ui.update { it.copy(approval = null) }
+        ApprovalNotifications.cancel(getApplication(), prompt.requestId)
         if (always) persistToolApproval(prompt.tool)
     }
 
@@ -1365,15 +1375,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 updateAssistant { it.copy(streaming = false) }
                 _ui.update { it.copy(busy = false, notice = "Turn stopped.", elicitation = null) }
             }
-            is ChatEvent.ApprovalRequest -> _ui.update {
-                it.copy(
-                    approval = ApprovalPrompt(
-                        requestId = event.requestId,
-                        tool = event.tool,
-                        argumentsSummary = event.argumentsSummary,
-                        timeoutSecs = event.timeoutSecs,
-                    ),
+            is ChatEvent.ApprovalRequest -> {
+                val prompt = ApprovalPrompt(
+                    requestId = event.requestId,
+                    tool = event.tool,
+                    argumentsSummary = event.argumentsSummary,
+                    timeoutSecs = event.timeoutSecs,
                 )
+                _ui.update { it.copy(approval = prompt) }
+                if (!appVisible) ApprovalNotifications.show(getApplication(), prompt)
             }
             is ChatEvent.ElicitationRequest -> _ui.update {
                 it.copy(elicitation = event.prompt)
