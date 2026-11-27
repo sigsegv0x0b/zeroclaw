@@ -180,6 +180,9 @@ pub async fn handle_revoke(
                 .into_response();
         }
     };
+    for device in &outcome.released {
+        state.node_registry.revoke_owner(&device.token_hash);
+    }
     if !outcome.released.is_empty()
         && let Err(error) = crate::persist_pairing_tokens_under(&state, commit).await
     {

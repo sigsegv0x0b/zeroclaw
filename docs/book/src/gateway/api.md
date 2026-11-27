@@ -76,6 +76,31 @@ of actions with uncertain outcomes. Markers are also bounded and held in
 memory, so this configuration does not guarantee exactly-once processing or
 survival across restarts. Rate limits do not cap concurrent turns.
 
+## Node inventory
+
+`GET /api/nodes` (paired bearer or an administrator dashboard session) returns
+the paired-device registry joined to the live `/ws/nodes` registry. Each entry
+has `paired`, `connected`, the paired device id, the live node id, whether it
+came from the pairing registry, and `tools` with the provider-safe tool name,
+capability, description and parameter schema. A paired phone that is offline is
+listed as `connected: false`; a live node with no paired row is still listed as
+`paired: false`.
+
+On the gateway host, the same inventory is available to the CLI:
+
+```sh
+zeroclaw nodes list
+zeroclaw nodes list --json
+zeroclaw nodes show dev-1a2b3c4d
+zeroclaw nodes revoke dev-1a2b3c4d
+```
+
+The CLI calls the loopback-only `GET /admin/nodes` and
+`POST /admin/nodes/revoke` routes with the gateway admin token. Revocation
+removes the token, device row, mTLS certificates, `paired_tokens` entry and the
+live node socket. `revoke` accepts a paired device id, a live node id, or the
+token hash.
+
 ## Channel-plugin webhook ingress
 
 Builds with WASM plugin support expose `GET` and `POST /plugin/{path}` when a running,

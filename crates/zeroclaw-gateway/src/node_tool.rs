@@ -408,6 +408,7 @@ mod tests {
             invoke_tx,
             owner: "owner".to_string(),
             generation: 0,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
 
         let source = NodeToolSource::new(Arc::clone(&registry));
@@ -435,6 +436,7 @@ mod tests {
                 invoke_tx,
                 owner: format!("owner-{node_id}"),
                 generation: 0,
+                shutdown: tokio_util::sync::CancellationToken::new(),
             });
         }
 
@@ -522,6 +524,7 @@ mod tests {
             invoke_tx,
             owner: "owner".to_string(),
             generation: 0,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
 
         let tool = NodeTool::new(
