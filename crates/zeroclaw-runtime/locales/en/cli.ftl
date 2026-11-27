@@ -1834,3 +1834,22 @@ cli-mtls-close-failed = Closing enrollment failed: {$error}
 cli-mtls-close-refused = gateway refused to close the enrollment window
 cli-mtls-open-failed = Failed to open enrollment window: {$error}
 cli-mtls-open-refused = gateway refused the enrollment window
+
+# ── Node inventory ──
+cli-nodes-list-header = DEVICE        NODE               TYPE      CONNECTED TOOLS  NAME
+cli-nodes-list-empty = No paired devices or connected nodes.
+cli-nodes-request-failed = Could not reach the gateway: {$error}
+cli-nodes-gateway-refused = The gateway refused the request (HTTP {$status}).
+cli-nodes-yes = yes
+cli-nodes-no = no
+cli-nodes-not-found = No paired device or connected node matches '{$id}'.
+cli-nodes-detail-device = Device:    {$value}
+cli-nodes-detail-node = Node:      {$value}
+cli-nodes-detail-name = Name:      {$value}
+cli-nodes-detail-type = Type:      {$value}
+cli-nodes-detail-paired = Paired:    {$value}
+cli-nodes-detail-connected = Connected: {$value}
+cli-nodes-detail-last-seen = Last seen: {$value}
+cli-nodes-detail-tools = Tools ({$count}):
+cli-nodes-detail-tool-line = {$name}  ({$capability}) — {$description}
+cli-nodes-revoked = Revoked node '{$id}' and its live connections.

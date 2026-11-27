@@ -1166,6 +1166,29 @@ enum MtlsCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum NodesCommands {
+    /// List paired devices and currently connected nodes with their tools
+    List {
+        /// Emit JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one paired device or live node, including the tools it offers
+    Show {
+        /// Paired device id (dev-…), live node id (android-…), or token hash
+        id: String,
+        /// Emit JSON instead of a human-readable detail view
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke a paired node, its token, certificates and live connections
+    Revoke {
+        /// Paired device id (dev-…), live node id (android-…), or token hash
+        id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum Commands {
     /// Quickstart — create one working agent end-to-end. Replaces the
     /// section-by-section onboarding flow with a single preset-driven
@@ -1330,6 +1353,12 @@ Examples:
     Mtls {
         #[command(subcommand)]
         command: MtlsCommands,
+    },
+
+    /// List, inspect and revoke paired devices and connected nodes
+    Nodes {
+        #[command(subcommand)]
+        command: NodesCommands,
     },
 
     /// Start ACP (Agent Control Protocol) server over stdio
@@ -8661,6 +8690,256 @@ async fn wait_for_pairing(config: &Config, timeout_secs: u64) -> Result<()> {
     }
 }
 
+/// Call an admin node endpoint and decode its JSON body, reporting the
+/// gateway's own error text instead of a bare HTTP status.
+#[cfg(feature = "agent-runtime")]
+async fn nodes_admin_request(
+    config: &Config,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let admin_token = gateway_admin_token(config)?;
+    let url = gateway_admin_url(
+        admin_gateway_host(&config.gateway.host),
+        config.gateway.port,
+        config.gateway.path_prefix.as_deref(),
+        path,
+    );
+    let mut request = reqwest::Client::new()
+        .request(method, &url)
+        .header(
+            zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+            &admin_token,
+        )
+        .timeout(std::time::Duration::from_secs(5));
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.map_err(|error| {
+        anyhow::Error::msg(ta(
+            "cli-nodes-request-failed",
+            &[("error", &error.to_string())],
+            "Could not reach the gateway: {$error}",
+        ))
+    })?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    if !status.is_success() {
+        let message = body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                ta(
+                    "cli-nodes-gateway-refused",
+                    &[("status", &status.to_string())],
+                    "The gateway refused the request (HTTP {$status}).",
+                )
+            });
+        anyhow::bail!("{message}");
+    }
+    Ok(body)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn nodes_matches_id(node: &serde_json::Value, id: &str) -> bool {
+    ["id", "node_id"].iter().any(|key| {
+        node.get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case(id))
+    })
+}
+
+#[cfg(feature = "agent-runtime")]
+fn nodes_yes_no(value: bool) -> String {
+    if value {
+        t("cli-nodes-yes", "yes")
+    } else {
+        t("cli-nodes-no", "no")
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn run_nodes_command(config: &Config, command: NodesCommands) -> Result<()> {
+    match command {
+        NodesCommands::List { json } => {
+            let value =
+                nodes_admin_request(config, reqwest::Method::GET, "/admin/nodes", None).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok(());
+            }
+            let nodes = value
+                .get("nodes")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if nodes.is_empty() {
+                println!(
+                    "{}",
+                    t(
+                        "cli-nodes-list-empty",
+                        "No paired devices or connected nodes."
+                    )
+                );
+                return Ok(());
+            }
+            println!(
+                "{}",
+                t(
+                    "cli-nodes-list-header",
+                    "DEVICE        NODE               TYPE      CONNECTED TOOLS  NAME"
+                )
+            );
+            for node in nodes {
+                let device = node["id"].as_str().unwrap_or("-");
+                let node_id = node["node_id"].as_str().unwrap_or("-");
+                let kind = node["device_type"].as_str().unwrap_or("-");
+                let name = node["name"].as_str().unwrap_or("-");
+                let connected = node["connected"].as_bool().unwrap_or(false);
+                let tools = node["tools"].as_array().map_or(0, std::vec::Vec::len);
+                println!(
+                    "{device:<13} {node_id:<18} {kind:<9} {:<9} {tools:>5}  {name}",
+                    nodes_yes_no(connected)
+                );
+            }
+            Ok(())
+        }
+        NodesCommands::Show { id, json } => {
+            let value =
+                nodes_admin_request(config, reqwest::Method::GET, "/admin/nodes", None).await?;
+            let node = value
+                .get("nodes")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|nodes| nodes.iter().find(|node| nodes_matches_id(node, &id)))
+                .cloned();
+            let Some(node) = node else {
+                anyhow::bail!(ta(
+                    "cli-nodes-not-found",
+                    &[("id", &id)],
+                    "No paired device or connected node matches '{$id}'."
+                ));
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&node)?);
+                return Ok(());
+            }
+            let field = |key: &str| node[key].as_str().unwrap_or("-");
+            println!(
+                "{}",
+                ta(
+                    "cli-nodes-detail-device",
+                    &[("value", field("id"))],
+                    "Device:    {$value}"
+                )
+            );
+            println!(
+                "{}",
+                ta(
+                    "cli-nodes-detail-node",
+                    &[("value", field("node_id"))],
+                    "Node:      {$value}"
+                )
+            );
+            println!(
+                "{}",
+                ta(
+                    "cli-nodes-detail-name",
+                    &[("value", field("name"))],
+                    "Name:      {$value}"
+                )
+            );
+            println!(
+                "{}",
+                ta(
+                    "cli-nodes-detail-type",
+                    &[("value", field("device_type"))],
+                    "Type:      {$value}"
+                )
+            );
+            println!(
+                "{}",
+                ta(
+                    "cli-nodes-detail-paired",
+                    &[(
+                        "value",
+                        &nodes_yes_no(node["paired"].as_bool().unwrap_or(false))
+                    )],
+                    "Paired:    {$value}"
+                )
+            );
+            println!(
+                "{}",
+                ta(
+                    "cli-nodes-detail-connected",
+                    &[(
+                        "value",
+                        &nodes_yes_no(node["connected"].as_bool().unwrap_or(false))
+                    )],
+                    "Connected: {$value}"
+                )
+            );
+            if let Some(last_seen) = node["last_seen"].as_str() {
+                println!(
+                    "{}",
+                    ta(
+                        "cli-nodes-detail-last-seen",
+                        &[("value", last_seen)],
+                        "Last seen: {$value}"
+                    )
+                );
+            }
+            let tools = node["tools"].as_array().cloned().unwrap_or_default();
+            println!(
+                "{}",
+                ta(
+                    "cli-nodes-detail-tools",
+                    &[("count", &tools.len().to_string())],
+                    "Tools ({$count}):"
+                )
+            );
+            for tool in tools {
+                let name = tool["name"].as_str().unwrap_or("-");
+                let capability = tool["capability"].as_str().unwrap_or("-");
+                let description = tool["description"].as_str().unwrap_or("");
+                println!(
+                    "  {}",
+                    ta(
+                        "cli-nodes-detail-tool-line",
+                        &[
+                            ("name", name),
+                            ("capability", capability),
+                            ("description", description),
+                        ],
+                        "{$name}  ({$capability}) — {$description}"
+                    )
+                );
+            }
+            Ok(())
+        }
+        NodesCommands::Revoke { id } => {
+            let value = nodes_admin_request(
+                config,
+                reqwest::Method::POST,
+                "/admin/nodes/revoke",
+                Some(serde_json::json!({ "selector": id })),
+            )
+            .await?;
+            let revoked = value["revoked"].as_str().unwrap_or(&id);
+            println!(
+                "{}",
+                ta(
+                    "cli-nodes-revoked",
+                    &[("id", revoked)],
+                    "Revoked node '{$id}' and its live connections."
+                )
+            );
+            Ok(())
+        }
+    }
+}
+
 #[cfg(feature = "agent-runtime")]
 async fn run_mtls_command(config: &Config, command: MtlsCommands) -> Result<()> {
     let mtls = config.gateway.mtls.clone().unwrap_or_default();
@@ -11005,6 +11284,8 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         } => run_pair_command(&config, host, qr, pair_timeout, enroll_port).await,
 
         Commands::Mtls { command } => run_mtls_command(&config, command).await,
+
+        Commands::Nodes { command } => run_nodes_command(&config, command).await,
 
         Commands::Gateway { gateway_command } => {
             if !cfg!(feature = "gateway") {
@@ -19500,6 +19781,39 @@ mod tests {
     }
 
     #[test]
+    fn nodes_cli_parses_list_show_and_revoke() {
+        let list = Cli::try_parse_from(["zeroclaw", "nodes", "list", "--json"])
+            .expect("nodes list parses");
+        match list.command {
+            Commands::Nodes {
+                command: NodesCommands::List { json },
+            } => assert!(json),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let show = Cli::try_parse_from(["zeroclaw", "nodes", "show", "dev-test"])
+            .expect("nodes show parses");
+        match show.command {
+            Commands::Nodes {
+                command: NodesCommands::Show { id, json },
+            } => {
+                assert_eq!(id, "dev-test");
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let revoke = Cli::try_parse_from(["zeroclaw", "nodes", "revoke", "android-test"])
+            .expect("nodes revoke parses");
+        match revoke.command {
+            Commands::Nodes {
+                command: NodesCommands::Revoke { id },
+            } => assert_eq!(id, "android-test"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     #[cfg(feature = "agent-runtime")]
     fn gateway_admin_url_uses_unprefixed_admin_path_by_default() {
         assert_eq!(
@@ -19705,6 +20019,7 @@ mod tests {
             "dev_under_test",
             Some(out.path().to_path_buf()),
             false,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -19761,6 +20076,7 @@ mod tests {
             "dev_dropin_test",
             Some(out.path().to_path_buf()),
             true,
+            None,
         )
         .expect_err("an incomplete drop-in directory must fail the command")
         .to_string();
@@ -19801,6 +20117,7 @@ mod tests {
             "dev_under_test",
             Some(out.path().to_path_buf()),
             true,
+            None,
         )
         .expect_err("an unpublishable certificate must fail the command")
         .to_string();
@@ -19866,6 +20183,7 @@ mod tests {
             "dev_under_test",
             Some(out.path().to_path_buf()),
             true,
+            None,
         )
         .expect("the retry must publish");
 
