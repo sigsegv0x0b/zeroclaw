@@ -93,6 +93,10 @@ pub(crate) struct ConnectParams {
 /// The sub-protocol we support for the chat WebSocket.
 pub(crate) const WS_PROTOCOL: &str = "zeroclaw.v1";
 
+/// Android app preference: `true` means matching actions should default to the
+/// phone; `false` means ask the user when the host also offers the action.
+const PREFER_NODE_TOOLS_HEADER: &str = "x-zeroclaw-prefer-node-tools";
+
 #[derive(Deserialize)]
 pub struct WsQuery {
     pub token: Option<String>,
@@ -121,6 +125,21 @@ pub(crate) fn extract_ws_token<'a>(
     crate::token_auth::websocket_bearer_token(headers, query_token)
 }
 
+/// The app's phone-tool preference. Absent means on; explicit false/0/off/no
+/// turns it off.
+fn prefer_node_tools(headers: &HeaderMap) -> bool {
+    headers
+        .get(PREFER_NODE_TOOLS_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "false" | "0" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
 /// GET /ws/chat — WebSocket upgrade for agent chat
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
@@ -137,6 +156,7 @@ pub async fn handle_ws_chat(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .or_else(|| params.node_id.clone());
+    let prefer_node_tools = prefer_node_tools(&headers);
 
     // A scoped dashboard session chats through the core, as its own
     // principal, whenever this gateway runs inside the daemon: the core
@@ -253,6 +273,7 @@ pub async fn handle_ws_chat(
         approval_subject: auth_subject,
         session: session_watch,
         node_id: chat_node,
+        prefer_node_tools,
     };
     ws.on_upgrade(move |socket| {
         handle_socket(
@@ -582,6 +603,8 @@ struct SocketCaller {
     session: Option<crate::dashboard_session::SessionWatch>,
     /// Node id of the phone that opened this chat, when the client sent one.
     node_id: Option<String>,
+    /// The app's preference for phone tools over equivalent host tools.
+    prefer_node_tools: bool,
 }
 
 async fn handle_socket(
@@ -597,6 +620,7 @@ async fn handle_socket(
         approval_subject: auth_subject,
         session: mut session_watch,
         node_id,
+        prefer_node_tools,
     } = caller;
     let (mut sender, mut receiver) = socket.split();
     // An upgraded socket outlives the listener it arrived on, so a reload or
@@ -818,15 +842,22 @@ async fn handle_socket(
     // a chat that names no node gets none either instead of every phone.
     let node_owner = auth_subject.clone();
     let node_source = match (node_id, node_owner) {
-        (Some(node_id), Some(owner)) => crate::node_tool::NodeToolSource::for_owned_node(
-            state.node_registry.clone(),
-            node_id,
-            owner,
-        ),
+        (Some(node_id), Some(owner)) => {
+            crate::node_tool::NodeToolSource::for_owned_node_with_preference(
+                state.node_registry.clone(),
+                node_id,
+                owner,
+                prefer_node_tools,
+            )
+        }
         // Pairing disabled means the gateway already trusts every caller; keep
         // the node-id scoping available there.
         (Some(node_id), None) if !state.pairing.require_pairing() => {
-            crate::node_tool::NodeToolSource::for_node(state.node_registry.clone(), node_id)
+            crate::node_tool::NodeToolSource::for_node_with_preference(
+                state.node_registry.clone(),
+                node_id,
+                prefer_node_tools,
+            )
         }
         _ => crate::node_tool::NodeToolSource::none(state.node_registry.clone()),
     };
@@ -3118,6 +3149,16 @@ mod tests {
         routing::{get, post},
     };
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+    #[test]
+    fn node_tool_preference_defaults_on_and_parses_off() {
+        assert!(prefer_node_tools(&HeaderMap::new()));
+        let mut headers = HeaderMap::new();
+        headers.insert(PREFER_NODE_TOOLS_HEADER, "false".parse().unwrap());
+        assert!(!prefer_node_tools(&headers));
+        headers.insert(PREFER_NODE_TOOLS_HEADER, "true".parse().unwrap());
+        assert!(prefer_node_tools(&headers));
+    }
 
     #[test]
     fn ws_terminal_failure_uses_localized_message_without_reclassifying_diagnostic() {

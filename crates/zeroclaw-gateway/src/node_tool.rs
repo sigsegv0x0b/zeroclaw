@@ -116,6 +116,9 @@ pub struct NodeToolSource {
     node_id: Option<String>,
     owner: Option<String>,
     enabled: bool,
+    /// When true, matching actions default to this phone. When false, the
+    /// model is told to ask which device the user means.
+    prefer_node_tools: bool,
 }
 
 impl NodeToolSource {
@@ -125,6 +128,7 @@ impl NodeToolSource {
             node_id: None,
             owner: None,
             enabled: true,
+            prefer_node_tools: true,
         }
     }
 
@@ -132,11 +136,20 @@ impl NodeToolSource {
     /// node is disconnected the user gets no phone tools rather than another
     /// connected node silently answering in its place.
     pub fn for_node(registry: Arc<NodeRegistry>, node_id: String) -> Self {
+        Self::for_node_with_preference(registry, node_id, true)
+    }
+
+    pub fn for_node_with_preference(
+        registry: Arc<NodeRegistry>,
+        node_id: String,
+        prefer_node_tools: bool,
+    ) -> Self {
         Self {
             registry,
             node_id: Some(node_id),
             owner: None,
             enabled: true,
+            prefer_node_tools,
         }
     }
 
@@ -144,11 +157,21 @@ impl NodeToolSource {
     /// A chat turn authenticated by a paired token can only reach the phone
     /// that registered under that same token.
     pub fn for_owned_node(registry: Arc<NodeRegistry>, node_id: String, owner: String) -> Self {
+        Self::for_owned_node_with_preference(registry, node_id, owner, true)
+    }
+
+    pub fn for_owned_node_with_preference(
+        registry: Arc<NodeRegistry>,
+        node_id: String,
+        owner: String,
+        prefer_node_tools: bool,
+    ) -> Self {
         Self {
             registry,
             node_id: Some(node_id),
             owner: Some(owner),
             enabled: true,
+            prefer_node_tools,
         }
     }
 
@@ -160,6 +183,15 @@ impl NodeToolSource {
             node_id: None,
             owner: None,
             enabled: false,
+            prefer_node_tools: true,
+        }
+    }
+
+    fn preference_note(&self) -> &'static str {
+        if self.prefer_node_tools {
+            " Preference: this phone is the default for actions that could run on either the phone or the host. Use a host or server tool when the user explicitly names the server, host, cron, or another device."
+        } else {
+            " Preference: if this action could run on either this phone or the host, ask the user which one they mean before calling either."
         }
     }
 
@@ -173,10 +205,11 @@ impl NodeToolSource {
             .capabilities_for(self.node_id.as_deref(), self.owner.as_deref())
             .into_iter()
             .map(|(node_id, capability_name, capability)| {
+                let description = format!("{}{}", capability.description, self.preference_note());
                 Box::new(NodeTool::new(
                     node_id,
                     capability_name,
-                    capability.description,
+                    description,
                     capability.parameters,
                     Arc::clone(&self.registry),
                 )) as Box<dyn Tool>
@@ -415,7 +448,15 @@ mod tests {
         let tools = source.collect();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name(), "node_android-1a2b3c4d__alarm_set");
-        assert_eq!(tools[0].description(), "Set an alarm on the phone");
+        assert!(
+            tools[0]
+                .description()
+                .starts_with("Set an alarm on the phone")
+        );
+        assert!(
+            tools[0].description().contains("this phone is the default"),
+            "the default preference must be visible to the model"
+        );
 
         let empty = NodeToolSource::new(Arc::new(NodeRegistry::new(10)));
         assert!(empty.collect().is_empty());
@@ -474,6 +515,40 @@ mod tests {
 
         let all = NodeToolSource::new(Arc::clone(&registry));
         assert_eq!(all.collect().len(), 2);
+    }
+
+    #[test]
+    fn preference_off_tells_the_model_to_ask() {
+        let registry = Arc::new(NodeRegistry::new(10));
+        let (invoke_tx, _invoke_rx) = tokio::sync::mpsc::channel(32);
+        registry.register(NodeInfo {
+            node_id: "android-origin".to_string(),
+            capabilities: vec![NodeCapability {
+                name: "alarm.set".to_string(),
+                description: "Set an alarm on the phone".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }],
+            invoke_tx,
+            owner: "owner".to_string(),
+            generation: 0,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+
+        let source = NodeToolSource::for_owned_node_with_preference(
+            Arc::clone(&registry),
+            "android-origin".to_string(),
+            "owner".to_string(),
+            false,
+        );
+        let tools = source.collect();
+        assert_eq!(tools.len(), 1);
+        assert!(
+            tools[0]
+                .description()
+                .contains("ask the user which one they mean"),
+            "preference off must tell the model to ask instead of assuming the phone"
+        );
+        assert!(!tools[0].description().contains("this phone is the default"));
     }
 
     #[test]
