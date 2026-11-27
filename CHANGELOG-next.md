@@ -118,7 +118,8 @@ Plus the dashboard through ZeroRelay, a CLI-only server build, and tighter isola
   - mTLS enrollment tokens are bound to the certificate issued with them, so a token is refused without that device's client certificate, and revoking the certificate revokes the token;
   - enrollment, renewal and revocation append to the daemon's certificate audit chain, and a timed enrollment window's code expires with the window even if issuance was still in flight;
   - phone node registrations are keyed by the paired-token hash that authenticated them, so another token cannot overwrite a node id or receive its tools, a stale socket cannot unregister its replacement, and registration frames are bounded;
-  - rotating all credentials revokes every mTLS certificate and its live connection, not only the token set and device registry.
+  - rotating all credentials revokes every mTLS certificate and its live connection, not only the token set and device registry;
+  - `GET /api/nodes` joins paired devices to live nodes, and `zeroclaw nodes list`, `show` and `revoke` expose the same inventory from the gateway host; revocation also closes the live node socket.
 - **Android:** the mTLS client key and the bearer token stay in the Android Keystore; imported PEM keys are sealed at rest and imported into the Keystore when the platform accepts them; backups exclude the app's settings; accessibility automation refuses system settings, permission prompts and ZeroClaw's own screens.
 - **Command scanning:**
   - POSIX commands are split at substitution and subshell boundaries (#11822);

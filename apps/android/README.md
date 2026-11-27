@@ -326,6 +326,19 @@ connection that replaced it, and a chat turn only receives tools from the node
 registered under the same token it authenticated with. A chat that names no
 node gets no phone tools.
 
+On the gateway host, the paired-device and live-node inventory is one command:
+
+```sh
+zeroclaw nodes list            # paired, connected, tool count
+zeroclaw nodes list --json
+zeroclaw nodes show dev-1a2b3c4d
+zeroclaw nodes revoke dev-1a2b3c4d   # also accepts the live android-… id
+```
+
+`list` joins `/api/devices` with the live `/ws/nodes` registry. `show` prints
+the node's tools and parameters; `revoke` removes the token, device row, mTLS
+certificates, `paired_tokens` entry and live node socket.
+
 ## Wire contract used
 
 | Purpose | Call |
@@ -338,6 +351,7 @@ node gets no phone tools.
 | Stop a turn | `POST /api/sessions/{id}/abort` |
 | Chat stream | `WS /ws/chat?session_id=…&agent=…` |
 | Device node | `WS /ws/nodes` (register + invoke/result, optional `attachments`) |
+| Node inventory | `GET /api/nodes` (paired devices joined to live nodes and tools) |
 | Attachment upload | `POST /api/upload?agent=…&filename=…` raw bytes → `{path, marker, kind, name, size}` |
 | Voice transcription | `POST /api/transcribe` (audio/wav body) → `{text}` |
 
