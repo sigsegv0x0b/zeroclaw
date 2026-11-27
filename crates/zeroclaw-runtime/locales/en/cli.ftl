@@ -1822,3 +1822,4 @@ cli-nodes-detail-last-seen = Last seen: {$value}
 cli-nodes-detail-tools = Tools ({$count}):
 cli-nodes-detail-tool-line = {$name}  ({$capability}) — {$description}
 cli-nodes-revoked = Revoked node '{$id}' and its live connections.
+cli-nodes-gateway-outdated = The running gateway is an older build without the /admin/nodes endpoint. Restart it with this binary (`zeroclaw gateway restart`) and try again.

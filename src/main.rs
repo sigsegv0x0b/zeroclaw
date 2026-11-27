@@ -8725,12 +8725,32 @@ async fn nodes_admin_request(
         ))
     })?;
     let status = response.status();
-    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    let text = response.text().await.unwrap_or_default();
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
     if !status.is_success() {
         let message = body
             .get("error")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
+            .or_else(|| {
+                // A pre-nodes gateway falls through to its dashboard SPA
+                // handler, which answers a plain-text 503 when the dashboard
+                // was never installed. Point at the real fix instead of
+                // echoing a misleading HTTP status.
+                let text = text.trim();
+                if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    && text.contains("Web dashboard not available")
+                {
+                    Some(t(
+                        "cli-nodes-gateway-outdated",
+                        "The running gateway is an older build without the /admin/nodes endpoint. Restart it with this binary (`zeroclaw gateway restart`) and try again.",
+                    ))
+                } else if text.is_empty() {
+                    None
+                } else {
+                    Some(text.chars().take(300).collect())
+                }
+            })
             .unwrap_or_else(|| {
                 ta(
                     "cli-nodes-gateway-refused",
