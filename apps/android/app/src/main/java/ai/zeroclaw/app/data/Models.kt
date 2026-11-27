@@ -203,6 +203,26 @@ sealed interface ChatEvent {
     data class Other(val type: String) : ChatEvent
 }
 
+/** Why a tool call did not run after an approval decision. */
+enum class ToolDenial {
+    /** The operator tapped Deny. */
+    User,
+
+    /** The runtime denied it: timeout, unreachable client, or no channel. */
+    Runtime,
+}
+
+/**
+ * Classify the denial messages the runtime feeds the model. Only these two
+ * shapes mean "approval said no"; ordinary tool errors are not denials.
+ */
+fun toolDenialFromOutput(output: String): ToolDenial? = when {
+    output.startsWith("Denied by user.") -> ToolDenial.User
+    output.startsWith("Tool call not executed:") &&
+        output.contains("no operator decision was available") -> ToolDenial.Runtime
+    else -> null
+}
+
 data class ToolCallCard(
     val id: String,
     val name: String,
@@ -211,7 +231,10 @@ data class ToolCallCard(
     val finished: Boolean = false,
     /** Optional qualifier shown after the tool name, e.g. `[maps.navigate]`. */
     val detail: String? = null,
+    /** Set when the call was refused by an approval decision. */
+    val denial: ToolDenial? = null,
 )
+
 
 /**
  * A short qualifier for a tool card title.
@@ -312,7 +335,30 @@ fun ChatMessage.completeTool(id: String?, name: String?, output: String): ChatMe
         ?: next.indexOfFirst { it is MessageBlock.Tool && !it.card.finished }
     if (target < 0) return this
     val tool = next[target] as MessageBlock.Tool
-    next[target] = MessageBlock.Tool(tool.card.copy(output = output, finished = true))
+    next[target] = MessageBlock.Tool(
+        tool.card.copy(
+            output = output,
+            finished = true,
+            denial = tool.card.denial ?: toolDenialFromOutput(output),
+        ),
+    )
+    return copy(blocks = next, text = "")
+}
+
+/**
+ * Mark the pending card for [name] as denied before the result arrives, so the
+ * transcript reacts to the operator's tap immediately. Falls back to the last
+ * unfinished tool card when the approval frame names a different alias.
+ */
+fun ChatMessage.markToolDenied(name: String): ChatMessage {
+    val next = contentBlocks.toMutableList()
+    val index = next.indexOfLast {
+        it is MessageBlock.Tool && !it.card.finished && it.card.name == name
+    }.takeIf { it >= 0 }
+        ?: next.indexOfLast { it is MessageBlock.Tool && !it.card.finished }
+    if (index < 0) return this
+    val tool = next[index] as MessageBlock.Tool
+    next[index] = MessageBlock.Tool(tool.card.copy(denial = ToolDenial.User))
     return copy(blocks = next, text = "")
 }
 

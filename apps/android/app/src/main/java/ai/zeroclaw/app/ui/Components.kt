@@ -572,12 +572,21 @@ fun ToolCallRow(
     val nodeNote = display.nodeId?.let { node ->
         if (node == localNodeId) "this phone" else "phone $node"
     }
+    val denied = card.denial != null && !blocked
     Surface(
-        color = if (blocked) Zc.DangerSoft else Zc.SurfaceRaised,
+        color = when {
+            blocked -> Zc.DangerSoft
+            denied -> Zc.Warning.copy(alpha = 0.10f)
+            else -> Zc.SurfaceRaised
+        },
         shape = RoundedCornerShape(10.dp),
         border = androidx.compose.foundation.BorderStroke(
             1.dp,
-            if (blocked) Zc.Danger.copy(alpha = 0.55f) else Zc.Border,
+            when {
+                blocked -> Zc.Danger.copy(alpha = 0.55f)
+                denied -> Zc.Warning.copy(alpha = 0.45f)
+                else -> Zc.Border
+            },
         ),
         modifier = Modifier
             .fillMaxWidth()
@@ -591,6 +600,7 @@ fun ToolCallRow(
                         .background(
                             when {
                                 blocked -> Zc.Danger
+                                denied -> Zc.Warning
                                 card.finished -> Zc.Success
                                 else -> Zc.Warning
                             },
@@ -601,7 +611,11 @@ fun ToolCallRow(
                 Text(
                     text = title,
                     style = MaterialTheme.typography.labelMedium.copy(fontFamily = MonoFamily),
-                    color = if (blocked) Zc.Danger else Zc.Accent,
+                    color = when {
+                        blocked -> Zc.Danger
+                        denied -> Zc.Warning
+                        else -> Zc.Accent
+                    },
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
@@ -609,22 +623,30 @@ fun ToolCallRow(
                 Spacer(Modifier.width(6.dp))
                 ToolOriginBadge(display)
                 Spacer(Modifier.width(8.dp))
-                if (blocked) {
-                    Text(
-                        text = "blocked",
+                when {
+                    blocked -> {
+                        Text(
+                            text = "blocked",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Zc.Danger,
+                            modifier = Modifier.clickable(onClick = onOpenSettings),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = "settings",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Zc.Accent,
+                            modifier = Modifier.clickable(onClick = onOpenSettings),
+                        )
+                    }
+
+                    denied -> Text(
+                        text = "denied",
                         style = MaterialTheme.typography.labelSmall,
-                        color = Zc.Danger,
-                        modifier = Modifier.clickable(onClick = onOpenSettings),
+                        color = Zc.Warning,
                     )
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        text = "settings",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = Zc.Accent,
-                        modifier = Modifier.clickable(onClick = onOpenSettings),
-                    )
-                } else {
-                    Text(
+
+                    else -> Text(
                         text = when {
                             card.finished -> "done"
                             else -> "running"

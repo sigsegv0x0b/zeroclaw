@@ -245,7 +245,9 @@ Choices made in the approval dialog persist too:
 - **Always** writes the tool to `auto_approve` on the agent's risk profile, so
   it survives a restart and applies to every chat, not just the current
   session. It is the same list **Settings → Tools** edits.
-- **Deny** affects that call only; it does not change policy.
+- **Deny** affects that call only; it does not change policy. The refused
+  tool card turns amber and is labelled `denied`; a refusal by timeout or an
+  unreachable client is marked the same way, without blaming the operator.
 - Schema-discovery tools (`tool_search`, including the phone's
   `node_…__tool_search`) are approved by default because they only return
   schemas. **Ask** in Settings still forces a prompt, and **Block** hides the

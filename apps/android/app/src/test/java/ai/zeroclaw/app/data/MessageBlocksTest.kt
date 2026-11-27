@@ -15,8 +15,52 @@ class MessageBlocksTest {
     )
 
     @Test
-    fun intentLaunchCardNamesTheRecipe() {
-        val args = buildJsonObject {
+    fun deniedResultMarksTheCardAsDenied() {
+        val name = "node_android-1a2b3c4d__timer_set"
+        var message = ChatMessage(id = "m1", role = MessageRole.Assistant, streaming = true)
+        message = message.appendTool(card(name))
+        message = message.completeTool(
+            null,
+            name,
+            "Denied by user. The operator was asked to approve 'timer_set' and declined, " +
+                "so the call did not run.",
+        )
+
+        val tool = message.contentBlocks.filterIsInstance<MessageBlock.Tool>().single()
+        assertEquals(ToolDenial.User, tool.card.denial)
+        assertTrue(tool.card.finished)
+    }
+
+    @Test
+    fun runtimeDenialIsDistinguishedFromOperatorDenial() {
+        assertEquals(
+            ToolDenial.User,
+            toolDenialFromOutput("Denied by user. The operator declined."),
+        )
+        assertEquals(
+            ToolDenial.Runtime,
+            toolDenialFromOutput(
+                "Tool call not executed: 'x' requires approval and no operator decision " +
+                    "was available, so the runtime denied it by policy. This was not a " +
+                    "user's decision.",
+            ),
+        )
+        assertEquals(null, toolDenialFromOutput("Started a 5m timer."))
+    }
+
+    @Test
+    fun denyingBeforeTheResultMarksThePendingCard() {
+        val name = "node_android-1a2b3c4d__timer_set"
+        var message = ChatMessage(id = "m1", role = MessageRole.Assistant, streaming = true)
+        message = message.appendTool(card(name))
+        message = message.markToolDenied(name)
+
+        val tool = message.contentBlocks.filterIsInstance<MessageBlock.Tool>().single()
+        assertEquals(ToolDenial.User, tool.card.denial)
+    }
+
+    @Test
+    fun intentLaunchCardNamesTheRecipe() {        val args = buildJsonObject {
             put("destination", "Sky Dome")
             put("recipe", "maps.navigate")
         }

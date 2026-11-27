@@ -1269,6 +1269,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         socket.sendApproval(prompt.requestId, decision)
         _ui.update { it.copy(approval = null) }
         ApprovalNotifications.cancel(getApplication(), prompt.requestId)
+        if (!approve) updateAssistant { it.markToolDenied(prompt.tool) }
         if (always) persistToolApproval(prompt.tool)
     }
 
@@ -1481,6 +1482,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             state.copy(messages = messages)
+        }
+        // A timeout or unreachable client denies the call without an operator
+        // tap, so clear the now-stale dialog and its notification when that
+        // denial result arrives.
+        if (toolDenialFromOutput(event.output) != null) {
+            val pending = _ui.value.approval
+            if (pending != null && (event.name == null || event.name == pending.tool)) {
+                _ui.update { it.copy(approval = null) }
+                ApprovalNotifications.cancel(getApplication(), pending.requestId)
+            }
         }
     }
 
