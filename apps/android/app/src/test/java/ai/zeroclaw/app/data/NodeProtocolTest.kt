@@ -109,11 +109,16 @@ class NodeProtocolTest {
         assertTrue(names.contains(DeviceCapabilities.DEVICE_INFO))
         assertTrue(names.contains(DeviceCapabilities.NOTIFICATIONS_LIST))
         assertTrue(names.contains(DeviceCapabilities.CALL_LOG_SEARCH))
+        assertTrue(names.contains(DeviceCapabilities.TOOL_SEARCH))
+        assertTrue(names.contains(DeviceCapabilities.INTENT_SEARCH))
+        assertTrue(names.contains(DeviceCapabilities.INTENT_LAUNCH))
     }
 
     @Test
     fun `alarm schema requires hour and minute`() {
-        val alarm = DeviceCapabilities.definitions.single { it.name == DeviceCapabilities.ALARM_SET }
+        val alarm = DeviceCapabilities.fullDefinitions.single {
+            it.name == DeviceCapabilities.ALARM_SET
+        }
         val required = alarm.parameters["required"] as JsonArray
         val fields = required.map { it.jsonPrimitive.content }
         assertTrue(fields.contains("hour"))
@@ -126,9 +131,37 @@ class NodeProtocolTest {
 
     @Test
     fun `timer schema requires seconds`() {
-        val timer = DeviceCapabilities.definitions.single { it.name == DeviceCapabilities.TIMER_SET }
+        val timer = DeviceCapabilities.fullDefinitions.single {
+            it.name == DeviceCapabilities.TIMER_SET
+        }
         val required = timer.parameters["required"] as JsonArray
         assertEquals(listOf("seconds"), required.map { it.jsonPrimitive.content })
+    }
+
+    @Test
+    fun `advertised capabilities fit the gateway registration limits`() {
+        // Mirrors valid_capability() in crates/zeroclaw-gateway/src/nodes.rs.
+        val toolNames = mutableSetOf<String>()
+        DeviceCapabilities.definitions.forEach { capability ->
+            assertTrue(
+                "name too long: ${capability.name}",
+                capability.name.length <= 32,
+            )
+            assertTrue(
+                "description too long: ${capability.name}",
+                capability.description.toByteArray().size <= 1024,
+            )
+            assertTrue(
+                "parameters too large: ${capability.name}",
+                zcJson.encodeToString(JsonObject.serializer(), capability.parameters)
+                    .toByteArray()
+                    .size <= 16 * 1024,
+            )
+            assertTrue(
+                "tool name collision: ${capability.name}",
+                toolNames.add(capability.name.replace('.', '_').lowercase()),
+            )
+        }
     }
 
     @Test

@@ -162,6 +162,69 @@ the gateway turns each one into an agent tool. Both halves must be on:
    gateway's own native tools, so the agent can choose the phone or the host;
    the tool descriptions tell it to ask when the user has not said which.
 
+### Deferred parameter schemas
+
+Every capability keeps its own tool name, so **Settings → Tools** and the
+gateway's `always_ask` / `auto_approve` / `excluded_tools` keep working per
+capability. What is compacted is the payload: a capability with parameters
+advertises a one-line summary and an open schema, and the model fetches the
+real schema from `tool.search`:
+
+```text
+node_android-1a2b3c4d__alarm_set
+  "Set an alarm on this Android phone's clock app. Call tool.search(query="select:alarm.set") for parameters."
+  {"type":"object"}
+```
+
+Zero-argument capabilities (`device.info`, `motion.activity`, `talk.ptt.stop`,
+…) and the three discovery tools keep their full schema, because they are cheap
+and actionable without a lookup. The compact registration payload is 30%
+smaller overall and 49% smaller for the capabilities that defer their schema
+(19,197 → 13,587 characters overall; 11,530 → 5,920 for deferred ones).
+
+`tool.search` accepts the spellings a model or a config file may use:
+`alarm.set`, `alarm_set`, and `node_android-1a2b3c4d__alarm_set` all resolve to
+the same capability.
+
+### Android intents
+
+`intent.search` and `intent.launch` let the agent hand an action to another
+app on the phone. The catalog (`IntentCapabilities.recipes`) is the single
+source of truth: it generates the search index, the JSON schemas, and every
+URI. The model can only name a recipe, never an arbitrary `Intent`.
+
+| Recipe | Effect |
+|---|---|
+| `maps.navigate` | Turn-by-turn navigation (`google.navigation:`), Maps URL fallback |
+| `maps.search` | Map search or coordinates (`geo:`) |
+| `maps.directions` | Route preview (Maps URL) |
+| `phone.dial` | Dialer pre-filled (`ACTION_DIAL`, never `ACTION_CALL`) |
+| `sms.compose` | Messaging app with recipient and draft (`smsto:` + `sms_body`) |
+| `email.compose` | Email app with recipient, subject, body (`mailto:` + extras) |
+| `media.play_search` | Default media app (`MEDIA_PLAY_FROM_SEARCH` + query) |
+| `web.open` | http(s) URL or deep link |
+| `web.search` | Default search app (`WEB_SEARCH` + query) |
+| `share.text` | Android share sheet (`ACTION_SEND`, `text/plain`) |
+| `settings.open` | Wi-Fi, Bluetooth, location, airplane, sound, display, battery saver, app details |
+| `app.launch` | Launch an installed app by package name |
+
+`intent.search` reports which installed apps handle each recipe, so a missing
+handler shows up as `"available": false` instead of a failed launch. Raw mode
+(`action` + `uri`) is default-closed: only `VIEW`, `DIAL`, `SENDTO`, `SEND`,
+`WEB_SEARCH`, `MEDIA_PLAY_FROM_SEARCH` and `INSERT` are accepted, with an
+http/https/geo/google.navigation/tel/mailto/smsto scheme allowlist. `file:`,
+`content:`, privileged actions (`CALL`, `INSTALL_PACKAGE`, `DELETE`, `REBOOT`,
+…) and our own package are refused.
+
+Android 11+ package visibility is declared in `AndroidManifest.xml` under
+`<queries>`. Add an entry there whenever a recipe adds a scheme, MIME type, or
+action; otherwise the recipe looks unavailable on a device that can run it.
+
+Android 10+ restricts background activity launches. The node service can still
+dispatch when the app is visible, but a launch requested while the app is in
+the background may be blocked with no error. Keep the app in the foreground
+when testing navigation, or trigger the intent from a notification tap.
+
 ## Tool permissions
 
 **Settings → Tools** lists the selected agent's tools, grouped into phone and
@@ -213,6 +276,9 @@ Advertised capabilities:
 | `mobile.ui.act` | `snapshot_id`, `action` | click/set_text/scroll/tap/swipe/global |
 | `talk.ptt.once` | `timeout_secs?` | Transcribe one utterance |
 | `talk.ptt.start` / `.stop` / `.cancel` | — | Session-based push-to-talk |
+| `tool.search` | `query`, `max_results?` | Full parameter schemas for phone tools and intent recipes |
+| `intent.search` | `query`, raw `action`/`uri`/`type`/`package`? | Recipe discovery, parameter schema, installed handlers |
+| `intent.launch` | `recipe` plus its arguments, or an allowlisted raw intent | Hand the action to another app |
 
 ## Attachments
 

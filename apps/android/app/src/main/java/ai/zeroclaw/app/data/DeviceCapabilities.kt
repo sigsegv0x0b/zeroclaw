@@ -9,6 +9,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -105,6 +106,9 @@ object DeviceCapabilities {
     const val TALK_PTT_STOP = "talk.ptt.stop"
     const val TALK_PTT_CANCEL = "talk.ptt.cancel"
     const val TALK_PTT_ONCE = "talk.ptt.once"
+    const val TOOL_SEARCH = "tool.search"
+    const val INTENT_SEARCH = "intent.search"
+    const val INTENT_LAUNCH = "intent.launch"
 
     private const val PHONE_NOTE = " This runs on the phone, not on the ZeroClaw host."
 
@@ -118,7 +122,7 @@ object DeviceCapabilities {
         parameters = zcJson.parseToJsonElement(parameters) as JsonObject,
     )
 
-    val definitions: List<NodeCapabilityDef> = listOf(
+    val fullDefinitions: List<NodeCapabilityDef> = listOf(
         capability(
             ALARM_SET,
             "Set an alarm on this Android phone's clock app at a local wall-clock time. " +
@@ -644,7 +648,30 @@ object DeviceCapabilities {
             { "type": "object", "properties": {} }
             """.trimIndent(),
         ),
-    )
+    ) + listOf(PhoneToolSearch.definition) + IntentCapabilities.definitions
+
+    /**
+     * The capabilities advertised over `/ws/nodes`.
+     *
+     * Every capability keeps its canonical name so Settings → Tools and the
+     * gateway's `always_ask` / `auto_approve` / `excluded_tools` policies stay
+     * per capability. Parameterized capabilities advertise only a one-line
+     * summary and an open schema; the model fetches the real schema from
+     * `tool.search`. Zero-argument capabilities and the discovery tools stay
+     * eager because they are cheap and useful without a lookup.
+     */
+    val definitions: List<NodeCapabilityDef> = fullDefinitions.map(::advertised)
+
+    private fun advertised(definition: NodeCapabilityDef): NodeCapabilityDef {
+        if (PhoneToolSearch.isEager(definition)) return definition
+        val summary = PhoneToolSearch.summaryLine(definition.description.removeSuffix(PHONE_NOTE))
+        return NodeCapabilityDef(
+            name = definition.name,
+            description = "$summary Call ${PhoneToolSearch.NAME}" +
+                "(query=\"select:${definition.name}\") for parameters.",
+            parameters = JsonObject(mapOf("type" to JsonPrimitive("object"))),
+        )
+    }
 
     suspend fun execute(context: Context, capability: String, args: JsonObject): CapabilityOutcome =
         when (capability) {
@@ -689,6 +716,11 @@ object DeviceCapabilities {
             TALK_PTT_START -> VoiceCapabilities.start(context)
             TALK_PTT_STOP -> VoiceCapabilities.stop()
             TALK_PTT_CANCEL -> VoiceCapabilities.cancel()
+            TOOL_SEARCH -> PhoneToolSearch.execute(args)
+            INTENT_SEARCH -> withContext(Dispatchers.IO) {
+                IntentCapabilities.search(args, IntentCapabilities.probe(context))
+            }
+            INTENT_LAUNCH -> IntentCapabilities.launch(context, args)
             else -> CapabilityOutcome(false, "", "Unsupported capability: $capability")
         }
 
