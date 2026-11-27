@@ -457,7 +457,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update { it.copy(preferNodeTools = enabled) }
         viewModelScope.launch {
             store.savePreferNodeTools(enabled)
-            if (!_ui.value.busy && _ui.value.connected) reconnectSocket()
+            // The preference is read during the WebSocket handshake, so the
+            // stored socket config must be replaced even if the UI momentarily
+            // reports the old connection as closed.
+            if (!_ui.value.busy) reconnectSocket()
         }
     }
 

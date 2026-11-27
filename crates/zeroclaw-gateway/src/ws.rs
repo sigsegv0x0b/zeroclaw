@@ -97,6 +97,53 @@ pub(crate) const WS_PROTOCOL: &str = "zeroclaw.v1";
 /// phone; `false` means ask the user when the host also offers the action.
 const PREFER_NODE_TOOLS_HEADER: &str = "x-zeroclaw-prefer-node-tools";
 
+/// Gateway-authored prefix on a phone turn. It is kept in durable history for
+/// model continuity and stripped from the operator-facing history API.
+pub(crate) const NODE_PREFERENCE_MARKER: &str = "[ZeroClaw device preference]";
+
+fn node_preference_note(prefer_node_tools: bool) -> String {
+    if prefer_node_tools {
+        format!(
+            "{NODE_PREFERENCE_MARKER} The user is using the ZeroClaw Android app. This phone is \
+             the default for actions that could run on either the phone or the host. Use the \
+             matching node_* phone tool unless the user explicitly names the server, host, cron, \
+             or another device."
+        )
+    } else {
+        format!(
+            "{NODE_PREFERENCE_MARKER} The user is using the ZeroClaw Android app. If both this \
+             phone and the host offer the same action, ask the user which device they mean before \
+             calling either tool."
+        )
+    }
+}
+
+/// Remove the gateway-authored phone-preference prefix from a persisted user
+/// message before returning it to a chat UI.
+pub(crate) fn strip_node_preference(content: &str) -> &str {
+    content
+        .strip_prefix(NODE_PREFERENCE_MARKER)
+        .and_then(|rest| rest.split_once("\n\n").map(|(_, message)| message))
+        .unwrap_or(content)
+}
+
+fn node_message_content(content: &str, preference_note: Option<&str>) -> String {
+    match preference_note {
+        Some(note) => format!("{note}\n\n{content}"),
+        None => content.to_string(),
+    }
+}
+
+/// Whether a message itself names the phone. With the preference off, only
+/// such a message may dispatch a phone tool; otherwise the tool refuses and
+/// tells the model to ask.
+fn message_explicitly_targets_phone(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    ["phone", "android", "mobile", "this device", "my device"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
 #[derive(Deserialize)]
 pub struct WsQuery {
     pub token: Option<String>,
@@ -836,6 +883,12 @@ async fn handle_socket(
         return;
     }
 
+    // The phone turn carries a gateway-authored preference line. It is
+    // stronger than per-tool descriptions: the model sees it on every message
+    // even when a matching host tool would otherwise look equally valid.
+    let node_preference_message = node_id
+        .as_ref()
+        .map(|_| node_preference_note(prefer_node_tools));
     // The chat's authenticated token hash is also the node owner: a phone's
     // tools are reachable only from the same credential that registered the
     // phone. A dashboard session (no token, no owner) gets no phone tools, and
@@ -861,6 +914,7 @@ async fn handle_socket(
         }
         _ => crate::node_tool::NodeToolSource::none(state.node_registry.clone()),
     };
+    let node_policy = node_source.policy();
     let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
         state.config.clone(),
         state.agent_lifecycle.clone(),
@@ -1039,6 +1093,9 @@ async fn handle_socket(
                                 return;
                             }
                         };
+                        node_policy.set_explicit_phone(message_explicitly_targets_phone(&content));
+                        let content =
+                            node_message_content(&content, node_preference_message.as_deref());
                         let client_gone = process_chat_message(
                             &state,
                             &mut agent,
@@ -1279,6 +1336,9 @@ async fn handle_socket(
                     }
                 };
 
+                node_policy.set_explicit_phone(message_explicitly_targets_phone(&content));
+                let content =
+                    node_message_content(&content, node_preference_message.as_deref());
                 let client_gone = process_chat_message(
                     &state,
                     &mut agent,
@@ -3149,6 +3209,27 @@ mod tests {
         routing::{get, post},
     };
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+    #[test]
+    fn node_preference_prefix_is_model_visible_and_hidden_from_history() {
+        let note = node_preference_note(false);
+        assert!(note.starts_with(NODE_PREFERENCE_MARKER));
+        let content = node_message_content("set an alarm", Some(&note));
+        assert!(content.contains("ask the user which device"));
+        assert_eq!(strip_node_preference(&content), "set an alarm");
+        assert_eq!(
+            strip_node_preference("ordinary message"),
+            "ordinary message"
+        );
+    }
+
+    #[test]
+    fn a_message_only_targets_the_phone_when_it_says_so() {
+        assert!(message_explicitly_targets_phone("set an alarm on my phone"));
+        assert!(message_explicitly_targets_phone("use Android for this"));
+        assert!(!message_explicitly_targets_phone("set an alarm"));
+        assert!(!message_explicitly_targets_phone("run this on the server"));
+    }
 
     #[test]
     fn node_tool_preference_defaults_on_and_parses_off() {

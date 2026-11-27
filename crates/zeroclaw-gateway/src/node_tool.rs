@@ -3,6 +3,7 @@
 //! Tool names are prefixed with the node ID: `node_<node_id>__<capability>`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -25,6 +26,41 @@ const NODE_INVOKE_TIMEOUT_SECS: u64 = 30;
 /// silently mislabelled.
 const ALLOWED_IMAGE_MIMES: &[&str] = &["image/jpeg", "image/png", "image/webp", "image/gif"];
 
+/// Per-chat switch shared by every node tool and the WebSocket handler.
+///
+/// `prefer_node_tools` is the app setting for this socket. When it is off,
+/// `explicit_phone` is refreshed from each incoming user message: only a
+/// message that names the phone may dispatch a phone tool, so the model
+/// cannot skip the "which device?" question just because it ignored the
+/// prompt.
+#[derive(Debug)]
+pub struct NodeToolPolicy {
+    prefer_node_tools: AtomicBool,
+    explicit_phone: AtomicBool,
+}
+
+impl NodeToolPolicy {
+    pub fn new(prefer_node_tools: bool) -> Arc<Self> {
+        Arc::new(Self {
+            prefer_node_tools: AtomicBool::new(prefer_node_tools),
+            explicit_phone: AtomicBool::new(false),
+        })
+    }
+
+    pub fn set_explicit_phone(&self, explicit: bool) {
+        self.explicit_phone.store(explicit, Ordering::Relaxed);
+    }
+
+    fn prefers_phone(&self) -> bool {
+        self.prefer_node_tools.load(Ordering::Relaxed)
+    }
+
+    fn allows_phone_tool(&self) -> bool {
+        self.prefer_node_tools.load(Ordering::Relaxed)
+            || self.explicit_phone.load(Ordering::Relaxed)
+    }
+}
+
 /// A zeroclaw [`Tool`] backed by a node capability.
 /// The `prefixed_name` (e.g. `node_phone-1__camera_snap`) is what the agent
 /// loop sees. Invocations are routed to the connected node via WebSocket.
@@ -41,16 +77,36 @@ pub struct NodeTool {
     parameters: serde_json::Value,
     /// Node registry for routing invocations.
     registry: Arc<NodeRegistry>,
+    /// Whether this chat may dispatch phone tools yet.
+    policy: Arc<NodeToolPolicy>,
 }
 
 impl NodeTool {
-    /// Create a new node tool wrapper.
+    /// Create a new node tool wrapper that allows dispatch (test/default).
     pub fn new(
         node_id: String,
         capability_name: String,
         description: String,
         parameters: serde_json::Value,
         registry: Arc<NodeRegistry>,
+    ) -> Self {
+        Self::with_policy(
+            node_id,
+            capability_name,
+            description,
+            parameters,
+            registry,
+            NodeToolPolicy::new(true),
+        )
+    }
+
+    fn with_policy(
+        node_id: String,
+        capability_name: String,
+        description: String,
+        parameters: serde_json::Value,
+        registry: Arc<NodeRegistry>,
+        policy: Arc<NodeToolPolicy>,
     ) -> Self {
         let prefixed_name = Self::tool_name(&node_id, &capability_name);
         Self {
@@ -60,6 +116,7 @@ impl NodeTool {
             description,
             parameters,
             registry,
+            policy,
         }
     }
 
@@ -116,9 +173,9 @@ pub struct NodeToolSource {
     node_id: Option<String>,
     owner: Option<String>,
     enabled: bool,
-    /// When true, matching actions default to this phone. When false, the
-    /// model is told to ask which device the user means.
-    prefer_node_tools: bool,
+    /// Shared with every tool this source builds and with the chat handler,
+    /// which refreshes the explicit-phone choice before each turn.
+    policy: Arc<NodeToolPolicy>,
 }
 
 impl NodeToolSource {
@@ -128,7 +185,7 @@ impl NodeToolSource {
             node_id: None,
             owner: None,
             enabled: true,
-            prefer_node_tools: true,
+            policy: NodeToolPolicy::new(true),
         }
     }
 
@@ -149,7 +206,7 @@ impl NodeToolSource {
             node_id: Some(node_id),
             owner: None,
             enabled: true,
-            prefer_node_tools,
+            policy: NodeToolPolicy::new(prefer_node_tools),
         }
     }
 
@@ -171,7 +228,7 @@ impl NodeToolSource {
             node_id: Some(node_id),
             owner: Some(owner),
             enabled: true,
-            prefer_node_tools,
+            policy: NodeToolPolicy::new(prefer_node_tools),
         }
     }
 
@@ -183,12 +240,18 @@ impl NodeToolSource {
             node_id: None,
             owner: None,
             enabled: false,
-            prefer_node_tools: true,
+            policy: NodeToolPolicy::new(true),
         }
     }
 
+    /// The policy shared by every tool this source builds. A chat handler
+    /// updates its explicit-phone flag before each turn.
+    pub fn policy(&self) -> Arc<NodeToolPolicy> {
+        Arc::clone(&self.policy)
+    }
+
     fn preference_note(&self) -> &'static str {
-        if self.prefer_node_tools {
+        if self.policy.prefers_phone() {
             " Preference: this phone is the default for actions that could run on either the phone or the host. Use a host or server tool when the user explicitly names the server, host, cron, or another device."
         } else {
             " Preference: if this action could run on either this phone or the host, ask the user which one they mean before calling either."
@@ -206,12 +269,13 @@ impl NodeToolSource {
             .into_iter()
             .map(|(node_id, capability_name, capability)| {
                 let description = format!("{}{}", capability.description, self.preference_note());
-                Box::new(NodeTool::new(
+                Box::new(NodeTool::with_policy(
                     node_id,
                     capability_name,
                     description,
                     capability.parameters,
                     Arc::clone(&self.registry),
+                    Arc::clone(&self.policy),
                 )) as Box<dyn Tool>
             })
             .collect()
@@ -239,6 +303,17 @@ impl Tool for NodeTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if !self.policy.allows_phone_tool() {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    "The user has not chosen the phone for this action. Ask whether they want \
+                     it on this phone or on the host/server, then wait for their answer."
+                        .to_string(),
+                ),
+            });
+        }
         // Risk is enforced by the agent's approval policy, which sees this
         // tool's name and the operator's `auto_approve` / `always_ask` sets.
         // An in-tool `approved` flag would be model-controlled, so it could
@@ -566,6 +641,39 @@ mod tests {
         assert_eq!(tool.description(), "Take a photo");
         assert_eq!(tool.parameters_schema()["type"], "object");
         assert_eq!(tool.tool_provenance(), ToolProvenance::Extension);
+    }
+
+    #[tokio::test]
+    async fn preference_off_refuses_until_the_user_names_the_phone() {
+        let registry = Arc::new(NodeRegistry::new(10));
+        let policy = NodeToolPolicy::new(false);
+        let tool = NodeTool::with_policy(
+            "phone-1".to_string(),
+            "alarm.set".to_string(),
+            "Set an alarm".to_string(),
+            serde_json::json!({"type": "object", "properties": {}}),
+            registry,
+            Arc::clone(&policy),
+        );
+        let refused = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(!refused.success);
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Ask whether"))
+        );
+
+        policy.set_explicit_phone(true);
+        let allowed = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(
+            allowed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not connected")),
+            "after an explicit phone choice the tool must dispatch: {:?}",
+            allowed.error
+        );
     }
 
     #[tokio::test]

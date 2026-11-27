@@ -1953,9 +1953,14 @@ pub async fn handle_api_session_messages(
             if visible.role == "assistant" && visible.content == crate::ws::TASK_FAILED_MARKER {
                 return None;
             }
+            let content = if visible.role == "user" {
+                crate::ws::strip_node_preference(&visible.content).to_string()
+            } else {
+                visible.content
+            };
             Some(serde_json::json!({
                 "role": visible.role,
-                "content": visible.content,
+                "content": content,
                 "created_at": m.created_at.map(|dt| dt.to_rfc3339()),
             }))
         })
