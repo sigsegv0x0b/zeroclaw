@@ -928,6 +928,14 @@ pub(crate) async fn try_compute_drift(
     })?;
     on_disk.config_path = path.clone();
 
+    // The loader merges the built-in `auto_approve` defaults into
+    // `risk_profiles.default` (see `Config::load`). Mirror that here so a file
+    // written before a default was added is not reported as drift the operator
+    // cannot fix; otherwise every policy write from a client hits 409.
+    if let Some(default_profile) = on_disk.risk_profiles.get_mut("default") {
+        default_profile.ensure_default_auto_approve();
+    }
+
     let in_memory_props: std::collections::HashMap<String, zeroclaw_config::traits::PropFieldInfo> =
         in_memory
             .prop_fields()
@@ -5750,6 +5758,32 @@ mod tests {
         assert!(
             drift.is_empty(),
             "expected no drift right after save, got {drift:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_drift_treats_missing_builtin_auto_approve_as_merged() {
+        let (_tmp, path) = temp_config_path();
+        let raw = "[risk_profiles.default]\nauto_approve = [\"tool_search\"]\n";
+        tokio::fs::write(&path, raw).await.expect("write config");
+
+        // Build the in-memory side exactly as `Config::load` does: parse the
+        // file, then merge the built-in defaults into `risk_profiles.default`.
+        let mut cfg: zeroclaw_config::schema::Config =
+            toml::from_str(raw).expect("parse minimal config");
+        cfg.config_path = path.clone();
+        cfg.risk_profiles
+            .get_mut("default")
+            .expect("default profile")
+            .ensure_default_auto_approve();
+
+        let drift = compute_drift(&cfg).await;
+        assert!(
+            drift
+                .iter()
+                .all(|entry| entry.path != "risk_profiles.default.auto_approve"),
+            "the loader merges built-in defaults, so their absence on disk must not \
+             report drift: {drift:?}"
         );
     }
 
