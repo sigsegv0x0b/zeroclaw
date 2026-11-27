@@ -3242,6 +3242,19 @@ mod tests {
     }
 
     #[test]
+    fn node_preference_note_is_the_single_source_of_the_phone_default() {
+        // Node tool descriptions no longer repeat this per capability.
+        let prefer_phone = node_preference_note(true);
+        assert!(prefer_phone.starts_with(NODE_PREFERENCE_MARKER));
+        assert!(prefer_phone.contains("This phone is the default"));
+
+        let ask = node_preference_note(false);
+        assert!(ask.starts_with(NODE_PREFERENCE_MARKER));
+        assert!(ask.contains("ask the user which device they mean"));
+        assert!(!ask.contains("this phone is the default"));
+    }
+
+    #[test]
     fn ws_terminal_failure_uses_localized_message_without_reclassifying_diagnostic() {
         let diagnostic = "provider completed without final text or tool calls";
         let localized = "Réponse terminale invalide.";

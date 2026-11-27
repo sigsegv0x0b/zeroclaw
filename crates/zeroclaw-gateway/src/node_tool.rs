@@ -51,10 +51,6 @@ impl NodeToolPolicy {
         self.explicit_phone.store(explicit, Ordering::Relaxed);
     }
 
-    fn prefers_phone(&self) -> bool {
-        self.prefer_node_tools.load(Ordering::Relaxed)
-    }
-
     fn allows_phone_tool(&self) -> bool {
         self.prefer_node_tools.load(Ordering::Relaxed)
             || self.explicit_phone.load(Ordering::Relaxed)
@@ -250,16 +246,12 @@ impl NodeToolSource {
         Arc::clone(&self.policy)
     }
 
-    fn preference_note(&self) -> &'static str {
-        if self.policy.prefers_phone() {
-            " Preference: this phone is the default for actions that could run on either the phone or the host. Use a host or server tool when the user explicitly names the server, host, cron, or another device."
-        } else {
-            " Preference: if this action could run on either this phone or the host, ask the user which one they mean before calling either."
-        }
-    }
-
     /// Build one tool per connected capability. Split from [`ToolSource::tools`]
     /// so tests can exercise it without constructing a full [`ToolRequest`].
+    ///
+    /// The phone-or-host preference is delivered once per turn by
+    /// [`crate::ws::node_preference_note`]; repeating it in every description
+    /// cost ~200 characters per capability on every request.
     fn collect(&self) -> Vec<Box<dyn Tool>> {
         if !self.enabled {
             return Vec::new();
@@ -268,11 +260,10 @@ impl NodeToolSource {
             .capabilities_for(self.node_id.as_deref(), self.owner.as_deref())
             .into_iter()
             .map(|(node_id, capability_name, capability)| {
-                let description = format!("{}{}", capability.description, self.preference_note());
                 Box::new(NodeTool::with_policy(
                     node_id,
                     capability_name,
-                    description,
+                    capability.description,
                     capability.parameters,
                     Arc::clone(&self.registry),
                     Arc::clone(&self.policy),
@@ -529,8 +520,8 @@ mod tests {
                 .starts_with("Set an alarm on the phone")
         );
         assert!(
-            tools[0].description().contains("this phone is the default"),
-            "the default preference must be visible to the model"
+            !tools[0].description().contains("Preference:"),
+            "the phone-or-host preference belongs to the per-turn note, not every tool"
         );
 
         let empty = NodeToolSource::new(Arc::new(NodeRegistry::new(10)));
@@ -618,12 +609,14 @@ mod tests {
         let tools = source.collect();
         assert_eq!(tools.len(), 1);
         assert!(
-            tools[0]
-                .description()
-                .contains("ask the user which one they mean"),
-            "preference off must tell the model to ask instead of assuming the phone"
+            !tools[0].description().contains("Preference:"),
+            "preference off must not duplicate the per-turn note in every tool"
         );
-        assert!(!tools[0].description().contains("this phone is the default"));
+        assert_eq!(
+            tools[0].description(),
+            "Set an alarm on the phone",
+            "the tool description is the capability's own text"
+        );
     }
 
     #[test]
