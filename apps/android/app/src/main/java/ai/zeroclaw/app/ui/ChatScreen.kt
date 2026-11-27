@@ -58,6 +58,7 @@ import ai.zeroclaw.app.data.ChatMessage
 import ai.zeroclaw.app.data.ElicitationPrompt
 import ai.zeroclaw.app.data.NodeStatus
 import ai.zeroclaw.app.data.TtsController
+import ai.zeroclaw.app.data.ToolPolicyUi
 import ai.zeroclaw.app.data.UiState
 import ai.zeroclaw.app.ui.theme.Zc
 
@@ -71,6 +72,15 @@ fun ChatScreen(
     val tts = remember { TtsController(context.applicationContext) }
     DisposableEffect(tts) {
         onDispose { tts.shutdown() }
+    }
+
+    LaunchedEffect(state.connected, state.agent) {
+        // The tool policy drives the blocked badge in the transcript. Reload
+        // it on every connect so a policy changed elsewhere (or on another
+        // client) is reflected without a restart.
+        if (state.connected && state.agent.isNotBlank()) {
+            viewModel.refreshToolPolicies()
+        }
     }
 
     Column(
@@ -99,7 +109,13 @@ fun ChatScreen(
             if (state.messages.isEmpty()) {
                 EmptyChat(agent = state.agent)
             } else {
-                MessageList(state.messages, state.deviceId, tts)
+                MessageList(
+                    messages = state.messages,
+                    localNodeId = state.deviceId,
+                    tts = tts,
+                    toolPolicy = state.toolPolicy,
+                    onOpenToolSettings = viewModel::openToolSettings,
+                )
             }
         }
 
@@ -233,6 +249,8 @@ private fun MessageList(
     messages: List<ChatMessage>,
     localNodeId: String,
     tts: TtsController,
+    toolPolicy: ToolPolicyUi,
+    onOpenToolSettings: (String) -> Unit,
 ) {
     val listState = rememberLazyListState()
     val last = messages.lastOrNull()
@@ -255,7 +273,13 @@ private fun MessageList(
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         items(messages, key = { it.id }) { message ->
-            MessageItem(message, localNodeId, tts)
+            MessageItem(
+                message = message,
+                localNodeId = localNodeId,
+                tts = tts,
+                toolPolicy = toolPolicy,
+                onOpenToolSettings = onOpenToolSettings,
+            )
         }
     }
 }

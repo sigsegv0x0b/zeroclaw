@@ -39,6 +39,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -84,6 +85,7 @@ fun SettingsScreen(
     onRenewCertificate: () -> Unit,
     onRefreshTools: () -> Unit,
     onToolPolicy: (String, ToolPolicy) -> Unit,
+    initialToolFocus: String? = null,
 ) {
     var url by remember(state.gatewayUrl) { mutableStateOf(state.gatewayUrl) }
     var gwId by remember(state.mtlsGatewayId) { mutableStateOf(state.mtlsGatewayId) }
@@ -168,7 +170,14 @@ fun SettingsScreen(
     var token by remember(state.token) { mutableStateOf(state.token) }
     var reveal by remember { mutableStateOf(false) }
     var confirmForget by remember { mutableStateOf(false) }
-    var tab by remember { mutableStateOf(SettingsTab.General) }
+    var tab by remember(initialToolFocus) {
+        mutableStateOf(
+            if (initialToolFocus != null) SettingsTab.Tools else SettingsTab.General,
+        )
+    }
+    LaunchedEffect(tab) {
+        if (tab == SettingsTab.Tools && !state.toolPolicy.loaded) onRefreshTools()
+    }
     val colors = zcFieldColors()
 
     Column(
@@ -695,6 +704,7 @@ fun SettingsScreen(
                 state = state,
                 onRefresh = onRefreshTools,
                 onPolicy = onToolPolicy,
+                focusTool = initialToolFocus,
                 modifier = Modifier.weight(1f),
             )
         }
@@ -711,10 +721,11 @@ private fun ToolPolicyTab(
     state: UiState,
     onRefresh: () -> Unit,
     onPolicy: (String, ToolPolicy) -> Unit,
+    focusTool: String? = null,
     modifier: Modifier = Modifier,
 ) {
     val policy = state.toolPolicy
-    var search by remember { mutableStateOf("") }
+    var search by remember(focusTool) { mutableStateOf(focusTool.orEmpty()) }
     Column(
         modifier
             .fillMaxWidth()

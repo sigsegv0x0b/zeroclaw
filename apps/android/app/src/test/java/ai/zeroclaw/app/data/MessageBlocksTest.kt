@@ -4,6 +4,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 
 class MessageBlocksTest {
     private fun card(name: String, id: String = name) = ToolCallCard(
@@ -11,6 +13,19 @@ class MessageBlocksTest {
         name = name,
         args = null,
     )
+
+    @Test
+    fun intentLaunchCardNamesTheRecipe() {
+        val args = buildJsonObject {
+            put("destination", "Sky Dome")
+            put("recipe", "maps.navigate")
+        }
+
+        assertEquals("[maps.navigate]", toolDetail("node_android-1a2b3c4d__intent_launch", args))
+        assertEquals("[maps.navigate]", toolDetail("intent.launch", args))
+        assertEquals(null, toolDetail("node_android-1a2b3c4d__alarm_set", args))
+        assertEquals(null, toolDetail("node_android-1a2b3c4d__intent_launch", buildJsonObject {}))
+    }
 
     @Test
     fun textThinkingAndToolsKeepStreamOrder() {

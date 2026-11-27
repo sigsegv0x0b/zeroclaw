@@ -64,6 +64,8 @@ data class UiState(
     val insecurePrompt: InsecureConnectionPrompt? = null,
     val settingsOpen: Boolean = false,
     val toolPolicy: ToolPolicyUi = ToolPolicyUi(),
+    /** Tool to pre-filter when Settings opens on the Tools tab. */
+    val toolFocus: String? = null,
     val drawerOpen: Boolean = false,
 ) {
     val paired: Boolean get() = gatewayUrl.isNotBlank() && token.isNotBlank()
@@ -813,7 +815,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun dismissNotice() = _ui.update { it.copy(notice = null) }
 
-    fun openSettings(open: Boolean) = _ui.update { it.copy(settingsOpen = open) }
+    fun openSettings(open: Boolean) = _ui.update {
+        it.copy(settingsOpen = open, toolFocus = if (open) it.toolFocus else null)
+    }
+
+    /** Open Settings → Tools filtered to one tool, from a blocked tool card. */
+    fun openToolSettings(tool: String) = _ui.update {
+        it.copy(settingsOpen = true, toolFocus = tool)
+    }
 
     fun openDrawer(open: Boolean) = _ui.update { it.copy(drawerOpen = open) }
 
@@ -1250,6 +1259,54 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         socket.sendApproval(prompt.requestId, decision)
         _ui.update { it.copy(approval = null) }
+        if (always) persistToolApproval(prompt.tool)
+    }
+
+    /**
+     * "Always" in the approval dialog is an operator decision, not a
+     * per-session one, so write it to the agent's risk profile. Settings →
+     * Tools reads the same lists, so the choice is visible and reversible
+     * there, and it survives a restart or a new chat.
+     */
+    private fun persistToolApproval(tool: String) {
+        val snapshot = _ui.value
+        if (snapshot.gatewayUrl.isBlank() || snapshot.token.isBlank() || snapshot.agent.isBlank()) return
+        viewModelScope.launch {
+            runCatching {
+                val base = snapshot.gatewayUrl
+                val token = snapshot.token
+                val profile = configString(
+                    gateway.configProp(base, token, "agents.${snapshot.agent}.risk_profile"),
+                ).ifBlank { "default" }
+                val prefix = "risk_profiles.$profile"
+                val auto = configArray(gateway.configProp(base, token, "$prefix.auto_approve"))
+                    .toMutableSet().apply { add(tool) }
+                val ask = configArray(gateway.configProp(base, token, "$prefix.always_ask"))
+                    .toMutableSet().apply { remove(tool) }
+                val excluded = configArray(gateway.configProp(base, token, "$prefix.excluded_tools"))
+                    .toMutableSet().apply { remove(tool) }
+                gateway.patchConfig(
+                    base,
+                    token,
+                    listOf(
+                        configPatchOp("$prefix.auto_approve", auto),
+                        configPatchOp("$prefix.always_ask", ask),
+                        configPatchOp("$prefix.excluded_tools", excluded),
+                    ),
+                )
+            }.onSuccess {
+                refreshToolPolicies()
+                _ui.update { it.copy(notice = "Tool approval saved for $tool.") }
+            }.onFailure { error ->
+                _ui.update {
+                    it.copy(
+                        notice = "Could not save the approval for $tool: ${error.userMessage()}. " +
+                            "Open Settings → Tools to change it there.",
+                        toolPolicy = it.toolPolicy.copy(error = error.userMessage()),
+                    )
+                }
+            }
+        }
     }
 
     fun answerElicitation(selected: List<String>, freeForm: String?) {
@@ -1396,6 +1453,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 id = event.id ?: newId(),
                 name = event.name,
                 args = event.args?.shortJson(),
+                detail = toolDetail(event.name, event.args),
             )
             messages[index] = messages[index].appendTool(card)
             state.copy(messages = messages, busy = true)

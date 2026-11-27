@@ -4,6 +4,8 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 
 /** Shared lenient JSON: the gateway adds fields as it evolves. */
 val zcJson: Json = Json {
@@ -207,7 +209,27 @@ data class ToolCallCard(
     val args: String?,
     val output: String? = null,
     val finished: Boolean = false,
+    /** Optional qualifier shown after the tool name, e.g. `[maps.navigate]`. */
+    val detail: String? = null,
 )
+
+/**
+ * A short qualifier for a tool card title.
+ *
+ * `intent.launch` is one tool for every recipe, so the transcript would
+ * otherwise show an anonymous `intent_launch` card. Naming the recipe makes
+ * the call legible without changing the tool name that policy keys on.
+ */
+fun toolDetail(name: String, args: JsonElement?): String? {
+    val capability = name.substringAfter("__", name)
+    if (capability != "intent_launch" && capability != "intent.launch") return null
+    val recipe = ((args as? JsonObject)?.get("recipe") as? JsonPrimitive)
+        ?.takeIf { it.isString }
+        ?.content
+        ?.trim()
+        .orEmpty()
+    return recipe.takeIf { it.isNotEmpty() }?.let { "[$it]" }
+}
 
 /** One ordered piece of an assistant turn. */
 sealed interface MessageBlock {

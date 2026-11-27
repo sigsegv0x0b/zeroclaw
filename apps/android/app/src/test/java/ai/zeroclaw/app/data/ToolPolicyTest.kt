@@ -34,6 +34,12 @@ class ToolPolicyTest {
     }
 
     @Test
+    fun `blocked node tool matches its gateway name`() {
+        val name = "node_android-06da938d__timer_set"
+        assertEquals(ToolPolicy.Blocked, policy(excluded = setOf(name)).policyFor(name))
+    }
+
+    @Test
     fun `unlisted tool uses the profile default`() {
         assertEquals(ToolPolicy.Default, policy().policyFor("timer_set"))
     }

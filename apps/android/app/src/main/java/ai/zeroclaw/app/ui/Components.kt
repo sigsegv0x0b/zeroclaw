@@ -84,6 +84,8 @@ import ai.zeroclaw.app.data.AttachmentKind
 import ai.zeroclaw.app.data.MessageAttachment
 import ai.zeroclaw.app.data.PendingAttachment
 import ai.zeroclaw.app.data.ToolCallCard
+import ai.zeroclaw.app.data.ToolPolicy
+import ai.zeroclaw.app.data.ToolPolicyUi
 import ai.zeroclaw.app.data.TtsController
 import ai.zeroclaw.app.data.TtsStatus
 import ai.zeroclaw.app.ui.theme.MonoFamily
@@ -147,7 +149,13 @@ fun BrandMark(size: Int = 32) {
 
 
 @Composable
-fun MessageItem(message: ChatMessage, localNodeId: String, tts: TtsController) {
+fun MessageItem(
+    message: ChatMessage,
+    localNodeId: String,
+    tts: TtsController,
+    toolPolicy: ToolPolicyUi,
+    onOpenToolSettings: (String) -> Unit,
+) {
     when (message.role) {
         MessageRole.User -> Column(
             Modifier
@@ -235,7 +243,12 @@ fun MessageItem(message: ChatMessage, localNodeId: String, tts: TtsController) {
                                 }
                             }
 
-                            is MessageBlock.Tool -> ToolCallRow(block.card, localNodeId)
+                            is MessageBlock.Tool -> ToolCallRow(
+                                card = block.card,
+                                localNodeId = localNodeId,
+                                blocked = toolPolicy.policyFor(block.card.name) == ToolPolicy.Blocked,
+                                onOpenSettings = { onOpenToolSettings(block.card.name) },
+                            )
                         }
                         if (index != blocks.lastIndex) {
                             Spacer(Modifier.height(8.dp))
@@ -545,16 +558,27 @@ internal fun ToolOriginBadge(display: ToolDisplay) {
 }
 
 @Composable
-fun ToolCallRow(card: ToolCallCard, localNodeId: String) {
+fun ToolCallRow(
+    card: ToolCallCard,
+    localNodeId: String,
+    blocked: Boolean = false,
+    onOpenSettings: () -> Unit = {},
+) {
     var expanded by remember(card.id) { mutableStateOf(false) }
     val display = remember(card.name) { toolDisplay(card.name) }
+    val title = remember(display.name, card.detail) {
+        card.detail?.let { "${display.name} $it" } ?: display.name
+    }
     val nodeNote = display.nodeId?.let { node ->
         if (node == localNodeId) "this phone" else "phone $node"
     }
     Surface(
-        color = Zc.SurfaceRaised,
+        color = if (blocked) Zc.DangerSoft else Zc.SurfaceRaised,
         shape = RoundedCornerShape(10.dp),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Zc.Border),
+        border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            if (blocked) Zc.Danger.copy(alpha = 0.55f) else Zc.Border,
+        ),
         modifier = Modifier
             .fillMaxWidth()
             .clickable { expanded = !expanded },
@@ -564,13 +588,20 @@ fun ToolCallRow(card: ToolCallCard, localNodeId: String) {
                 Box(
                     Modifier
                         .size(6.dp)
-                        .background(if (card.finished) Zc.Success else Zc.Warning, CircleShape),
+                        .background(
+                            when {
+                                blocked -> Zc.Danger
+                                card.finished -> Zc.Success
+                                else -> Zc.Warning
+                            },
+                            CircleShape,
+                        ),
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    text = display.name,
+                    text = title,
                     style = MaterialTheme.typography.labelMedium.copy(fontFamily = MonoFamily),
-                    color = Zc.Accent,
+                    color = if (blocked) Zc.Danger else Zc.Accent,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
@@ -578,14 +609,30 @@ fun ToolCallRow(card: ToolCallCard, localNodeId: String) {
                 Spacer(Modifier.width(6.dp))
                 ToolOriginBadge(display)
                 Spacer(Modifier.width(8.dp))
-                Text(
-                    text = when {
-                        card.finished -> "done"
-                        else -> "running"
-                    },
-                    style = MaterialTheme.typography.labelSmall,
-                    color = if (card.finished) Zc.TextSubtle else Zc.Warning,
-                )
+                if (blocked) {
+                    Text(
+                        text = "blocked",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Zc.Danger,
+                        modifier = Modifier.clickable(onClick = onOpenSettings),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "settings",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Zc.Accent,
+                        modifier = Modifier.clickable(onClick = onOpenSettings),
+                    )
+                } else {
+                    Text(
+                        text = when {
+                            card.finished -> "done"
+                            else -> "running"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (card.finished) Zc.TextSubtle else Zc.Warning,
+                    )
+                }
                 Spacer(Modifier.width(8.dp))
                 Text(
                     text = if (expanded) "Hide" else "Show",

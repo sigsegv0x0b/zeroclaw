@@ -240,6 +240,20 @@ gateway config API. Connected node capabilities appear under the same
 `node_<node_id>__<capability>` names the model sees, so phone tools can be
 preapproved from the same screen.
 
+Choices made in the approval dialog persist too:
+
+- **Always** writes the tool to `auto_approve` on the agent's risk profile, so
+  it survives a restart and applies to every chat, not just the current
+  session. It is the same list **Settings → Tools** edits.
+- **Deny** affects that call only; it does not change policy.
+- Schema-discovery tools (`tool_search`, including the phone's
+  `node_…__tool_search`) are approved by default because they only return
+  schemas. **Ask** in Settings still forces a prompt, and **Block** hides the
+  tool.
+- A tool the selected policy blocks renders in the transcript with a red name,
+  a `blocked` label, and a **settings** link that opens **Settings → Tools**
+  filtered to that tool.
+
 Advertised capabilities:
 
 | Capability | Tool parameters | Device effect |

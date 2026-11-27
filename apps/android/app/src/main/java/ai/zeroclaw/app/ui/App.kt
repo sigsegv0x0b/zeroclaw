@@ -59,6 +59,7 @@ fun ZeroClawRoot(viewModel: AppViewModel = viewModel()) {
                     onRenewCertificate = viewModel::renewCertificate,
                     onRefreshTools = viewModel::refreshToolPolicies,
                     onToolPolicy = viewModel::setToolPolicy,
+                    initialToolFocus = state.toolFocus,
                 )
                 !state.paired -> OnboardingScreen(
                     booting = state.booting,
