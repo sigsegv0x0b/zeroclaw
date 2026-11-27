@@ -112,6 +112,15 @@ fn normalized_always_ask(entries: &[String]) -> HashSet<String> {
         .collect()
 }
 
+/// Tools that only report metadata and cannot change state. They are approved
+/// by default so a first schema lookup does not interrupt a turn. `always_ask`
+/// still forces a prompt, and `excluded_tools` hides them entirely.
+fn is_discovery_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "tool_search" | "tool.search")
+        || tool_name.ends_with("__tool_search")
+        || tool_name.ends_with("__tool.search")
+}
+
 impl ApprovalManager {
     /// Create an interactive (CLI) approval manager from a risk profile.
     pub fn from_risk_profile(risk_profile: &RiskProfileConfig) -> Self {
@@ -246,6 +255,13 @@ impl ApprovalManager {
         // who explicitly lists a tool here wants a prompt regardless of level.
         if self.always_ask.contains("*") || self.always_ask.contains(tool_name) {
             return ApprovalRequirement::Prompt;
+        }
+
+        // Discovery tools only return schemas; they have no side effects and
+        // should not interrupt a turn. `always_ask` above still wins, so an
+        // operator can force a prompt per tool from Settings.
+        if is_discovery_tool(tool_name) {
+            return ApprovalRequirement::Approved;
         }
 
         // Full autonomy auto-approves only tools that are not always_ask.
@@ -1147,6 +1163,37 @@ mod tests {
         assert!(
             !mgr.needs_approval("tool_search"),
             "tool_search discovery must not need approval in non-interactive mode"
+        );
+    }
+
+    #[test]
+    fn discovery_tools_are_approved_by_default_interactively() {
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
+        assert_eq!(
+            mgr.approval_requirement("tool_search"),
+            ApprovalRequirement::Approved
+        );
+        assert_eq!(
+            mgr.approval_requirement("node_android-1a2b3c4d__tool_search"),
+            ApprovalRequirement::Approved,
+            "the node-prefixed phone discovery tool must be approved too"
+        );
+        assert_eq!(
+            mgr.approval_requirement("some_unknown_tool"),
+            ApprovalRequirement::Prompt,
+            "ordinary tools keep the supervised default"
+        );
+    }
+
+    #[test]
+    fn always_ask_can_still_force_a_prompt_for_discovery_tools() {
+        let mut config = supervised_config();
+        config.always_ask = vec!["node_android-1a2b3c4d__tool_search".to_string()];
+        let mgr = ApprovalManager::from_risk_profile(&config);
+        assert_eq!(
+            mgr.approval_requirement("node_android-1a2b3c4d__tool_search"),
+            ApprovalRequirement::Prompt,
+            "an explicit Ask policy must beat the discovery default"
         );
     }
 
