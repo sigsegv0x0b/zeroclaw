@@ -37,6 +37,8 @@ data class StoredSettings(
     val lastSessionId: String = "",
     val deviceId: String = "",
     val nodeEnabled: Boolean = true,
+    /** Prefer this phone's tools over equivalent host tools unless the user is explicit. */
+    val preferNodeTools: Boolean = true,
     val nodeFolderUri: String = "",
     val nodeFolderName: String = "",
     /** `android` (on-phone recognizer) or `zeroclaw` (gateway transcription). */
@@ -85,6 +87,7 @@ class SettingsStore(private val context: Context) {
         val lastSession = stringPreferencesKey("last_session_id")
         val deviceId = stringPreferencesKey("device_id")
         val nodeEnabled = booleanPreferencesKey("node_enabled")
+        val preferNodeTools = booleanPreferencesKey("prefer_node_tools")
         val nodeFolderUri = stringPreferencesKey("node_folder_uri")
         val nodeFolderName = stringPreferencesKey("node_folder_name")
         val voiceBackend = stringPreferencesKey("voice_backend")
@@ -112,6 +115,7 @@ class SettingsStore(private val context: Context) {
             lastSessionId = prefs[Keys.lastSession].orEmpty(),
             deviceId = prefs[Keys.deviceId].orEmpty(),
             nodeEnabled = prefs[Keys.nodeEnabled] ?: true,
+            preferNodeTools = prefs[Keys.preferNodeTools] ?: true,
             nodeFolderUri = prefs[Keys.nodeFolderUri].orEmpty(),
             nodeFolderName = prefs[Keys.nodeFolderName].orEmpty(),
             voiceBackend = prefs[Keys.voiceBackend] ?: "android",
@@ -295,6 +299,10 @@ class SettingsStore(private val context: Context) {
 
     suspend fun saveNodeEnabled(enabled: Boolean) {
         context.settingsDataStore.edit { prefs -> prefs[Keys.nodeEnabled] = enabled }
+    }
+
+    suspend fun savePreferNodeTools(enabled: Boolean) {
+        context.settingsDataStore.edit { prefs -> prefs[Keys.preferNodeTools] = enabled }
     }
 
     suspend fun clear() {

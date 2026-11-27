@@ -107,18 +107,14 @@ object DeviceCapabilities {
     const val TALK_PTT_ONCE = "talk.ptt.once"
 
     private const val PHONE_NOTE = " This runs on the phone, not on the ZeroClaw host."
-    private const val ASK_TARGET_NOTE =
-        " If the user has not said the phone, do not call it: ask whether they want this on " +
-            "their phone or on the ZeroClaw host first; the host has its own tools for the same job."
 
     private fun capability(
         name: String,
         description: String,
         parameters: String,
-        asksTarget: Boolean = false,
     ): NodeCapabilityDef = NodeCapabilityDef(
         name = name,
-        description = description + PHONE_NOTE + if (asksTarget) ASK_TARGET_NOTE else "",
+        description = description + PHONE_NOTE,
         parameters = zcJson.parseToJsonElement(parameters) as JsonObject,
     )
 
@@ -143,7 +139,6 @@ object DeviceCapabilities {
               "required": ["hour", "minute"]
             }
             """.trimIndent(),
-            asksTarget = true,
         ),
         capability(
             TIMER_SET,
@@ -163,7 +158,6 @@ object DeviceCapabilities {
               "required": ["seconds"]
             }
             """.trimIndent(),
-            asksTarget = true,
         ),
         capability(
             ALARM_LIST,
@@ -254,7 +248,6 @@ object DeviceCapabilities {
               }
             }
             """.trimIndent(),
-            asksTarget = true,
         ),
         capability(
             FILE_READ,
@@ -269,7 +262,6 @@ object DeviceCapabilities {
               "required": ["path"]
             }
             """.trimIndent(),
-            asksTarget = true,
         ),
         capability(
             FILE_CREATE,
@@ -287,7 +279,6 @@ object DeviceCapabilities {
               "required": ["path", "content"]
             }
             """.trimIndent(),
-            asksTarget = true,
         ),
         capability(
             GALLERY_LIST,

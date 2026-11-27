@@ -121,6 +121,7 @@ Plus the dashboard through ZeroRelay, a CLI-only server build, and tighter isola
   - rotating all credentials revokes every mTLS certificate and its live connection, not only the token set and device registry;
   - `GET /api/nodes` joins paired devices to live nodes, and `zeroclaw nodes list`, `show` and `revoke` expose the same inventory from the gateway host; revocation also closes the live node socket.
 - **Android:** the mTLS client key and the bearer token stay in the Android Keystore; imported PEM keys are sealed at rest and imported into the Keystore when the platform accepts them; backups exclude the app's settings; accessibility automation refuses system settings, permission prompts and ZeroClaw's own screens.
+- **Phone tools by preference:** Android Settings has **Prefer this phone's tools** (on by default). Matching requests use the phone unless the user names the server, host, cron or another device; turning it off makes the agent ask which device to use when both offer the action.
 - **Command scanning:**
   - POSIX commands are split at substitution and subshell boundaries (#11822);
   - a bare semicolon or pipe in an incoming message is no longer treated as command injection (#12068).
