@@ -12,6 +12,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import ai.zeroclaw.app.data.AppViewModel
+import ai.zeroclaw.app.data.ChatRuntime
 import ai.zeroclaw.app.ui.ZeroClawRoot
 import ai.zeroclaw.app.ui.theme.ZeroClawTheme
 
@@ -24,6 +25,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        ChatRuntime.init(applicationContext)
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
@@ -45,11 +47,20 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        ChatRuntime.setVisible(true)
         viewModel.onForeground()
     }
 
     override fun onStop() {
         super.onStop()
-        viewModel.onBackground()
+        ChatRuntime.setVisible(false)
+    }
+
+    override fun onDestroy() {
+        // Task removal can destroy the activity without an orderly stop.
+        // A configuration change recreates it immediately, so only mark the
+        // app hidden for a real finish/removal.
+        if (!isChangingConfigurations) ChatRuntime.setVisible(false)
+        super.onDestroy()
     }
 }

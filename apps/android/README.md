@@ -409,10 +409,19 @@ frame.
 When the app is not visible, an `approval_request` also posts a
 HIGH-importance local notification with the tool name and argument summary.
 Tapping it returns to the approval dialog, and answering or opening the app
-clears it; the notification expires with the gateway's approval window. This
-is a local notification, not a remote push: it only works while Android keeps
-the app process and its chat socket alive. If the process is gone, the
-gateway's window expires and the call is denied.
+clears it; the notification expires with the gateway's approval window.
+
+The chat socket is owned by a process-wide `ChatRuntime` and hosted by
+`NodeService`, the same `connectedDevice` foreground service that holds the
+node link. Backgrounding the app, or removing it from Recents where the OS
+keeps the service, no longer drops the live turn or its approvals. The service
+also restarts on boot and after an app update when the phone is paired and
+**Device link** is enabled.
+
+This is still not remote push. A force-stop or an OEM process killer takes the
+service and socket with it, and the gateway's approval window then expires and
+denies the call; guaranteed delivery requires FCM or UnifiedPush plus a
+pending-approval API.
 
 A registration is keyed by the paired-token hash that authenticated
 `/ws/nodes`, not by the self-declared node id alone. A second token cannot

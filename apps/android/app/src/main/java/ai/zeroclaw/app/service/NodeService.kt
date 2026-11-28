@@ -14,6 +14,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import ai.zeroclaw.app.MainActivity
 import ai.zeroclaw.app.R
+import ai.zeroclaw.app.data.ChatRuntime
 import ai.zeroclaw.app.data.DeviceCapabilities
 import ai.zeroclaw.app.data.MtlsTransport
 import ai.zeroclaw.app.data.NodeClient
@@ -47,6 +48,7 @@ class NodeService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        ChatRuntime.init(applicationContext)
         createChannel()
         ContextCompat.registerReceiver(
             this,
@@ -103,6 +105,10 @@ class NodeService : Service() {
                     nodeId = deviceId,
                 ),
             )
+            // The service is the process's long-lived host: bring the chat
+            // socket up too, so approvals and questions still arrive after the
+            // activity is gone.
+            ChatRuntime.startFromSettings(applicationContext)
         }
     }
 
@@ -155,6 +161,7 @@ class NodeService : Service() {
         runCatching { unregisterReceiver(certificateRenewed) }
         client?.stop()
         client = null
+        ChatRuntime.close()
         NodeRuntime.set(NodeStatus.Stopped)
         scope.cancel()
         super.onDestroy()

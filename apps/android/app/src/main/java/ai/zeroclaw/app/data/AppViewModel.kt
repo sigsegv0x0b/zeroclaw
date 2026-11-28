@@ -111,11 +111,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val store = SettingsStore(app)
     private val gateway = GatewayClient()
-    private val socket = ChatSocket(viewModelScope)
+    // Process-wide: the foreground NodeService keeps this socket alive when
+    // the activity is backgrounded or swiped away.
+    private val socket = ChatRuntime
     private val androidVoice = AndroidVoiceInput(app)
     private val gatewayVoice = GatewayVoiceInput(app) { currentTransport }
     @Volatile private var currentTransport: okhttp3.OkHttpClient = MtlsTransport.plainClient()
-    @Volatile private var appVisible = false
     private var pendingProbe: MtlsEnrollment.Probe? = null
     private var pendingMtlsPort: Int = 42618
     private var pendingInsecure: PendingConnection? = null
@@ -644,10 +645,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * the new material before the chat or node clients use the old one.
      */
     fun onForeground() {
-        appVisible = true
-        // The dialog is back in front of the operator; the notification is
-        // redundant and would linger after they answer.
-        ApprovalNotifications.cancel(getApplication(), _ui.value.approval?.requestId)
         viewModelScope.launch {
             if (_ui.value.booting || !_ui.value.paired) return@launch
             // The chat socket and the device-node link are separate. A
@@ -660,10 +657,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             maybeRenewBeforeConnect()
         }
-    }
-
-    fun onBackground() {
-        appVisible = false
     }
 
     /**
@@ -1268,7 +1261,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         socket.sendApproval(prompt.requestId, decision)
         _ui.update { it.copy(approval = null) }
-        ApprovalNotifications.cancel(getApplication(), prompt.requestId)
+        socket.cancelApproval(prompt.requestId)
         if (!approve) updateAssistant { it.markToolDenied(prompt.tool) }
         if (always) persistToolApproval(prompt.tool)
     }
@@ -1377,14 +1370,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update { it.copy(busy = false, notice = "Turn stopped.", elicitation = null) }
             }
             is ChatEvent.ApprovalRequest -> {
-                val prompt = ApprovalPrompt(
-                    requestId = event.requestId,
-                    tool = event.tool,
-                    argumentsSummary = event.argumentsSummary,
-                    timeoutSecs = event.timeoutSecs,
-                )
-                _ui.update { it.copy(approval = prompt) }
-                if (!appVisible) ApprovalNotifications.show(getApplication(), prompt)
+                _ui.update {
+                    it.copy(
+                        approval = ApprovalPrompt(
+                            requestId = event.requestId,
+                            tool = event.tool,
+                            argumentsSummary = event.argumentsSummary,
+                            timeoutSecs = event.timeoutSecs,
+                        ),
+                    )
+                }
             }
             is ChatEvent.ElicitationRequest -> _ui.update {
                 it.copy(elicitation = event.prompt)
@@ -1490,7 +1485,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val pending = _ui.value.approval
             if (pending != null && (event.name == null || event.name == pending.tool)) {
                 _ui.update { it.copy(approval = null) }
-                ApprovalNotifications.cancel(getApplication(), pending.requestId)
+                socket.cancelApproval(pending.requestId)
             }
         }
     }
@@ -1517,7 +1512,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         androidVoice.destroy()
         gatewayVoice.destroy()
-        socket.close()
+        // The foreground NodeService owns the chat socket now; clearing the
+        // activity must not drop a live turn or its approvals.
         super.onCleared()
     }
 }
